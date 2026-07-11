@@ -93,7 +93,7 @@ def start_server(use_existing=False):
         wait_status()
         return None
     proc = subprocess.Popen(
-        ["./run-scanner.sh"],
+        ["./pluto-scanner"],
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
         start_new_session=True,

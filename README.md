@@ -76,10 +76,10 @@ python3 -m pip install -r requirements.txt
 ## Run
 
 ```sh
-PLUTO_URI=ip:pluto.local ./run-scanner.sh
+PLUTO_URI=ip:pluto.local ./pluto-scanner
 ```
 
-The wrapper defaults to `ip:pluto.local`. You can also run the binary directly:
+The binary defaults to `ip:pluto.local` when `PLUTO_URI` is not set. You can also pass the URI explicitly:
 
 ```sh
 ./pluto-scanner --uri ip:192.168.2.1

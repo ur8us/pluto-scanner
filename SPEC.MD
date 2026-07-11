@@ -470,7 +470,6 @@ responses are parsed defensively (HTTP error → `{status:"error", ...}`).
 | File | Purpose |
 |---|---|
 | `Makefile` | `gcc main.c -o pluto-scanner` (`-std=c99 -Wall -Wextra -liio -lm -pthread`) |
-| `run-scanner.sh` | Sets `PLUTO_URI` (default `ip:pluto.local`), execs the binary |
 | `pluto-scanner.conf` | Local runtime state saved by backend (**untracked**) |
 | `bands.ini` | Editable frequency band overlay definitions |
 | `markers.ini` | Editable frequency marker definitions |

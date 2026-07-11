@@ -6,7 +6,6 @@
 
 - `main.c` serves HTTP on port `8080`, exposes JSON API endpoints, controls Pluto through `libiio`, computes FFT rows, and streams waterfall data over SSE.
 - `index.html` owns the spectrum/waterfall canvases, Pluto controls, zoom/pan, Go To, rulers, bands, and markers.
-- `run-scanner.sh` starts `./pluto-scanner` with `PLUTO_URI`, defaulting to `ip:pluto.local`.
 - `pluto-scanner.conf` is local runtime state and should stay untracked.
 - `images/` contains README screenshots captured from the live browser UI.
 - `PLUTO.MD` reference for ADALM-Pluto hardware (libiio API, clock control, SSH).
@@ -402,7 +401,7 @@ FIREFOX_BIN=/path/to/firefox tools/ui_browser_test.py
 For a deeper frontend pass, run the scanner with trace capture:
 
 ```sh
-PLUTO_URI=ip:pluto.local stdbuf -oL -eL ./run-scanner.sh 2>&1 | tee frontend-validation-trace.log
+PLUTO_URI=ip:pluto.local stdbuf -oL -eL ./pluto-scanner 2>&1 | tee frontend-validation-trace.log
 ```
 
 Then run the browser validations in another terminal. Check the trace for:
