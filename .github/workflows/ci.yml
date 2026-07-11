@@ -22,7 +22,7 @@ jobs:
 
     steps:
       - name: Check out source
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Install dependencies
         run: |
@@ -47,22 +47,38 @@ jobs:
   macos:
     name: ci-macos
     runs-on: macos-15
+    env:
+      DEPS_PREFIX: ${{ github.workspace }}/.ci/deps
+      BUILD_ROOT: ${{ github.workspace }}/.ci/build-macos
+      PKG_CONFIG_PATH: ${{ github.workspace }}/.ci/deps/lib/pkgconfig:${{ github.workspace }}/.ci/deps/lib64/pkgconfig
 
     steps:
       - name: Check out source
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Install dependencies
-        run: brew install libiio node pkg-config
+        run: brew install cmake ninja node pkg-config
+
+      - name: Build static libxml2 and libiio
+        run: tools/ci/build-static-deps.sh
 
       - name: Show build configuration
-        run: make build-info
+        run: |
+          iio_cflags="$(pkg-config --cflags libiio libxml-2.0)"
+          iio_libs="$(pkg-config --libs --static libiio libxml-2.0)"
+          make build-info IIO_CFLAGS="$iio_cflags" IIO_LIBS="$iio_libs"
 
       - name: Build
-        run: make
+        run: |
+          iio_cflags="$(pkg-config --cflags libiio libxml-2.0)"
+          iio_libs="$(pkg-config --libs --static libiio libxml-2.0)"
+          make IIO_CFLAGS="$iio_cflags" IIO_LIBS="$iio_libs"
 
       - name: Run validation checks
-        run: make check
+        run: |
+          iio_cflags="$(pkg-config --cflags libiio libxml-2.0)"
+          iio_libs="$(pkg-config --libs --static libiio libxml-2.0)"
+          make check IIO_CFLAGS="$iio_cflags" IIO_LIBS="$iio_libs"
 
   windows:
     name: ci-windows
@@ -73,7 +89,7 @@ jobs:
 
     steps:
       - name: Check out source
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Set up MSYS2
         uses: msys2/setup-msys2@v2
