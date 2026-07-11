@@ -198,6 +198,7 @@ const values = {
 };
 for (const [id, value] of Object.entries(values)) {
   const el = document.getElementById(id);
+  if (!el) continue;
   el.disabled = false;
   el.value = value;
   el.dispatchEvent(new Event('input', {bubbles: true}));

@@ -207,6 +207,8 @@ def run_check():
         )
         reader = None
         output = ""
+        rate_preview_rows = []
+        rate_live_rows = []
         try:
             wait_for_server(process)
             plan = http_json("POST", "/api/start", start_payload(center, span_hz))
@@ -262,6 +264,38 @@ def run_check():
                 if int_field(row, "decim_factor") != 64 or int_field(row, "overlap_factor") != 64:
                     raise RuntimeError(f"row changed CIC/overlap metadata: {row}")
 
+            time.sleep(0.2)
+            rate_plan = http_json(
+                "POST",
+                "/api/rate",
+                {"min_rate_lps": 10, "rate_limit_lps": 50},
+            )
+            if rate_plan.get("status") != "ok":
+                raise RuntimeError(f"rate change failed: {rate_plan}")
+            rate_view_id = int_field(rate_plan, "view_id")
+            rate_rows = reader.collect_for_view(
+                rate_view_id, minimum_rows=8, timeout=15
+            )
+            if len(rate_rows) < 2:
+                raise RuntimeError(
+                    f"only {len(rate_rows)} rows captured for rate view {rate_view_id}"
+                )
+            if int(rate_rows[0].get("preview", 0)) != 1:
+                raise RuntimeError(
+                    "first row after waterfall-rate change was not cached "
+                    f"preview: {rate_rows[0]}"
+                )
+            rate_preview_rows = [
+                row for row in rate_rows if int(row.get("preview", 0)) == 1
+            ]
+            rate_live_rows = [
+                row for row in rate_rows if int(row.get("preview", 0)) == 0
+            ]
+            if not rate_preview_rows:
+                raise RuntimeError("no cached preview rows captured after rate change")
+            if not rate_live_rows:
+                raise RuntimeError("no live row captured after rate-change previews")
+
             http_json("POST", "/api/stop", {})
             stop_backend_process(process)
             output = process.communicate(timeout=10)[0]
@@ -277,6 +311,8 @@ def run_check():
         "preview_rows": len(preview_rows),
         "preview_count": expected_count,
         "live_rows": len(live_rows),
+        "rate_preview_rows": len(rate_preview_rows),
+        "rate_live_rows": len(rate_live_rows),
         "first_line_ms": float(view_plan.get("first_line_ms", 0.0)),
         "log_tail": output[-1000:],
     }

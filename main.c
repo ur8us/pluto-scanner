@@ -5821,6 +5821,22 @@ static void *scan_thread_func(void *arg)
 /* ------------------------------------------------------------------ */
 /* Start / Stop scan                                                  */
 /* ------------------------------------------------------------------ */
+/**
+ * @brief Clear pending reconnect auto-start state after explicit user action.
+ *
+ * Manual Stop and manual Start must take precedence over stale reconnect
+ * requests. The suppress window avoids a reconnect poll racing immediately
+ * after the frontend has explicitly stopped the stream.
+ *
+ * @param suppress_ms Monotonic suppression interval in milliseconds.
+ */
+static void clear_auto_restart_request(long long suppress_ms)
+{
+    g_auto_restart_on_reconnect = 0;
+    if (suppress_ms > 0)
+        g_auto_restart_suppress_until_msec = now_msec() + suppress_ms;
+}
+
 static int start_scan(void)
 {
     double air_freqs[MAX_FREQS];
@@ -5830,6 +5846,8 @@ static int start_scan(void)
     double step = 0.0;
     int total_steps;
     run_mode_t mode;
+
+    clear_auto_restart_request(0);
 
     /* If already scanning, restart with new params */
     if (g_scan_thread_joinable) {
@@ -7448,7 +7466,12 @@ start_bad_json:
         json_doc_t json;
         char err[160];
         uint32_t rate_tmp = 0;
+        uint32_t min_rate_tmp = g_min_rate_lps;
         int present = 0;
+        int min_present = 0;
+        int rate_changed = 0;
+        int min_changed = 0;
+        int restart_needed = 0;
         int ret = 0;
 
         if (json_body_for_request(&http, &json, err, sizeof(err)) != 0) {
@@ -7462,12 +7485,31 @@ start_bad_json:
             close(client_fd);
             return;
         }
+        if (json_get_uint(&json, "min_rate_lps", &min_rate_tmp, &min_present) != 0) {
+            send_json_error(client_fd, 400, "Bad Request", cors,
+                            "Malformed min_rate_lps");
+            close(client_fd);
+            return;
+        }
 
         if (rate_tmp > 0) {
-            g_rate_limit_lps = normalize_rate_limit_lps(rate_tmp);
+            uint32_t normalized_rate = normalize_rate_limit_lps(rate_tmp);
+            rate_changed = normalized_rate != g_rate_limit_lps;
+            g_rate_limit_lps = normalized_rate;
+        }
+        if (min_present) {
+            uint32_t normalized_min = normalize_min_rate_lps(min_rate_tmp);
+            min_changed = normalized_min != g_min_rate_lps;
+            g_min_rate_lps = normalized_min;
+        }
+        if (rate_changed || min_changed) {
             save_config();
-            if (g_scanning)
+            restart_needed = rate_changed ||
+                (min_changed && planned_run_mode() == RUN_MODE_SINGLE);
+            if (g_scanning && restart_needed) {
+                g_view_id++;
                 ret = start_scan();
+            }
         }
 
         {
@@ -7482,24 +7524,31 @@ start_bad_json:
             uint32_t line_sample_count = current_line_sample_count();
             double raw_line_rate = 0.0;
             double first_line_ms;
+            int minimum_rate_limited = current_minimum_rate_limited();
+            int minimum_rate_achieved;
             int rate_drop_factor = rate_drop_factor_for_plan(current_active_samplerate(), line_sample_count,
                                                              total_steps,
                                                              decim_factor,
                                                              g_rate_limit_lps,
                                                              &raw_line_rate);
             first_line_ms = current_first_line_ms(total_steps, line_sample_count);
+            minimum_rate_achieved = mode == RUN_MODE_SINGLE ?
+                current_minimum_rate_achieved() :
+                (g_min_rate_lps == 0 || raw_line_rate >= (double)g_min_rate_lps);
             double traffic_kbytes_s = measured_frontend_kbytes_s();
             double active_samplerate = current_active_samplerate();
             double active_rf_bandwidth = current_active_rf_bandwidth();
             double active_bw_ratio = current_active_bw_ratio();
-            char json_body[1024];
+            char json_body[2048];
             snprintf(json_body, sizeof(json_body),
                 "{\"status\":\"%s\",\"min_rate_lps\":%u,\"rate_limit_lps\":%u,"
                 "\"rate_drop_factor\":%d,\"raw_line_rate\":%.3f,"
                 "\"first_line_ms\":%.3f,"
                 "\"traffic_kbytes_s\":%.1f,"
-                "\"mode\":\"%s\",\"effective_fft_size\":%d,"
+                "\"mode\":\"%s\",\"view_id\":%u,\"effective_fft_size\":%d,"
                 "\"decim_factor\":%d,\"decim_hop\":%d,\"overlap_factor\":%.3f,"
+                "\"minimum_rate_overlap\":%d,\"minimum_rate_limited\":%d,"
+                "\"minimum_rate_achieved\":%d,"
                 "\"effective_input_samples\":%u,"
                 "\"active_samplerate\":%.0f,\"active_rf_bandwidth\":%.0f,"
                 "\"active_bw_ratio\":%.3f,"
@@ -7507,8 +7556,11 @@ start_bad_json:
                 (ret == 0) ? "ok" : "error",
                 g_min_rate_lps, g_rate_limit_lps, rate_drop_factor, raw_line_rate,
                 first_line_ms, traffic_kbytes_s,
-                run_mode_name(mode), effective_fft,
-                decim_factor, decim_hop, overlap_factor, line_sample_count,
+                run_mode_name(mode), g_view_id, effective_fft,
+                decim_factor, decim_hop, overlap_factor,
+                minimum_rate_limited, minimum_rate_limited,
+                minimum_rate_achieved,
+                line_sample_count,
                 active_samplerate, active_rf_bandwidth, active_bw_ratio,
                 g_scanning);
             send_json_response(client_fd, 200, "OK", cors, json_body);
@@ -7539,8 +7591,10 @@ start_bad_json:
 
         g_min_rate_lps = normalize_min_rate_lps(min_rate_tmp);
         save_config();
-        if (g_scanning && planned_run_mode() == RUN_MODE_SINGLE)
+        if (g_scanning && planned_run_mode() == RUN_MODE_SINGLE) {
+            g_view_id++;
             ret = start_scan();
+        }
 
         {
             double step = 0.0;
@@ -7552,28 +7606,30 @@ start_bad_json:
             int decim_hop = current_decim_hop();
             double overlap_factor = current_overlap_factor();
             uint32_t line_sample_count = current_line_sample_count();
-            int minimum_rate_limited = current_minimum_rate_limited();
-            int minimum_rate_achieved = mode == RUN_MODE_SINGLE ?
-                current_minimum_rate_achieved() : (g_min_rate_lps == 0);
             double raw_line_rate = 0.0;
             double first_line_ms;
+            int minimum_rate_limited = current_minimum_rate_limited();
+            int minimum_rate_achieved;
             int rate_drop_factor = rate_drop_factor_for_plan(current_active_samplerate(), line_sample_count,
                                                              total_steps,
                                                              decim_factor,
                                                              g_rate_limit_lps,
                                                              &raw_line_rate);
             first_line_ms = current_first_line_ms(total_steps, line_sample_count);
+            minimum_rate_achieved = mode == RUN_MODE_SINGLE ?
+                current_minimum_rate_achieved() :
+                (g_min_rate_lps == 0 || raw_line_rate >= (double)g_min_rate_lps);
             double traffic_kbytes_s = measured_frontend_kbytes_s();
             double active_samplerate = current_active_samplerate();
             double active_rf_bandwidth = current_active_rf_bandwidth();
             double active_bw_ratio = current_active_bw_ratio();
-            char json_body[1024];
+            char json_body[2048];
             snprintf(json_body, sizeof(json_body),
                 "{\"status\":\"%s\",\"min_rate_lps\":%u,"
                 "\"rate_drop_factor\":%d,\"raw_line_rate\":%.3f,"
                 "\"first_line_ms\":%.3f,"
                 "\"traffic_kbytes_s\":%.1f,"
-                "\"mode\":\"%s\",\"effective_fft_size\":%d,"
+                "\"mode\":\"%s\",\"view_id\":%u,\"effective_fft_size\":%d,"
                 "\"decim_factor\":%d,\"decim_hop\":%d,\"overlap_factor\":%.3f,"
                 "\"minimum_rate_overlap\":%d,\"minimum_rate_limited\":%d,"
                 "\"minimum_rate_achieved\":%d,"
@@ -7583,7 +7639,7 @@ start_bad_json:
                 (ret == 0) ? "ok" : "error",
                 g_min_rate_lps, rate_drop_factor, raw_line_rate,
                 first_line_ms, traffic_kbytes_s,
-                run_mode_name(mode), effective_fft,
+                run_mode_name(mode), g_view_id, effective_fft,
                 decim_factor, decim_hop, overlap_factor,
                 minimum_rate_limited, minimum_rate_limited,
                 minimum_rate_achieved,
@@ -7598,6 +7654,7 @@ start_bad_json:
 
     /* POST /api/stop */
     if (strcmp(http.method, "POST") == 0 && strcmp(http.path, "/api/stop") == 0) {
+        clear_auto_restart_request(PLUTO_AUTO_RESTART_SUPPRESS_MS);
         stop_scan();
         send_json_response(client_fd, 200, "OK", cors, "{\"status\":\"ok\"}");
         close(client_fd);

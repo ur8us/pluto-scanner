@@ -81,10 +81,17 @@ def main():
         assert len(driver.find_elements(By.ID, "rssiVal")) == 0
         assert len(driver.find_elements(By.ID, "peakVal")) == 0
         assert driver.find_element(By.ID, "infoRange").is_displayed()
-        assert driver.find_element(By.ID, "rfBandwidth").is_displayed()
-        assert not driver.find_element(By.ID, "samplerate").is_enabled()
-        assert not driver.find_element(By.ID, "rfBandwidth").is_enabled()
-        assert not driver.find_element(By.ID, "bwRatio").is_enabled()
+        assert len(driver.find_elements(By.ID, "samplerate")) == 0
+        assert len(driver.find_elements(By.ID, "rfBandwidth")) == 0
+        assert len(driver.find_elements(By.ID, "bwRatio")) == 0
+        assert driver.find_element(By.ID, "infoSampleRate").is_displayed()
+        assert driver.find_element(By.ID, "infoRfBandwidth").is_displayed()
+        assert driver.find_element(By.ID, "infoBwUsage").is_displayed()
+        Select(driver.find_element(By.ID, "timeMarks")).select_by_value("15")
+        assert (
+            driver.execute_script("return localStorage.getItem('timeMarksSeconds');")
+            == "15"
+        )
         assert driver.find_element(By.ID, "gainMode").is_displayed()
         assert driver.find_element(By.ID, "vgaGain").is_displayed()
 
@@ -109,6 +116,27 @@ def main():
         )
         WebDriverWait(driver, 15).until(
             lambda d: "430 - 470" in d.find_element(By.ID, "infoRange").text
+        )
+        wait_nonblank_waterfall(driver)
+
+        driver.find_element(By.ID, "btnStop").click()
+        WebDriverWait(driver, 15).until(
+            lambda d: d.find_element(By.ID, "statusText").text == "idle"
+        )
+        time.sleep(3.0)
+        stopped_status = driver.execute_async_script(
+            """
+const done = arguments[arguments.length - 1];
+fetch('/api/status')
+  .then(r => r.json()).then(done)
+  .catch(e => done({status: 'error', message: String(e)}));
+"""
+        )
+        if stopped_status.get("scanning"):
+            raise RuntimeError("explicit Stop was followed by automatic restart")
+        driver.find_element(By.ID, "btnStart").click()
+        WebDriverWait(driver, 12).until(
+            lambda d: d.find_element(By.ID, "statusText").text == "scanning"
         )
         wait_nonblank_waterfall(driver)
 

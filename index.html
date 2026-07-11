@@ -638,6 +638,12 @@
                     <span class="val" id="infoRange">---</span></span
                 >
                 <span>SCAN: <span class="val" id="infoScan">---</span></span>
+                <span>S/R: <span class="val" id="infoSampleRate">---</span></span>
+                <span>B/W: <span class="val" id="infoRfBandwidth">---</span></span>
+                <span
+                    >B/W USAGE:
+                    <span class="val" id="infoBwUsage">---</span></span
+                >
                 <span>FFT: <span class="val" id="infoFFT">---</span></span>
                 <span
                     >Traffic:
@@ -699,48 +705,20 @@
                         step="0.1"
                     />
                 </div>
+                <div class="ctrl-group">
+                    <label>TIME MARKS</label>
+                    <select id="timeMarks">
+                        <option value="10">10s</option>
+                        <option value="15">15s</option>
+                        <option value="30">30s</option>
+                        <option value="60">1min</option>
+                        <option value="300">5min</option>
+                        <option value="600">10min</option>
+                    </select>
+                </div>
                 <div style="display: none">
                     <select id="directSampling">
                         <option value="0">0</option>
-                    </select>
-                </div>
-                <div class="ctrl-group">
-                    <label>Sample Rate</label>
-                    <select id="samplerate" disabled>
-                        <option value="61440000" selected>61.44 MHz</option>
-                        <option value="30720000">30.72 MHz</option>
-                        <option value="20000000">20 MHz</option>
-                        <option value="16000000">16 MHz</option>
-                        <option value="8000000">8 MHz</option>
-                        <option value="4000000">4 MHz</option>
-                    </select>
-                </div>
-                <div class="ctrl-group">
-                    <label>RF Bandwidth</label>
-                    <select id="rfBandwidth" disabled>
-                        <option value="20000000" selected>20 MHz</option>
-                        <option value="18000000">18 MHz</option>
-                        <option value="16000000">16 MHz</option>
-                        <option value="12000000">12 MHz</option>
-                        <option value="8000000">8 MHz</option>
-                        <option value="6000000">6 MHz</option>
-                        <option value="4000000">4 MHz</option>
-                        <option value="3000000">3 MHz</option>
-                    </select>
-                </div>
-                <div class="ctrl-group">
-                    <label>Passband Usage Per Hop</label>
-                    <select id="bwRatio" disabled>
-                        <option value="0.1">0.1</option>
-                        <option value="0.2">0.2</option>
-                        <option value="0.3">0.3</option>
-                        <option value="0.4">0.4</option>
-                        <option value="0.5">0.5</option>
-                        <option value="0.7">0.7</option>
-                        <option value="0.8">0.8</option>
-                        <option value="0.85" selected>0.85</option>
-                        <option value="0.9">0.9</option>
-                        <option value="1.0">1.0</option>
                     </select>
                 </div>
                 <div style="display: none">
@@ -959,6 +937,8 @@
             let scanRequestSerial = 0;
             let statusPollInFlight = false;
             let desiredScanRunning = false;
+            let manualStopSerial = 0;
+            let userStopped = false;
             let autoRestartTimer = 0;
             let autoRestartInFlight = false;
             let configuredFreq0 = 0;
@@ -998,6 +978,7 @@
             let redrawFrame = 0;
             let waterfallRenderToken = 0;
             let waterfallRenderActiveToken = 0;
+            let timeMarksSeconds = 10;
             let currentViewRedrawWaiters = [];
             let binRangeCache = null;
             let freqScaleSignature = "";
@@ -1024,6 +1005,8 @@
             let sseReconnectTimer = 0;
             let sseFailureCount = 0;
             const MAX_ZOOM_FACTOR = 1000000;
+            const TIME_MARK_VALUES = [10, 15, 30, 60, 300, 600];
+            const TIME_MARK_STORAGE_KEY = "timeMarksSeconds";
             const MIN_AIR_FREQ_START_MHZ = 0;
             const MIN_SCAN_SPAN_MHZ = 0.1;
             const DIRECT_SAMPLING_HARD_MAX_HZ = 0;
@@ -1094,7 +1077,7 @@
                     wfImageData = wfCtx.createImageData(w, 600);
                     wfScratchImageData = null;
                     clearWaterfallPixelBuffer(wfImageData.data);
-                    wfCtx.putImageData(wfImageData, 0, 0);
+                    presentWaterfallImage();
                     if (lutReady) scheduleCurrentViewRedraw();
                 }
 
@@ -1158,6 +1141,88 @@
                 const value = Math.abs(seconds);
                 const decimals = value < 10 ? 3 : value < 100 ? 2 : 1;
                 return formatCompactNumber(value, decimals) + " s";
+            }
+
+            /**
+             * Return a supported waterfall time-mark interval in seconds.
+             *
+             * @param {number|string} value Candidate interval in seconds.
+             * @returns {number} Supported interval in seconds.
+             */
+            function normalizeTimeMarksSeconds(value) {
+                const seconds = Number(value);
+                return TIME_MARK_VALUES.includes(seconds) ? seconds : 10;
+            }
+
+            /**
+             * Apply the saved time-mark interval to the dropdown and state.
+             *
+             * @returns {void}
+             */
+            function restoreTimeMarksSetting() {
+                const saved = localStorage.getItem(TIME_MARK_STORAGE_KEY);
+                timeMarksSeconds = normalizeTimeMarksSeconds(saved);
+                const select = document.getElementById("timeMarks");
+                if (select) select.value = String(timeMarksSeconds);
+            }
+
+            /**
+             * Persist a new time-mark interval and redraw the waterfall overlay.
+             *
+             * @param {number|string} value Selected interval in seconds.
+             * @returns {void}
+             */
+            function setTimeMarksSeconds(value) {
+                timeMarksSeconds = normalizeTimeMarksSeconds(value);
+                localStorage.setItem(
+                    TIME_MARK_STORAGE_KEY,
+                    String(timeMarksSeconds),
+                );
+                const select = document.getElementById("timeMarks");
+                if (select) select.value = String(timeMarksSeconds);
+                if (wfImageData) presentWaterfallImage();
+            }
+
+            /**
+             * Format a wall-clock timestamp as HH:MM:SS for waterfall markers.
+             *
+             * @param {number} timestampMs Unix timestamp in milliseconds.
+             * @returns {string} Local wall-clock time.
+             */
+            function formatTimeMarkLabel(timestampMs) {
+                const date = new Date(timestampMs);
+                const pad = (value) => String(value).padStart(2, "0");
+                return (
+                    pad(date.getHours()) +
+                    ":" +
+                    pad(date.getMinutes()) +
+                    ":" +
+                    pad(date.getSeconds())
+                );
+            }
+
+            /**
+             * Estimate the wall-clock timestamp represented by one SSE row.
+             *
+             * Preview rows are produced from recent raw-sample memory. Their
+             * backend `preview_age_ms` lets time marks stay close to acquisition
+             * time instead of browser receive time.
+             *
+             * @param {Object} payload Parsed SSE row metadata.
+             * @returns {number} Unix timestamp in milliseconds.
+             */
+            function waterfallTimestampForPayload(payload) {
+                const now = Date.now();
+                const age = Number(payload && payload.preview_age_ms);
+                if (
+                    payload &&
+                    Number(payload.preview) &&
+                    Number.isFinite(age) &&
+                    age > 0
+                ) {
+                    return now - age;
+                }
+                return now;
             }
 
             /**
@@ -1360,7 +1425,7 @@
             /**
              * Enable controls according to connection/stream state.
              * Pluto sample rate, RF bandwidth, and passband usage are backend
-             * auto-profiled; the selects stay visible for observability only.
+             * auto-profiled and shown in the status bar instead of editable controls.
              */
             function syncFirstRowControlState() {
                 const locked = scanRunning;
@@ -1369,9 +1434,6 @@
                 document.getElementById("freqStart").disabled = locked;
                 document.getElementById("freqEnd").disabled = locked;
                 document.getElementById("converterFreq").disabled = locked;
-                document.getElementById("samplerate").disabled = true;
-                document.getElementById("rfBandwidth").disabled = true;
-                document.getElementById("bwRatio").disabled = true;
                 document.getElementById("directSampling").disabled = locked;
                 document.getElementById("clockIn").disabled = locked;
                 document.getElementById("btnStart").disabled =
@@ -1433,16 +1495,8 @@
                 syncDirectSamplingFields(false);
             }
 
-            function handleSamplerateChanged() {
-                syncFirstRowControlState();
-            }
-
             function sameStoredFrequency(a, b) {
                 return Math.abs(Number(a) - Number(b)) <= 10;
-            }
-
-            function sameStoredNumber(a, b, tolerance = 1e-9) {
-                return Math.abs(Number(a) - Number(b)) <= tolerance;
             }
 
             function inputMhzToHz(id) {
@@ -2558,6 +2612,7 @@
                     await startOrRestartScan({
                         resetView: false,
                         preserveView: true,
+                        userInitiated: true,
                     });
                     return;
                 }
@@ -3378,6 +3433,80 @@
             }
 
             /**
+             * Draw black/white dashed wall-clock boundary marks over waterfall.
+             *
+             * The marker is derived from retained row timestamps, so it survives
+             * zoom/pan redraws without becoming part of the FFT color data.
+             *
+             * @returns {void}
+             */
+            function drawWaterfallTimeMarksOverlay() {
+                if (!wfImageData || !wfRows.length) return;
+                const intervalMs =
+                    normalizeTimeMarksSeconds(timeMarksSeconds) * 1000;
+                if (!Number.isFinite(intervalMs) || intervalMs <= 0) return;
+
+                const w = wfCanvas.width;
+                const h = wfCanvas.height;
+                const rows = Math.min(wfRows.length, h);
+                wfCtx.save();
+                wfCtx.lineWidth = 1;
+                wfCtx.font =
+                    "11px system-ui, -apple-system, BlinkMacSystemFont, sans-serif";
+                wfCtx.textBaseline = "top";
+
+                for (let y = 0; y < rows - 1; y++) {
+                    const newer = wfRows[wfRows.length - 1 - y];
+                    const older = wfRows[wfRows.length - 2 - y];
+                    const newerTime = Number(newer && newer.t);
+                    const olderTime = Number(older && older.t);
+                    if (
+                        !Number.isFinite(newerTime) ||
+                        !Number.isFinite(olderTime)
+                    ) {
+                        continue;
+                    }
+                    const newerBucket = Math.floor(newerTime / intervalMs);
+                    const olderBucket = Math.floor(olderTime / intervalMs);
+                    if (newerBucket === olderBucket) continue;
+
+                    const boundaryMs = newerBucket * intervalMs;
+                    const yy = Math.max(0.5, Math.min(h - 0.5, y + 0.5));
+                    for (let x = 0; x < w; x += 12) {
+                        wfCtx.strokeStyle =
+                            Math.floor(x / 12) % 2
+                                ? "rgba(255,255,255,0.95)"
+                                : "rgba(0,0,0,0.95)";
+                        wfCtx.beginPath();
+                        wfCtx.moveTo(x + 0.5, yy);
+                        wfCtx.lineTo(Math.min(w, x + 8) + 0.5, yy);
+                        wfCtx.stroke();
+                    }
+
+                    const label = formatTimeMarkLabel(boundaryMs);
+                    const labelY = y + 3 < h - 13 ? y + 3 : Math.max(0, y - 13);
+                    wfCtx.strokeStyle = "rgba(0,0,0,0.9)";
+                    wfCtx.lineWidth = 3;
+                    wfCtx.strokeText(label, 6, labelY);
+                    wfCtx.fillStyle = "rgba(255,255,255,0.95)";
+                    wfCtx.fillText(label, 6, labelY);
+                }
+
+                wfCtx.restore();
+            }
+
+            /**
+             * Present the current waterfall image and its time-mark overlay.
+             *
+             * @returns {void}
+             */
+            function presentWaterfallImage() {
+                if (!wfImageData) return;
+                wfCtx.putImageData(wfImageData, 0, 0);
+                drawWaterfallTimeMarksOverlay();
+            }
+
+            /**
              * Borrow an inactive ImageData buffer for waterfall full-frame work.
              *
              * @param {number} width Canvas width in pixels.
@@ -3472,7 +3601,7 @@
 
                 wfImageData = imageData;
                 retainWaterfallScratchImageData(previousImageData, w, h);
-                wfCtx.putImageData(wfImageData, 0, 0);
+                presentWaterfallImage();
             }
 
             function transformVisibleDisplay(
@@ -3608,7 +3737,7 @@
                     ) {
                         const previousImageData = wfImageData;
                         wfImageData = imageData;
-                        wfCtx.putImageData(wfImageData, 0, 0);
+                        presentWaterfallImage();
                         retainWaterfallScratchImageData(previousImageData, w, h);
                     } else {
                         retainWaterfallScratchImageData(imageData, w, h);
@@ -3626,9 +3755,16 @@
              * @param {number} freqStart Row start frequency in hertz.
              * @param {number} freqEnd Row end frequency in hertz.
              * @param {number} steps Backend hop count for this row.
+             * @param {number} timestampMs Wall-clock row timestamp in milliseconds.
              * @returns {void}
              */
-            function drawWaterfallLine(data, freqStart, freqEnd, steps) {
+            function drawWaterfallLine(
+                data,
+                freqStart,
+                freqEnd,
+                steps,
+                timestampMs = Date.now(),
+            ) {
                 if (!wfImageData) return;
                 const wasRendering = waterfallRenderActiveToken !== 0;
                 waterfallRenderToken++;
@@ -3637,7 +3773,7 @@
                 const pix = wfImageData.data;
                 const w = wfImageData.width;
 
-                wfRows.push({ data, f0: freqStart, f1: freqEnd });
+                wfRows.push({ data, f0: freqStart, f1: freqEnd, t: timestampMs });
                 trimWaterfallHistory(data.length);
 
                 // Scroll down by 1 pixel; newest scan line is written at the top.
@@ -3686,7 +3822,7 @@
                     writeWaterfallPixel(pix, bi, value);
                 }
 
-                wfCtx.putImageData(wfImageData, 0, 0);
+                presentWaterfallImage();
 
                 // Update frequency labels
                 updateFrequencyLabels(currentFreq0, currentFreq1, steps);
@@ -3885,6 +4021,7 @@
                             data.f1 !== undefined
                                 ? Number(data.f1)
                                 : currentFreq1;
+                        const rowTimestampMs = waterfallTimestampForPayload(data);
                         if (pendingViewChange && rowView === currentViewId)
                             return;
                         if (
@@ -3925,6 +4062,7 @@
                             rowFreq0,
                             rowFreq1,
                             currentSteps,
+                            rowTimestampMs,
                         );
                         drawScope(
                             bins,
@@ -4013,7 +4151,7 @@
             }
 
             function scheduleDesiredScanRestart(status) {
-                if (!desiredScanRunning || autoRestartInFlight)
+                if (userStopped || !desiredScanRunning || autoRestartInFlight)
                     return;
                 if (
                     !backendOnline ||
@@ -4022,10 +4160,12 @@
                 )
                     return;
 
+                const stopSerial = manualStopSerial;
                 clearAutoRestartTimer();
                 autoRestartTimer = setTimeout(async () => {
                     autoRestartTimer = 0;
                     if (
+                        stopSerial !== manualStopSerial ||
                         !desiredScanRunning ||
                         autoRestartInFlight ||
                         scanRunning ||
@@ -4039,6 +4179,7 @@
                             resetView: false,
                             preserveView: true,
                             autoRetry: true,
+                            stopSerial,
                         });
                     } finally {
                         autoRestartInFlight = false;
@@ -4061,6 +4202,16 @@
                     updateUI(false, false);
                     disconnectSSE();
                     return null;
+                }
+
+                if (userStopped && Number(status.scanning)) {
+                    clearAutoRestartTimer();
+                    desiredScanRunning = false;
+                    autoRestartInFlight = false;
+                    await apiPost("/api/stop", {});
+                    updateUI(false, true);
+                    disconnectSSE();
+                    return status;
                 }
 
                 const reconnecting =
@@ -4094,7 +4245,7 @@
                     configuredSampleRate = Number(status.samplerate);
                 if (status.bw_ratio !== undefined)
                     configuredBwRatio = Number(status.bw_ratio);
-                syncPlutoControls(status, { updateRateControls: !!status.scanning });
+                syncPlutoControls(status);
                 if (status.direct_sampling !== undefined)
                     configuredDirectSampling = Number(status.direct_sampling);
                 if (status.goto_freq_hz !== undefined)
@@ -5389,45 +5540,6 @@
                 return value.toFixed(0) + " Hz";
             }
 
-            function ensureSelectOption(select, value, label) {
-                if (!select || !Number.isFinite(Number(value))) return;
-                const textValue = String(Math.round(Number(value)));
-                for (const opt of select.options) {
-                    if (String(Math.round(Number(opt.value))) === textValue) {
-                        opt.textContent = label;
-                        select.value = opt.value;
-                        return;
-                    }
-                }
-                const opt = document.createElement("option");
-                opt.value = textValue;
-                opt.textContent = label;
-                select.appendChild(opt);
-                select.value = textValue;
-            }
-
-            function syncSampleRateOptions(rates, selected) {
-                const sel = document.getElementById("samplerate");
-                const fallback = [
-                    4000000, 8000000, 16000000, 20000000, 30720000, 40000000,
-                    61440000,
-                ];
-                const list = Array.isArray(rates) && rates.length ? rates : fallback;
-                const chosen = Number(selected) || configuredSampleRate;
-                const merged = list.some((rate) => Math.abs(Number(rate) - chosen) < 1)
-                    ? list
-                    : [...list, chosen];
-                const opts = merged.map((rate) => {
-                    const opt = document.createElement("option");
-                    opt.value = String(rate);
-                    opt.textContent = sampleRateLabel(rate);
-                    if (Math.abs(rate - chosen) < 1) opt.selected = true;
-                    return opt;
-                });
-                sel.replaceChildren(...opts);
-                sel.value = String(chosen);
-            }
-
             function setRateLimitValue(value) {
                 const idx = clampNumber(
                     nearestRateIndex(value || 20),
@@ -5441,17 +5553,13 @@
             }
 
             /**
-             * Reflect the backend's active Pluto RF profile in disabled controls.
+             * Reflect the backend's active Pluto RF profile in the status bar.
              *
              * @param {Object} plan Backend status/start/view payload.
-             * @param {Object} [options] Optional UI sync flags.
-             * @param {boolean} [options.updateRateControls=true] Whether to
-             * rebuild read-only sample-rate/RF-bandwidth/passband options.
              * @returns {void}
              */
-            function syncPlutoControls(plan, options = {}) {
+            function syncPlutoControls(plan) {
                 if (!plan) return;
-                const updateRateControls = options.updateRateControls !== false;
                 const shownSampleRate =
                     plan.active_samplerate !== undefined
                         ? Number(plan.active_samplerate)
@@ -5472,33 +5580,22 @@
                           : NaN;
                 if (Number.isFinite(shownSampleRate)) {
                     configuredSampleRate = shownSampleRate;
-                    const srSel = document.getElementById("samplerate");
-                    if (srSel && updateRateControls)
-                        ensureSelectOption(
-                            srSel,
-                            configuredSampleRate,
-                            sampleRateLabel(configuredSampleRate),
-                        );
+                    const el = document.getElementById("infoSampleRate");
+                    if (el) el.textContent = sampleRateLabel(configuredSampleRate);
                 }
                 if (Number.isFinite(shownRfBandwidth)) {
                     configuredRfBandwidth = shownRfBandwidth;
-                    const bwSel = document.getElementById("rfBandwidth");
-                    if (bwSel && updateRateControls)
-                        ensureSelectOption(
-                            bwSel,
-                            configuredRfBandwidth,
-                            sampleRateLabel(configuredRfBandwidth),
-                        );
+                    const el = document.getElementById("infoRfBandwidth");
+                    if (el) el.textContent = sampleRateLabel(configuredRfBandwidth);
                 }
                 if (Number.isFinite(shownBwRatio)) {
                     configuredBwRatio = shownBwRatio;
-                    const ratioSel = document.getElementById("bwRatio");
-                    if (ratioSel && updateRateControls)
-                        ensureSelectOption(
-                            ratioSel,
-                            configuredBwRatio,
-                            configuredBwRatio.toFixed(3).replace(/0+$/, "").replace(/\.$/, ""),
-                        );
+                    const el = document.getElementById("infoBwUsage");
+                    if (el)
+                        el.textContent = configuredBwRatio
+                            .toFixed(3)
+                            .replace(/0+$/, "")
+                            .replace(/\.$/, "");
                 }
                 if (plan.gain_mode !== undefined) {
                     const gainMode = document.getElementById("gainMode");
@@ -5711,13 +5808,9 @@
                     converter_freq: parseFloat(
                         document.getElementById("converterFreq").value,
                     ),
-                    samplerate: parseFloat(
-                        document.getElementById("samplerate").value,
-                    ),
-                    rf_bandwidth: parseFloat(
-                        document.getElementById("rfBandwidth").value,
-                    ),
-                    bw_ratio: parseFloat(document.getElementById("bwRatio").value),
+                    samplerate: configuredSampleRate || 61440000,
+                    rf_bandwidth: configuredRfBandwidth || 20000000,
+                    bw_ratio: configuredBwRatio || 0.85,
                     gain_mode: document.getElementById("gainMode").value,
                     hardwaregain_db: parseFloat(
                         document.getElementById("vgaGain").value,
@@ -5738,23 +5831,10 @@
             }
 
             function scanControlsMatchAppliedSettings() {
-                const samplerate = parseFloat(
-                    document.getElementById("samplerate").value,
-                );
-                const rfBandwidth = parseFloat(
-                    document.getElementById("rfBandwidth").value,
-                );
-                const bwRatio = parseFloat(document.getElementById("bwRatio").value);
                 const startHz = inputMhzToHz("freqStart");
                 const endHz = inputMhzToHz("freqEnd");
                 const converterHz = inputMhzToHz("converterFreq");
 
-                if (!sameStoredNumber(samplerate, configuredSampleRate, 1))
-                    return false;
-                if (!sameStoredNumber(rfBandwidth, configuredRfBandwidth, 1))
-                    return false;
-                if (!sameStoredNumber(bwRatio, configuredBwRatio, 1e-9))
-                    return false;
                 if (!sameStoredFrequency(startHz, configuredFreq0))
                     return false;
                 if (!sameStoredFrequency(endHz, configuredFreq1))
@@ -5772,11 +5852,26 @@
                 currentBinsFreq1 = 0;
                 wfRows = [];
                 clearWaterfallPixels();
-                if (wfImageData) wfCtx.putImageData(wfImageData, 0, 0);
+                if (wfImageData) presentWaterfallImage();
             }
 
             async function startOrRestartScan(options = { resetView: true }) {
                 options = Object.assign({ resetView: true }, options || {});
+                const userInitiated = !!options.userInitiated;
+                if (options.autoRetry) {
+                    if (
+                        userStopped ||
+                        !desiredScanRunning ||
+                        options.stopSerial !== manualStopSerial
+                    ) {
+                        return null;
+                    }
+                } else {
+                    if (userStopped && !userInitiated) return null;
+                    if (userInitiated) userStopped = false;
+                    desiredScanRunning = true;
+                }
+                const stopSerial = manualStopSerial;
                 if (
                     options.resetView !== false &&
                     scanControlsMatchAppliedSettings()
@@ -5784,7 +5879,6 @@
                     options.resetView = false;
                     options.preserveView = true;
                 }
-                desiredScanRunning = true;
                 clearAutoRestartTimer();
                 const serial = ++scanRequestSerial;
                 viewRequestSerial++;
@@ -5815,7 +5909,16 @@
                     buildScanRequest(options),
                     { timeoutMs: 15000 },
                 );
-                if (serial !== scanRequestSerial) return result;
+                if (
+                    serial !== scanRequestSerial ||
+                    stopSerial !== manualStopSerial ||
+                    userStopped
+                ) {
+                    if (result && result.status === "ok") {
+                        await apiPost("/api/stop", {});
+                    }
+                    return result;
+                }
 
                 if (!result) {
                     clearAutoRestartTimer();
@@ -5851,8 +5954,11 @@
                 }, 80);
             }
 
-            async function updateBackendRateLimit() {
+            async function updateBackendWaterfallRate() {
                 const result = await apiPost("/api/rate", {
+                    min_rate_lps: parseInt(
+                        document.getElementById("minRate").value,
+                    ),
                     rate_limit_lps: parseInt(
                         document.getElementById("rateLimit").value,
                     ),
@@ -5868,6 +5974,8 @@
                         setRateLimitValue(result.rate_limit_lps);
                     if (result.min_rate_lps !== undefined)
                         setMinRateValue(result.min_rate_lps);
+                    if (result.view_id !== undefined)
+                        currentViewId = Number(result.view_id);
                     syncPlutoControls(result);
                     updateFFTInfo(result);
                     updateUI(!!result.scanning, true);
@@ -5877,40 +5985,27 @@
                 }
             }
 
-            async function updateBackendMinRate() {
-                const result = await apiPost("/api/min-rate", {
-                    min_rate_lps: parseInt(
-                        document.getElementById("minRate").value,
-                    ),
-                });
+            async function updateBackendRateLimit() {
+                return updateBackendWaterfallRate();
+            }
 
-                if (!result) {
-                    updateUI(false, false);
-                    disconnectSSE();
-                    return;
-                }
-                if (result.status === "ok") {
-                    if (result.min_rate_lps !== undefined)
-                        setMinRateValue(result.min_rate_lps);
-                    syncPlutoControls(result);
-                    updateFFTInfo(result);
-                    updateUI(!!result.scanning, true);
-                    if (result.scanning && !eventSource) connectSSE();
-                } else {
-                    updateUI(false, true);
-                }
+            async function updateBackendMinRate() {
+                return updateBackendWaterfallRate();
             }
 
             document
                 .getElementById("btnStart")
                 .addEventListener("click", async function () {
-                    await startOrRestartScan();
+                    await startOrRestartScan({ userInitiated: true });
                 });
 
             document
                 .getElementById("btnStop")
                 .addEventListener("click", async function () {
+                    manualStopSerial++;
+                    userStopped = true;
                     desiredScanRunning = false;
+                    autoRestartInFlight = false;
                     clearAutoRestartTimer();
                     scanRequestSerial++;
                     viewRequestSerial++;
@@ -5956,8 +6051,7 @@
                 const maxChanged = changes.maxChanged || rateMaxDirty;
                 rateMinDirty = false;
                 rateMaxDirty = false;
-                if (minChanged) await updateBackendMinRate();
-                if (maxChanged) await updateBackendRateLimit();
+                if (minChanged || maxChanged) await updateBackendWaterfallRate();
             }
 
             document
@@ -5979,12 +6073,12 @@
             document
                 .getElementById("directSampling")
                 .addEventListener("change", handleDirectSamplingChanged);
-            document
-                .getElementById("samplerate")
-                .addEventListener("change", handleSamplerateChanged);
-            document
-                .getElementById("rfBandwidth")
-                .addEventListener("change", handleSamplerateChanged);
+            const timeMarksSelect = document.getElementById("timeMarks");
+            if (timeMarksSelect) {
+                timeMarksSelect.addEventListener("change", function () {
+                    setTimeMarksSeconds(this.value);
+                });
+            }
 
             /**
              * Enable or disable automatic waterfall level control.
@@ -6171,6 +6265,7 @@
             };
 
             (async function init() {
+                restoreTimeMarksSetting();
                 const status = await apiGet("/api/status");
                 if (status) {
                     syncDeviceInfo(status);
@@ -6238,10 +6333,6 @@
                         document.getElementById("converterFreq").value =
                             status.converter_freq / 1e6;
                     }
-                    syncSampleRateOptions(
-                        status.sample_rates,
-                        status.active_samplerate || status.samplerate,
-                    );
                     syncPlutoControls(status);
                     if (status.direct_sampling_max_hz !== undefined) {
                         currentDirectSamplingMaxHz = Number(
