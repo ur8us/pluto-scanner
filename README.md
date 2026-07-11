@@ -74,6 +74,34 @@ libiio devices and AD936x attributes remain available.
 
 ## Build
 
+The main `Makefile` is the source-build entry point for Linux, macOS, and
+Windows through MSYS2/MinGW:
+
+```sh
+make
+make check
+```
+
+`make` auto-detects the host system, uses `pkg-config` for `libiio` when
+available, adds the required WinSock libraries on MSYS2/MinGW, and builds a
+native local executable. Use `make build-info` to inspect the detected compiler
+flags and libraries, or `make install-deps-help` to print dependency commands
+for common systems.
+
+Local release packaging is also exposed through Makefile targets:
+
+```sh
+make release-local
+make package-tar
+make package-appimage
+make package-zip
+make package-dmg
+```
+
+These targets call the same `tools/ci` scripts used by GitHub Actions. Platform
+packages still need the matching host OS: AppImage on Linux, zip on MSYS2/MinGW
+Windows, and dmg on macOS.
+
 ### Linux
 
 ```sh
