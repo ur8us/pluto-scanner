@@ -6,6 +6,7 @@ DEPS_PREFIX="${DEPS_PREFIX:-$ROOT_DIR/.release/deps}"
 OUT="${OUT:-$ROOT_DIR/.release/bin/pluto-scanner${EXE_EXT:-}}"
 CC="${CC:-cc}"
 STATIC_MODE="${STATIC_MODE:-full}"
+CFLAGS_EXTRA="${CFLAGS:-}"
 
 mkdir -p "$(dirname "$OUT")"
 
@@ -30,6 +31,8 @@ esac
 extra_libs=()
 case "$(uname -s)" in
     MINGW*|MSYS*|CYGWIN*)
+        # libiio's Windows header uses dllimport unless static consumers define this.
+        CFLAGS_EXTRA="${CFLAGS_EXTRA} -DLIBIIO_STATIC"
         extra_libs+=("-lws2_32" "-liphlpapi")
         ;;
     Darwin)
@@ -42,9 +45,9 @@ esac
 
 # shellcheck disable=SC2086
 "$CC" -std=c99 -Wall -Wextra -Wformat-security -O2 \
-    ${CFLAGS:-} $pkg_cflags \
+    $CFLAGS_EXTRA $pkg_cflags \
     -o "$OUT" "$ROOT_DIR/main.c" \
-    ${LDFLAGS:-} "${ldflags[@]}" $pkg_libs "${extra_libs[@]}"
+    ${LDFLAGS:-} ${ldflags[@]+"${ldflags[@]}"} $pkg_libs ${extra_libs[@]+"${extra_libs[@]}"}
 
 file "$OUT" || true
 
