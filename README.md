@@ -8,6 +8,15 @@ The app keeps the original scanner UI model: a small C HTTP server on `localhost
 set RX LO -> discard stale buffers -> refill useful buffer -> FFT -> publish row
 ```
 
+## Project Scope
+
+This project is focused on ADALM-Pluto SDR and directly compatible devices.
+Support for other receiver families is not planned for now.
+
+Demodulators and decoders are also out of scope for now. This includes SSB, FM,
+AM, and digital-mode decoding. The program is intended as a spectrum/waterfall
+scanner and high-zoom inspection tool, not as a general audio or data receiver.
+
 ## Releases
 
 Release builds are published on GitHub:
