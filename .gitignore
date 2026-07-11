@@ -13,3 +13,4 @@ test-results/
 playwright-report/
 ui-test-screenshots/
 PHASE*/
+.release/

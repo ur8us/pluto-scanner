@@ -1,0 +1,234 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+env:
+  LIBIIO_REF: v0.26
+  LIBXML2_VERSION: 2.12.10
+
+jobs:
+  linux:
+    name: Linux ${{ matrix.target }}
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: linux-x86_64
+            runner: ubuntu-24.04
+            appimage_arch: x86_64
+          - target: linux-aarch64
+            runner: ubuntu-24.04-arm
+            appimage_arch: aarch64
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Install build tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            build-essential \
+            cmake \
+            curl \
+            file \
+            musl-tools \
+            ninja-build \
+            pkg-config \
+            xz-utils
+
+      - name: Build static libxml2 and libiio
+        run: |
+          CC=musl-gcc \
+          DEPS_PREFIX="$PWD/.release/deps" \
+          BUILD_ROOT="$PWD/.release/build-${{ matrix.target }}" \
+          tools/ci/build-static-deps.sh
+
+      - name: Build static scanner
+        run: |
+          CC=musl-gcc \
+          STATIC_MODE=full \
+          VERIFY_STATIC=1 \
+          DEPS_PREFIX="$PWD/.release/deps" \
+          OUT="$PWD/.release/bin/pluto-scanner" \
+          tools/ci/build-release-binary.sh
+
+      - name: Package tar.gz
+        run: |
+          OUT_DIR="$PWD/.release/out" \
+          tools/ci/package-release.sh \
+            "${GITHUB_REF_NAME}" \
+            "${{ matrix.target }}" \
+            "$PWD/.release/bin/pluto-scanner" \
+            tar.gz
+
+      - name: Package AppImage
+        run: |
+          OUT_DIR="$PWD/.release/out" \
+          tools/ci/package-appimage.sh \
+            "${GITHUB_REF_NAME}" \
+            "${{ matrix.target }}" \
+            "$PWD/.release/bin/pluto-scanner" \
+            "${{ matrix.appimage_arch }}"
+
+      - name: Upload release artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-${{ matrix.target }}
+          path: .release/out/*
+          if-no-files-found: error
+
+  windows:
+    name: Windows x86_64
+    runs-on: windows-latest
+    defaults:
+      run:
+        shell: msys2 {0}
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Set up MSYS2
+        uses: msys2/setup-msys2@v2
+        with:
+          msystem: UCRT64
+          update: true
+          install: >-
+            base-devel
+            git
+            mingw-w64-ucrt-x86_64-cmake
+            mingw-w64-ucrt-x86_64-gcc
+            mingw-w64-ucrt-x86_64-ninja
+            mingw-w64-ucrt-x86_64-pkgconf
+            mingw-w64-ucrt-x86_64-python
+            xz
+
+      - name: Build static libxml2 and libiio
+        run: |
+          DEPS_PREFIX="$PWD/.release/deps" \
+          BUILD_ROOT="$PWD/.release/build-windows-x86_64" \
+          tools/ci/build-static-deps.sh
+
+      - name: Build static scanner
+        run: |
+          STATIC_MODE=full \
+          DEPS_PREFIX="$PWD/.release/deps" \
+          EXE_EXT=.exe \
+          OUT="$PWD/.release/bin/pluto-scanner.exe" \
+          tools/ci/build-release-binary.sh
+
+      - name: Package zip
+        run: |
+          OUT_DIR="$PWD/.release/out" \
+          tools/ci/package-release.sh \
+            "${GITHUB_REF_NAME}" \
+            windows-x86_64 \
+            "$PWD/.release/bin/pluto-scanner.exe" \
+            zip
+
+      - name: Upload release artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-windows-x86_64
+          path: .release/out/*
+          if-no-files-found: error
+
+  macos:
+    name: macOS universal
+    runs-on: macos-15-intel
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Install build tools
+        run: |
+          brew install cmake ninja pkg-config
+
+      - name: Build static dependency and scanner slices
+        run: |
+          set -euo pipefail
+          mkdir -p "$PWD/.release/bin"
+          for arch in x86_64 arm64; do
+            DEPS_PREFIX="$PWD/.release/deps-$arch" \
+            BUILD_ROOT="$PWD/.release/build-macos-$arch" \
+            CMAKE_OSX_ARCHITECTURES="$arch" \
+            CMAKE_OSX_DEPLOYMENT_TARGET=11.0 \
+            tools/ci/build-static-deps.sh
+
+            DEPS_PREFIX="$PWD/.release/deps-$arch" \
+            STATIC_MODE=deps \
+            CFLAGS="-arch $arch -mmacosx-version-min=11.0" \
+            LDFLAGS="-arch $arch -mmacosx-version-min=11.0" \
+            OUT="$PWD/.release/bin/pluto-scanner-$arch" \
+            tools/ci/build-release-binary.sh
+          done
+
+      - name: Create universal binary
+        run: |
+          lipo -create \
+            "$PWD/.release/bin/pluto-scanner-x86_64" \
+            "$PWD/.release/bin/pluto-scanner-arm64" \
+            -output "$PWD/.release/bin/pluto-scanner"
+          lipo -info "$PWD/.release/bin/pluto-scanner"
+          otool -L "$PWD/.release/bin/pluto-scanner"
+
+      - name: Package universal DMG
+        run: |
+          OUT_DIR="$PWD/.release/out" \
+          tools/ci/package-macos-dmg.sh \
+            "${GITHUB_REF_NAME}" \
+            "$PWD/.release/bin/pluto-scanner"
+
+      - name: Upload release artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-macos-universal
+          path: .release/out/*
+          if-no-files-found: error
+
+  release:
+    name: Publish GitHub release
+    if: startsWith(github.ref, 'refs/tags/')
+    needs:
+      - linux
+      - windows
+      - macos
+    runs-on: ubuntu-24.04
+
+    steps:
+      - name: Download build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: release-assets
+          merge-multiple: true
+
+      - name: Create checksums
+        run: |
+          cd release-assets
+          sha256sum * > SHA256SUMS.txt
+          cat SHA256SUMS.txt
+
+      - name: Create or update GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          tag="${GITHUB_REF_NAME}"
+          if gh release view "$tag" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release upload "$tag" release-assets/* --repo "$GITHUB_REPOSITORY" --clobber
+          else
+            gh release create "$tag" release-assets/* \
+              --repo "$GITHUB_REPOSITORY" \
+              --title "$tag" \
+              --verify-tag \
+              --generate-notes
+          fi

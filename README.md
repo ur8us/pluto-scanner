@@ -187,6 +187,25 @@ cancels, or hard reconnect
 messages; the bounded CIC and continuity unit checks do not replace that
 long-run hardware pass.
 
+## Release Builds
+
+Pushing a tag named `v*` starts the GitHub Actions release workflow. The workflow
+builds static release binaries with static `libiio` and `libxml2` linked in,
+packages the runtime assets next to the executable, and uploads the files to the
+GitHub release.
+
+Expected release assets:
+
+- `linux-x86_64` tar.gz and AppImage.
+- `linux-aarch64` tar.gz and AppImage.
+- `windows-x86_64` zip.
+- `macos-universal` dmg.
+- `SHA256SUMS.txt`.
+
+The release builds use the network/XML libiio backends for the default
+`ip:pluto.local` workflow. Runtime packages include `index.html`, `bands.ini`,
+`markers.ini`, license, and project documentation beside the executable.
+
 ## Files
 
 - `main.c` - C backend, HTTP API, libiio Pluto control, FFT/waterfall pipeline.
