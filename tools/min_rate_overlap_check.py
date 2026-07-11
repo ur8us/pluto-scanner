@@ -90,6 +90,14 @@ def port_is_free():
         sock.close()
 
 
+def stop_backend_process(process):
+    """Request backend process exit using a signal supported by this platform."""
+    if os.name == "nt":
+        process.terminate()
+    else:
+        process.send_signal(signal.SIGINT)
+
+
 def start_payload(min_rate_lps=0):
     """Build a deep x64 single-frequency request centered at 435 MHz."""
     center = 435_000_000.0
@@ -212,7 +220,7 @@ def run_check():
                     }
                 )
             http_json("POST", "/api/stop", {})
-            process.send_signal(signal.SIGINT)
+            stop_backend_process(process)
             output = process.communicate(timeout=10)[0]
         finally:
             if process.poll() is None:

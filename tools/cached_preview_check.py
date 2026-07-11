@@ -143,6 +143,14 @@ def port_is_free():
         sock.close()
 
 
+def stop_backend_process(process):
+    """Request backend process exit using a signal supported by this platform."""
+    if os.name == "nt":
+        process.terminate()
+    else:
+        process.send_signal(signal.SIGINT)
+
+
 def view_bounds(center_hz, span_hz):
     """Return visible start/end for one centered view."""
     return center_hz - span_hz * 0.5, center_hz + span_hz * 0.5
@@ -255,7 +263,7 @@ def run_check():
                     raise RuntimeError(f"row changed CIC/overlap metadata: {row}")
 
             http_json("POST", "/api/stop", {})
-            process.send_signal(signal.SIGINT)
+            stop_backend_process(process)
             output = process.communicate(timeout=10)[0]
         finally:
             if reader:

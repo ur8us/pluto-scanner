@@ -67,7 +67,7 @@ cmake -S "$libxml_src" -B "$BUILD_ROOT/libxml2-build" -G "$GENERATOR" \
     -DLIBXML2_WITH_PYTHON=OFF \
     -DLIBXML2_WITH_PROGRAMS=OFF \
     -DLIBXML2_WITH_TESTS=OFF \
-    "${cmake_arch_args[@]}"
+    ${cmake_arch_args[@]+"${cmake_arch_args[@]}"}
 cmake --build "$BUILD_ROOT/libxml2-build" --config Release --parallel
 cmake --install "$BUILD_ROOT/libxml2-build" --config Release
 
@@ -103,7 +103,7 @@ cmake -S "$libiio_src" -B "$BUILD_ROOT/libiio-build" -G "$GENERATOR" \
     -DCSHARP_BINDINGS=OFF \
     -DPYTHON_BINDINGS=OFF \
     ${libiio_c_flags_args[@]+"${libiio_c_flags_args[@]}"} \
-    "${cmake_arch_args[@]}"
+    ${cmake_arch_args[@]+"${cmake_arch_args[@]}"}
 cmake --build "$BUILD_ROOT/libiio-build" --config Release --parallel
 cmake --install "$BUILD_ROOT/libiio-build" --config Release
 
