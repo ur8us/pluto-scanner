@@ -31,6 +31,26 @@ The release builds use the network/XML libiio backends for the default
 `ip:192.168.2.1` workflow. Runtime packages include `index.html`, `bands.ini`,
 `markers.ini`, license, and project documentation beside the executable.
 
+To download and unpack the Linux x86_64 tarball:
+
+```sh
+mkdir -p ~/Downloads/pluto-scanner
+cd ~/Downloads/pluto-scanner
+
+curl -LO https://github.com/ur8us/pluto-scanner/releases/download/v0.1.0/pluto-scanner-v0.1.0-linux-x86_64.tar.gz
+tar -xzf pluto-scanner-v0.1.0-linux-x86_64.tar.gz
+cd pluto-scanner-v0.1.0-linux-x86_64
+
+./pluto-scanner
+```
+
+The `tar` flags are: `-x` extract, `-z` gzip, and `-f` use the named archive
+file. To use a specific Pluto address:
+
+```sh
+./pluto-scanner --uri 192.168.2.1
+```
+
 ## My Motivation
 
 I want this project to explore new principles for SDR tools:
