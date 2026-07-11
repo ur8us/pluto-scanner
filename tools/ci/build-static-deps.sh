@@ -35,6 +35,18 @@ if [ -n "${CMAKE_OSX_DEPLOYMENT_TARGET:-}" ]; then
     cmake_arch_args+=("-DCMAKE_OSX_DEPLOYMENT_TARGET=${CMAKE_OSX_DEPLOYMENT_TARGET}")
 fi
 
+libiio_c_flags="${CFLAGS:-}"
+case "$(uname -s)" in
+    MINGW*|MSYS*|CYGWIN*)
+        # libxml2's Windows headers use dllimport unless static consumers define this.
+        libiio_c_flags="${libiio_c_flags} -DLIBXML_STATIC"
+        ;;
+esac
+libiio_c_flags_args=()
+if [ -n "$libiio_c_flags" ]; then
+    libiio_c_flags_args+=("-DCMAKE_C_FLAGS=${libiio_c_flags}")
+fi
+
 libxml_minor="${LIBXML2_VERSION%.*}"
 libxml_archive="$BUILD_ROOT/libxml2-${LIBXML2_VERSION}.tar.xz"
 libxml_src="$BUILD_ROOT/libxml2-${LIBXML2_VERSION}"
@@ -90,6 +102,7 @@ cmake -S "$libiio_src" -B "$BUILD_ROOT/libiio-build" -G "$GENERATOR" \
     -DCPP_BINDINGS=OFF \
     -DCSHARP_BINDINGS=OFF \
     -DPYTHON_BINDINGS=OFF \
+    ${libiio_c_flags_args[@]+"${libiio_c_flags_args[@]}"} \
     "${cmake_arch_args[@]}"
 cmake --build "$BUILD_ROOT/libiio-build" --config Release --parallel
 cmake --install "$BUILD_ROOT/libiio-build" --config Release
