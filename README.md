@@ -88,6 +88,10 @@ native local executable. Use `make build-info` to inspect the detected compiler
 flags and libraries, or `make install-deps-help` to print dependency commands
 for common systems.
 
+`make check` may build an internal synthetic CIC test executable, but it is kept
+under `.build/tests/` and is not part of the normal source tree, release
+packages, or user-facing scanner program.
+
 Local release packaging is also exposed through Makefile targets:
 
 ```sh

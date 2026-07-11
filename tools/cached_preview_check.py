@@ -17,7 +17,29 @@ import urllib.request
 
 BASE = "http://127.0.0.1:8080"
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-TEST_BINARY = os.path.join(ROOT, "pluto-scanner-cic-test")
+
+
+def find_test_binary():
+    """Return the hidden synthetic scanner binary path used by Makefile."""
+    env_path = os.environ.get("PLUTO_CIC_TEST_BINARY")
+    candidates = []
+    if env_path:
+        candidates.append(env_path)
+    candidates.extend(
+        [
+            os.path.join(ROOT, ".build", "tests", "pluto-scanner-cic-test"),
+            os.path.join(ROOT, ".build", "tests", "pluto-scanner-cic-test.exe"),
+            os.path.join(ROOT, "pluto-scanner-cic-test"),
+            os.path.join(ROOT, "pluto-scanner-cic-test.exe"),
+        ]
+    )
+    for path in candidates:
+        if os.path.isfile(path):
+            return path
+    return candidates[0]
+
+
+TEST_BINARY = find_test_binary()
 
 
 def http_json(method, path, payload=None, timeout=20):
@@ -155,7 +177,9 @@ def int_field(payload, name):
 def run_check():
     """Run the cache preview validation against a private synthetic backend."""
     if not os.path.isfile(TEST_BINARY):
-        raise RuntimeError(f"missing {TEST_BINARY}; run make pluto-scanner-cic-test")
+        raise RuntimeError(
+            f"missing {TEST_BINARY}; run make cic-synthetic-test or make check"
+        )
     if not port_is_free():
         raise RuntimeError("TCP port 8080 is already in use")
 
@@ -164,7 +188,7 @@ def run_check():
     shifted_start, shifted_end = view_bounds(center + 25.0, span_hz)
 
     with tempfile.TemporaryDirectory(prefix="pluto-cache-preview-") as temp_dir:
-        binary = os.path.join(temp_dir, "pluto-scanner-cic-test")
+        binary = os.path.join(temp_dir, os.path.basename(TEST_BINARY))
         shutil.copy2(TEST_BINARY, binary)
         process = subprocess.Popen(
             [binary],

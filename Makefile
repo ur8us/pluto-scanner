@@ -2,6 +2,7 @@ SHELL := /bin/sh
 
 PROGRAM := pluto-scanner
 TEST_PROGRAM := pluto-scanner-cic-test
+BUILD_DIR ?= .build
 
 UNAME_S := $(shell uname -s 2>/dev/null || echo unknown)
 UNAME_M := $(shell uname -m 2>/dev/null || echo unknown)
@@ -59,11 +60,11 @@ CPPFLAGS += $(IIO_CFLAGS)
 LDLIBS ?= $(IIO_LIBS) $(MATH_LIBS) $(THREAD_LIBS) $(OS_LIBS)
 
 TARGET := $(PROGRAM)$(EXEEXT)
-TEST_TARGET := $(TEST_PROGRAM)$(EXEEXT)
+TEST_TARGET := $(BUILD_DIR)/tests/$(TEST_PROGRAM)$(EXEEXT)
 
 ifeq ($(EXEEXT),.exe)
   COMPAT_TARGETS := $(PROGRAM)
-  COMPAT_TEST_TARGETS := $(TEST_PROGRAM)
+  COMPAT_TEST_TARGETS :=
 else
   COMPAT_TARGETS :=
   COMPAT_TEST_TARGETS :=
@@ -86,15 +87,16 @@ all: $(TARGET) $(COMPAT_TARGETS)
 $(TARGET): main.c
 	$(CC) $(STD_CFLAGS) $(WARN_CFLAGS) $(CFLAGS) $(THREAD_CFLAGS) $(CPPFLAGS) -o $@ $< $(LDFLAGS) $(LDLIBS)
 
-$(TEST_TARGET): main.c
+$(BUILD_DIR)/tests:
+	mkdir -p $@
+
+$(TEST_TARGET): main.c | $(BUILD_DIR)/tests
 	$(CC) $(STD_CFLAGS) $(WARN_CFLAGS) -Wno-unused-function $(CFLAGS) $(THREAD_CFLAGS) $(CPPFLAGS) -DPSEUDO_RANDOM_SAMPLE_SOURCE=2 -o $@ $< $(LDFLAGS) $(LDLIBS)
 
 ifeq ($(EXEEXT),.exe)
 $(PROGRAM): $(TARGET)
 	cp -f $< $@
 
-$(TEST_PROGRAM): $(TEST_TARGET)
-	cp -f $< $@
 endif
 
 help:
@@ -106,6 +108,7 @@ help:
 	@echo "  make run              Run with default PLUTO_URI=ip:192.168.2.1"
 	@echo "  make check            Build and run local validation checks"
 	@echo "  make clean            Remove local build outputs"
+	@echo "  make cic-synthetic-test"
 	@echo ""
 	@echo "Diagnostics:"
 	@echo "  make build-info       Show detected OS, compiler flags, and libraries"
@@ -162,15 +165,15 @@ run: $(TARGET)
 smoke-test:
 	tools/http_smoke_test.sh
 
-check: all $(TEST_TARGET) $(COMPAT_TEST_TARGETS)
+check: all $(TEST_TARGET)
 	perl -0777 -ne 'print $$1 if /<script>(.*?)<\/script>/s' index.html | node --check
 	tools/cic_stability_check.py --quiet
 	tools/cic_continuity_check.py --quiet
-	tools/cic_synthetic_signal_check.py --quiet
+	PLUTO_CIC_TEST_BINARY="$(TEST_TARGET)" tools/cic_synthetic_signal_check.py --quiet
 	@echo "Build checks passed."
 
-cic-synthetic-test: $(TEST_TARGET) $(COMPAT_TEST_TARGETS)
-	tools/cic_synthetic_signal_check.py
+cic-synthetic-test: $(TEST_TARGET)
+	PLUTO_CIC_TEST_BINARY="$(TEST_TARGET)" tools/cic_synthetic_signal_check.py
 
 release-deps:
 	DEPS_PREFIX="$(DEPS_PREFIX)" BUILD_ROOT="$(BUILD_ROOT)" tools/ci/build-static-deps.sh
@@ -199,7 +202,8 @@ release-local: package-tar package-appimage
 endif
 
 clean:
-	rm -f $(TARGET) $(TEST_TARGET) $(COMPAT_TARGETS) $(COMPAT_TEST_TARGETS)
+	rm -f $(TARGET) $(COMPAT_TARGETS)
+	rm -rf "$(BUILD_DIR)"
 
 distclean: clean
 	rm -rf "$(RELEASE_DIR)"

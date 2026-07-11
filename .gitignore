@@ -1,6 +1,7 @@
 pluto-scanner
 pluto-scanner-cic-test
 pluto-scanner.conf
+.build/
 *.o
 *.d
 core
