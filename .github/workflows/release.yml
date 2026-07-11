@@ -152,6 +152,7 @@ jobs:
 
       - name: Install build tools
         run: |
+          brew untap aws/tap || true
           brew install cmake ninja pkg-config
 
       - name: Build static dependency and scanner slices

@@ -57,7 +57,9 @@ jobs:
         uses: actions/checkout@v7
 
       - name: Install dependencies
-        run: brew install cmake ninja node pkg-config
+        run: |
+          brew untap aws/tap || true
+          brew install cmake ninja node pkg-config
 
       - name: Build static libxml2 and libiio
         run: tools/ci/build-static-deps.sh
