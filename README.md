@@ -8,6 +8,29 @@ The app keeps the original scanner UI model: a small C HTTP server on `localhost
 set RX LO -> discard stale buffers -> refill useful buffer -> FFT -> publish row
 ```
 
+## Releases
+
+Release builds are published on GitHub:
+
+https://github.com/ur8us/pluto-scanner/releases
+
+Pushing a tag named `v*` starts the GitHub Actions release workflow. The workflow
+builds static release binaries with static `libiio` and `libxml2` linked in,
+packages the runtime assets next to the executable, and uploads the files to the
+GitHub release.
+
+Expected release assets:
+
+- `linux-x86_64` tar.gz and AppImage.
+- `linux-aarch64` tar.gz and AppImage.
+- `windows-x86_64` zip.
+- `macos-universal` dmg.
+- `SHA256SUMS.txt`.
+
+The release builds use the network/XML libiio backends for the default
+`ip:pluto.local` workflow. Runtime packages include `index.html`, `bands.ini`,
+`markers.ini`, license, and project documentation beside the executable.
+
 ## My Motivation
 
 I want this project to explore new principles for SDR tools:
@@ -93,10 +116,8 @@ http://localhost:8080
 
 ## QO-100 narrowband transponder
 
-The screenshot below was captured from the live browser UI after one minute on the QO-100 narrowband transponder band.
-
-
-![QO-100 narrowband waterfall](images/qo100-nb-transponder.png)
+The QO-100 narrowband transponder band is a useful live waterfall test target.
+No screenshot is currently tracked in this public repository.
 
 ## UI Controls
 
@@ -186,25 +207,6 @@ carrier continuity. Watch the backend log for `CIC queue waited ...`,
 cancels, or hard reconnect
 messages; the bounded CIC and continuity unit checks do not replace that
 long-run hardware pass.
-
-## Release Builds
-
-Pushing a tag named `v*` starts the GitHub Actions release workflow. The workflow
-builds static release binaries with static `libiio` and `libxml2` linked in,
-packages the runtime assets next to the executable, and uploads the files to the
-GitHub release.
-
-Expected release assets:
-
-- `linux-x86_64` tar.gz and AppImage.
-- `linux-aarch64` tar.gz and AppImage.
-- `windows-x86_64` zip.
-- `macos-universal` dmg.
-- `SHA256SUMS.txt`.
-
-The release builds use the network/XML libiio backends for the default
-`ip:pluto.local` workflow. Runtime packages include `index.html`, `bands.ini`,
-`markers.ini`, license, and project documentation beside the executable.
 
 ## Files
 
