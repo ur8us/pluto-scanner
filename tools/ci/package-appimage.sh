@@ -24,13 +24,33 @@ for asset in index.html bands.ini markers.ini README.md LICENSE PLUTO.MD SPEC.MD
     cp "$ROOT_DIR/$asset" "$RUNTIME_DIR/$asset"
 done
 
+cat > "$RUNTIME_DIR/RUNNING.txt" <<'EOF'
+Run the AppImage from a terminal so startup errors stay visible.
+
+Default Pluto URI:
+  ip:192.168.2.1
+
+Examples:
+  ./pluto-scanner.AppImage
+  ./pluto-scanner.AppImage --uri 192.168.2.1
+  ./pluto-scanner.AppImage --uri ip:192.168.2.1
+  PLUTO_URI=pluto.local ./pluto-scanner.AppImage
+
+On Ubuntu systems without the older libfuse2 package, either install libfuse2
+or run with:
+  APPIMAGE_EXTRACT_AND_RUN=1 ./pluto-scanner.AppImage
+
+Open the UI at:
+  http://localhost:8080/
+EOF
+
 cat > "$APPDIR/AppRun" <<EOF
 #!/bin/sh
 set -eu
 src="\${APPDIR}/usr/share/pluto-scanner"
 dst="\${XDG_DATA_HOME:-\$HOME/.local/share}/pluto-scanner/app-${VERSION}"
 mkdir -p "\$dst"
-for f in pluto-scanner index.html bands.ini README.md LICENSE PLUTO.MD SPEC.MD SPECTRUM_CALC.MD; do
+for f in pluto-scanner index.html bands.ini README.md LICENSE PLUTO.MD SPEC.MD SPECTRUM_CALC.MD RUNNING.txt; do
     cp -f "\$src/\$f" "\$dst/\$f"
 done
 if [ ! -e "\$dst/markers.ini" ]; then

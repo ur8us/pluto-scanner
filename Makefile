@@ -22,7 +22,7 @@ $(TEST_TARGET): main.c
 	$(CC) $(STD_CFLAGS) $(WARN_CFLAGS) -Wno-unused-function $(CFLAGS) $(THREAD_CFLAGS) $(CPPFLAGS) -DPSEUDO_RANDOM_SAMPLE_SOURCE=2 -o $@ $< $(LDFLAGS) $(LDLIBS)
 
 run: $(TARGET)
-	PLUTO_URI="$${PLUTO_URI:-ip:pluto.local}" ./$(TARGET)
+	PLUTO_URI="$${PLUTO_URI:-ip:192.168.2.1}" ./$(TARGET)
 
 smoke-test:
 	tools/http_smoke_test.sh

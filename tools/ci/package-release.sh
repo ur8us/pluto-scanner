@@ -34,11 +34,13 @@ Run from this directory so the scanner can find index.html, bands.ini, and
 markers.ini next to the executable.
 
 Default Pluto URI:
-  ip:pluto.local
+  ip:192.168.2.1
 
 Examples:
-  PLUTO_URI=ip:pluto.local ./pluto-scanner
+  ./pluto-scanner
+  ./pluto-scanner --uri 192.168.2.1
   ./pluto-scanner --uri ip:192.168.2.1
+  PLUTO_URI=pluto.local ./pluto-scanner
 
 Open the UI at:
   http://localhost:8080/

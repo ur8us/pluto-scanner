@@ -28,7 +28,7 @@ Expected release assets:
 - `SHA256SUMS.txt`.
 
 The release builds use the network/XML libiio backends for the default
-`ip:pluto.local` workflow. Runtime packages include `index.html`, `bands.ini`,
+`ip:192.168.2.1` workflow. Runtime packages include `index.html`, `bands.ini`,
 `markers.ini`, license, and project documentation beside the executable.
 
 ## My Motivation
@@ -74,6 +74,8 @@ libiio devices and AD936x attributes remain available.
 
 ## Build
 
+### Linux
+
 ```sh
 make
 ```
@@ -94,18 +96,81 @@ On Debian/Ubuntu-like systems:
 ```sh
 sudo apt install build-essential libiio-dev nodejs python3 python3-pip
 python3 -m pip install -r requirements.txt
+make
+make check
+```
+
+Release-style static Linux binaries are built by GitHub Actions. Locally, use
+the tarball when AppImage support is not installed:
+
+```sh
+tar -xzf pluto-scanner-v0.1.0-linux-x86_64.tar.gz
+cd pluto-scanner-v0.1.0-linux-x86_64
+./pluto-scanner
+```
+
+AppImage files normally need FUSE. On Ubuntu systems without `libfuse2`, either
+install it or use extraction mode:
+
+```sh
+chmod +x pluto-scanner-v0.1.0-linux-x86_64.AppImage
+APPIMAGE_EXTRACT_AND_RUN=1 ./pluto-scanner-v0.1.0-linux-x86_64.AppImage
+```
+
+### Windows
+
+The current Windows build uses MSYS2 UCRT64 / MinGW. Native Microsoft C compiler
+builds are not supported yet; they are feasible, but require a separate MSVC
+dependency path for static `libiio`/`libxml2` and a small portability layer for
+threading/build flags.
+
+Install MSYS2, open the "UCRT64" shell, then install dependencies:
+
+```sh
+pacman -S --needed \
+  base-devel \
+  git \
+  mingw-w64-ucrt-x86_64-gcc \
+  mingw-w64-ucrt-x86_64-libiio \
+  mingw-w64-ucrt-x86_64-pkgconf \
+  mingw-w64-ucrt-x86_64-python \
+  mingw-w64-ucrt-x86_64-nodejs
+```
+
+Build from the same UCRT64 shell:
+
+```sh
+make
+./pluto-scanner.exe
+```
+
+The GitHub release workflow builds the Windows package with static `libiio` and
+static `libxml2`, so users of the release zip do not need MSYS2 installed.
+
+### macOS
+
+Install Xcode command-line tools and Homebrew dependencies:
+
+```sh
+xcode-select --install
+brew install libiio node python
+make
 ```
 
 ## Run
 
 ```sh
-PLUTO_URI=ip:pluto.local ./pluto-scanner
+./pluto-scanner
 ```
 
-The binary defaults to `ip:pluto.local` when `PLUTO_URI` is not set. You can also pass the URI explicitly:
+The binary defaults to `ip:192.168.2.1`, the usual Pluto USB network address.
+You can also pass a URI or bare host/IP explicitly:
 
 ```sh
+./pluto-scanner --uri 192.168.2.1
 ./pluto-scanner --uri ip:192.168.2.1
+./pluto-scanner --uri pluto.local
+PLUTO_URI=pluto.local ./pluto-scanner
 ```
 
 Open:
@@ -123,6 +188,10 @@ http://localhost:8080
 ### QO-100 lower beacon, 1 kHz bandwidth, maximum zoom
 
 ![QO-100 lower beacon, 1 kHz bandwidth, maximum zoom](images/qo-100-lower-beacon-bw-1khz-max-zoom.png)
+
+### QO-100 lower beacon, OCXO gravity influence
+
+![QO-100 lower beacon, OCXO gravity influence](images/qo-100-lower-beacon-gravity-influence-on-ocxo.png)
 
 ### QO-100 narrow-band transponder, 700 kHz bandwidth
 

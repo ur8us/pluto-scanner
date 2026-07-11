@@ -144,7 +144,7 @@ static int win32_nanosleep(const struct timespec *req, struct timespec *rem)
 #define PLUTO_DEFAULT_GAIN_DB 20.0
 #define PLUTO_GAIN_MIN_DB   -3.0
 #define PLUTO_GAIN_MAX_DB   71.0
-#define PLUTO_DEFAULT_URI   "ip:pluto.local"
+#define PLUTO_DEFAULT_URI   "ip:192.168.2.1"
 #define PLUTO_ERR_OK        0
 #define PLUTO_MIN_FREQS_CNT 1
 #define PROCESS_QUEUE_LEN   8
@@ -1473,11 +1473,47 @@ static int http_content_length(const char *req)
     return len;
 }
 
+/**
+ * @brief Normalize a user supplied libiio URI or bare Pluto host.
+ *
+ * Values that already contain a libiio URI scheme, such as `ip:host`, `usb:`,
+ * or `local:`, are copied unchanged. Bare hostnames and IPv4 addresses are
+ * converted to `ip:<value>` so command-line values like `192.168.2.1` work.
+ *
+ * @param src Input URI, hostname, or IPv4 address.
+ * @param dst Destination buffer for the normalized URI.
+ * @param dst_len Destination buffer length in bytes.
+ */
+static void normalize_pluto_uri(const char *src, char *dst, size_t dst_len)
+{
+    const char *value = (src && *src) ? src : PLUTO_DEFAULT_URI;
+
+    if (!dst || dst_len == 0)
+        return;
+
+    if (strchr(value, ':')) {
+        copy_cstr(dst, dst_len, value);
+    } else {
+        snprintf(dst, dst_len, "ip:%s", value);
+    }
+}
+
+/**
+ * @brief Return the active normalized libiio URI.
+ *
+ * `PLUTO_URI` has highest priority, followed by `--uri`, saved config, and the
+ * compiled default. Bare host/IP values are normalized to the `ip:` backend.
+ *
+ * @return Pointer to a process-lifetime URI string.
+ */
 static const char *pluto_context_uri(void)
 {
+    static char env_uri[128];
     const char *env = getenv("PLUTO_URI");
-    if (env && *env)
-        return env;
+    if (env && *env) {
+        normalize_pluto_uri(env, env_uri, sizeof(env_uri));
+        return env_uri;
+    }
     return g_pluto_uri[0] ? g_pluto_uri : PLUTO_DEFAULT_URI;
 }
 
@@ -7655,7 +7691,8 @@ static void poll_device_reconnect(void)
     static long long last_poll = 0;
     long long now = now_msec();
 
-    if (g_dev || g_scanning || now - last_poll < 5000)
+    if (!g_auto_restart_on_reconnect || g_dev || g_scanning ||
+        now - last_poll < 5000)
         return;
     if (now < g_auto_restart_suppress_until_msec)
         return;
@@ -7684,19 +7721,96 @@ static void poll_device_reconnect(void)
 #endif
 }
 
+/**
+ * @brief Test whether an argv token is the URI option.
+ *
+ * Accepts normal `--uri` and common pasted en/em dash variants so copied
+ * commands from formatted text do not silently skip the Pluto URI override.
+ *
+ * @param arg Command-line argument token.
+ * @return Non-zero when the token names the URI option.
+ */
+static int is_uri_option(const char *arg)
+{
+    return arg &&
+        (strcmp(arg, "--uri") == 0 ||
+         strcmp(arg, "\342\200\223uri") == 0 ||
+         strcmp(arg, "\342\200\224uri") == 0);
+}
+
+/**
+ * @brief Return the value part of a `--uri=value` style option.
+ *
+ * Supports normal hyphen, en dash, and em dash prefixes.
+ *
+ * @param arg Command-line argument token.
+ * @return Pointer to the value after `=`, or `NULL` when not a URI assignment.
+ */
+static const char *uri_option_value(const char *arg)
+{
+    static const char opt_plain[] = "--uri=";
+    static const char opt_en_dash[] = "\342\200\223uri=";
+    static const char opt_em_dash[] = "\342\200\224uri=";
+
+    if (!arg)
+        return NULL;
+    if (strncmp(arg, opt_plain, sizeof(opt_plain) - 1) == 0)
+        return arg + sizeof(opt_plain) - 1;
+    if (strncmp(arg, opt_en_dash, sizeof(opt_en_dash) - 1) == 0)
+        return arg + sizeof(opt_en_dash) - 1;
+    if (strncmp(arg, opt_em_dash, sizeof(opt_em_dash) - 1) == 0)
+        return arg + sizeof(opt_em_dash) - 1;
+    return NULL;
+}
+
+/**
+ * @brief Print the browser URL in an ASCII-only terminal banner.
+ *
+ * Windows consoles do not reliably render UTF-8 box-drawing characters unless
+ * the active code page and font are configured. ASCII keeps release binaries
+ * readable in cmd.exe, PowerShell, Windows Terminal, and POSIX terminals.
+ *
+ * @param url Browser URL served by the local HTTP backend.
+ */
+static void print_startup_banner(const char *url)
+{
+    printf("\n");
+    printf("+------------------------------------------------+\n");
+    printf("| %-46s |\n", PROGRAM_TITLE);
+    printf("| %-46s |\n", url ? url : "");
+    printf("+------------------------------------------------+\n");
+    printf("\n");
+}
+
 int main(int argc, char **argv)
 {
     char cli_uri[128] = {0};
+    char normalized_uri[128];
     chdir_to_executable_dir(argv ? argv[0] : NULL);
 
     for (int i = 1; i < argc; i++) {
-        if (strcmp(argv[i], "--uri") == 0 && i + 1 < argc) {
+        const char *uri_value = uri_option_value(argv[i]);
+        if (is_uri_option(argv[i])) {
+            if (i + 1 >= argc) {
+                fprintf(stderr, "Missing value for --uri\n");
+                return 2;
+            }
             copy_cstr(cli_uri, sizeof(cli_uri), argv[++i]);
-        } else if (strncmp(argv[i], "--uri=", 6) == 0) {
-            copy_cstr(cli_uri, sizeof(cli_uri), argv[i] + 6);
+        } else if (uri_value) {
+            if (!*uri_value) {
+                fprintf(stderr, "Missing value for --uri\n");
+                return 2;
+            }
+            copy_cstr(cli_uri, sizeof(cli_uri), uri_value);
         } else if (strcmp(argv[i], "--help") == 0 || strcmp(argv[i], "-h") == 0) {
-            printf("Usage: %s [--uri ip:pluto.local]\n", argv[0]);
+            printf("Usage: %s [--uri ip:192.168.2.1]\n", argv[0]);
+            printf("       %s [--uri 192.168.2.1]\n", argv[0]);
+            printf("       %s [--uri pluto.local]\n", argv[0]);
             return 0;
+        } else {
+            fprintf(stderr, "Unknown option: %s\n", argv[i]);
+            fprintf(stderr, "Use --help for usage.\n");
+            return 2;
         }
     }
 
@@ -7714,19 +7828,24 @@ int main(int argc, char **argv)
 #endif
 
     load_config();
-    if (cli_uri[0])
-        copy_cstr(g_pluto_uri, sizeof(g_pluto_uri), cli_uri);
+    if (g_pluto_uri[0]) {
+        normalize_pluto_uri(g_pluto_uri, normalized_uri, sizeof(normalized_uri));
+        copy_cstr(g_pluto_uri, sizeof(g_pluto_uri), normalized_uri);
+    }
+    if (cli_uri[0]) {
+        normalize_pluto_uri(cli_uri, normalized_uri, sizeof(normalized_uri));
+        copy_cstr(g_pluto_uri, sizeof(g_pluto_uri), normalized_uri);
+    }
 
     init_window();
     memset(g_sse_fds, 0, sizeof(g_sse_fds));
 
-    /* Open device to read info */
+    /* Print libiio info. Pluto hardware is opened lazily on Start so the
+       browser UI remains reachable even when the default network URI is down. */
     {
         char lib_ver[64], drv_ver[64];
         pluto_sdr_get_api_info(lib_ver, drv_ver);
         printf("[SDR] API: %s (drv: %s), URI: %s\n", lib_ver, drv_ver, pluto_context_uri());
-
-        open_first_device(1);
     }
 
     int server_fd = create_http_server_socket();
@@ -7742,13 +7861,7 @@ int main(int argc, char **argv)
     {
         char url[64];
         snprintf(url, sizeof(url), "http://localhost:%d", PORT);
-
-        printf("\n");
-        printf("╔════════════════════════════════════════════════╗\n");
-        printf("║ %-46s ║\n", PROGRAM_TITLE);
-        printf("║ %-46s ║\n", url);
-        printf("╚════════════════════════════════════════════════╝\n");
-        printf("\n");
+        print_startup_banner(url);
     }
 
     printf("[SDR] Waiting for scan start from web UI\n");
