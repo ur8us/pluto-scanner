@@ -1,0 +1,101 @@
+name: CI
+
+on:
+  push:
+    branches:
+      - master
+  pull_request:
+    branches:
+      - master
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  linux:
+    name: ci-linux
+    runs-on: ubuntu-24.04
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            build-essential \
+            libiio-dev \
+            nodejs \
+            perl \
+            pkg-config \
+            python3
+
+      - name: Show build configuration
+        run: make build-info
+
+      - name: Build
+        run: make
+
+      - name: Run validation checks
+        run: make check
+
+  macos:
+    name: ci-macos
+    runs-on: macos-15
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: brew install libiio node pkg-config
+
+      - name: Show build configuration
+        run: make build-info
+
+      - name: Build
+        run: make
+
+      - name: Run validation checks
+        run: make check
+
+  windows:
+    name: ci-windows
+    runs-on: windows-latest
+    defaults:
+      run:
+        shell: msys2 {0}
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Set up MSYS2
+        uses: msys2/setup-msys2@v2
+        with:
+          msystem: UCRT64
+          update: true
+          install: >-
+            base-devel
+            git
+            make
+            perl
+            mingw-w64-ucrt-x86_64-gcc
+            mingw-w64-ucrt-x86_64-libiio
+            mingw-w64-ucrt-x86_64-pkgconf
+            mingw-w64-ucrt-x86_64-python
+            mingw-w64-ucrt-x86_64-nodejs
+
+      - name: Show build configuration
+        run: make build-info
+
+      - name: Build
+        run: make
+
+      - name: Run validation checks
+        run: make check
