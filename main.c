@@ -23,17 +23,50 @@
 #include <stdint.h>
 #include <ctype.h>
 #include <math.h>
-#include <unistd.h>
 #include <pthread.h>
 #include <signal.h>
 #include <time.h>
+#ifdef _WIN32
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#include <winsock2.h>
+#include <ws2tcpip.h>
+#include <windows.h>
+#include <direct.h>
+#include <io.h>
+#ifndef ssize_t
+typedef SSIZE_T ssize_t;
+#endif
+#define chdir _chdir
+#define close(fd) closesocket((SOCKET)(uintptr_t)(fd))
+#define read(fd, buf, len) recv((SOCKET)(uintptr_t)(fd), (char *)(buf), (int)(len), 0)
+#define write(fd, buf, len) send((SOCKET)(uintptr_t)(fd), (const char *)(buf), (int)(len), 0)
+#define PATH_MAX_CHARS 1024
+static int win32_nanosleep(const struct timespec *req, struct timespec *rem)
+{
+    DWORD msec = 0;
+    (void)rem;
+    if (req) {
+        uint64_t total = (uint64_t)req->tv_sec * 1000u +
+                         (uint64_t)(req->tv_nsec + 999999L) / 1000000u;
+        msec = total > UINT32_MAX ? UINT32_MAX : (DWORD)total;
+    }
+    Sleep(msec);
+    return 0;
+}
+#define nanosleep(req, rem) win32_nanosleep((req), (rem))
+#else
+#include <unistd.h>
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <sys/select.h>
 #include <fcntl.h>
+#include <dirent.h>
+#define PATH_MAX_CHARS 1024
+#endif
 #include <errno.h>
 #include <limits.h>
-#include <dirent.h>
 #include <iio.h>
 
 #ifndef M_PI
@@ -51,7 +84,6 @@
 #define API_JSON_BODY_MAX   8192
 #define MAX_FREQS           512
 #define MAX_SAMPLE_RATES    32
-#define MAX_PATH            1024
 #define HTML_PATH           "index.html"
 #define BANDS_PATH          "bands.ini"
 #define MARKERS_PATH        "markers.ini"
@@ -369,10 +401,15 @@ static int sse_client_count(void)
 static void sse_add_client(int fd)
 {
     int added = 0;
+#ifdef _WIN32
+    u_long nonblocking = 1;
+    (void)ioctlsocket((SOCKET)(uintptr_t)fd, FIONBIO, &nonblocking);
+#else
     int flags = fcntl(fd, F_GETFL, 0);
 
     if (flags >= 0)
         (void)fcntl(fd, F_SETFL, flags | O_NONBLOCK);
+#endif
 
     pthread_mutex_lock(&g_sse_mutex);
     for (int i = 0; i < MAX_SSE_CLIENTS; i++) {
@@ -1195,7 +1232,7 @@ static int validate_markers_text(const char *body, size_t body_len,
  */
 static int write_file_atomic(const char *path, const char *body, size_t body_len)
 {
-    char tmp_path[MAX_PATH];
+    char tmp_path[PATH_MAX_CHARS];
     int fd;
     FILE *f;
     int n;
@@ -1322,9 +1359,23 @@ static void url_decode(char *s)
 
 static void chdir_to_executable_dir(const char *argv0)
 {
-    char path[PATH_MAX];
+    char path[PATH_MAX_CHARS];
     char *slash;
 
+#ifdef _WIN32
+    if (argv0 && (strchr(argv0, '/') || strchr(argv0, '\\'))) {
+        snprintf(path, sizeof(path), "%s", argv0);
+    } else {
+        DWORD n = GetModuleFileNameA(NULL, path, (DWORD)sizeof(path));
+        if (n == 0 || n >= sizeof(path))
+            return;
+        path[n] = 0;
+    }
+    for (char *p = path; *p; p++) {
+        if (*p == '\\')
+            *p = '/';
+    }
+#else
     if (argv0 && strchr(argv0, '/')) {
         snprintf(path, sizeof(path), "%s", argv0);
     } else {
@@ -1333,6 +1384,7 @@ static void chdir_to_executable_dir(const char *argv0)
             return;
         path[n] = 0;
     }
+#endif
 
     slash = strrchr(path, '/');
     if (!slash)
@@ -1600,6 +1652,7 @@ static void pluto_sdr_get_api_info(char *lib_ver, char *drv_ver)
  * Read a small sysfs attribute into `dst`, stripping newline and space.
  * Returns 0 only when the file exists and contains a non-empty value.
  */
+#ifndef _WIN32
 static int read_trimmed_sysfs_file(const char *path, char *dst, size_t dst_len)
 {
     FILE *f;
@@ -1619,6 +1672,7 @@ static int read_trimmed_sysfs_file(const char *path, char *dst, size_t dst_len)
     trim_iio_string(dst);
     return dst[0] ? 0 : -1;
 }
+#endif
 
 /**
  * pluto_read_usb_iserial:
@@ -1629,6 +1683,12 @@ static int read_trimmed_sysfs_file(const char *path, char *dst, size_t dst_len)
  */
 static int pluto_read_usb_iserial(char *serial, size_t serial_len)
 {
+#ifdef _WIN32
+    if (!serial || serial_len == 0)
+        return -1;
+    serial[0] = 0;
+    return -1;
+#else
     DIR *dir;
     struct dirent *entry;
     int found = -1;
@@ -1642,7 +1702,7 @@ static int pluto_read_usb_iserial(char *serial, size_t serial_len)
         return -1;
 
     while ((entry = readdir(dir)) != NULL) {
-        char path[MAX_PATH];
+        char path[PATH_MAX_CHARS];
         char vendor[32] = {0};
         char product[128] = {0};
         char serial_tmp[128] = {0};
@@ -1682,6 +1742,7 @@ static int pluto_read_usb_iserial(char *serial, size_t serial_len)
 
     closedir(dir);
     return found;
+#endif
 }
 
 static int pluto_sdr_get_board_info(pluto_sdr_dev_t *dev, char *hw_rev, char *fw_ver,
@@ -5935,7 +5996,7 @@ static void send_file_response(int client_fd, const char *cors, const char *path
 
 typedef struct {
     char method[16];
-    char path[MAX_PATH];
+    char path[PATH_MAX_CHARS];
     char version[16];
     const char *body;
     size_t body_len;
@@ -7534,8 +7595,13 @@ static int create_http_server_socket(void)
 
     if (fd >= 0) {
         struct sockaddr_in6 addr6;
+#ifdef _WIN32
+        setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, (const char *)&opt, sizeof(opt));
+        setsockopt(fd, IPPROTO_IPV6, IPV6_V6ONLY, (const char *)&v6only, sizeof(v6only));
+#else
         setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
         setsockopt(fd, IPPROTO_IPV6, IPV6_V6ONLY, &v6only, sizeof(v6only));
+#endif
 
         memset(&addr6, 0, sizeof(addr6));
         addr6.sin6_family = AF_INET6;
@@ -7552,7 +7618,11 @@ static int create_http_server_socket(void)
     fd = socket(AF_INET, SOCK_STREAM, 0);
     if (fd >= 0) {
         struct sockaddr_in addr;
+#ifdef _WIN32
+        setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, (const char *)&opt, sizeof(opt));
+#else
         setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
+#endif
 
         memset(&addr, 0, sizeof(addr));
         addr.sin_family = AF_INET;
@@ -7631,7 +7701,17 @@ int main(int argc, char **argv)
     }
 
     signal(SIGINT, sigint_handler);
+#ifndef _WIN32
     signal(SIGPIPE, SIG_IGN);
+#else
+    {
+        WSADATA wsa;
+        if (WSAStartup(MAKEWORD(2, 2), &wsa) != 0) {
+            fprintf(stderr, "WSAStartup failed\n");
+            return 1;
+        }
+    }
+#endif
 
     load_config();
     if (cli_uri[0])
@@ -7702,9 +7782,19 @@ int main(int argc, char **argv)
             perror("accept"); break;
         }
 
-        struct timeval to;
-        to.tv_sec = 5; to.tv_usec = 0;
-        setsockopt(client_fd, SOL_SOCKET, SO_RCVTIMEO, &to, sizeof(to));
+#ifdef _WIN32
+        {
+            DWORD timeout_ms = 5000;
+            setsockopt(client_fd, SOL_SOCKET, SO_RCVTIMEO,
+                       (const char *)&timeout_ms, sizeof(timeout_ms));
+        }
+#else
+        {
+            struct timeval to;
+            to.tv_sec = 5; to.tv_usec = 0;
+            setsockopt(client_fd, SOL_SOCKET, SO_RCVTIMEO, &to, sizeof(to));
+        }
+#endif
 
         char req[MAX_REQUEST + 1] = {0};
         int total = 0;
@@ -7739,6 +7829,9 @@ int main(int argc, char **argv)
     stop_scan();
     if (g_dev) pluto_sdr_close(g_dev);
     close(server_fd);
+#ifdef _WIN32
+    WSACleanup();
+#endif
     printf("\n[Server] Shutdown.\n");
     return 0;
 }
