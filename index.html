@@ -194,6 +194,17 @@
                 left: auto;
                 transform: none;
             }
+            .wf-step-delta {
+                position: absolute;
+                bottom: 1px;
+                transform: translateX(-50%);
+                color: rgba(150, 160, 172, 0.82);
+                font-size: 8px;
+                line-height: 1;
+                text-shadow: 0 1px 2px #000;
+                white-space: nowrap;
+                pointer-events: none;
+            }
 
             .controls {
                 display: flex;
@@ -708,12 +719,16 @@
                 <div class="ctrl-group">
                     <label>TIME MARKS</label>
                     <select id="timeMarks">
+                        <option value="0" selected>Off</option>
                         <option value="10">10s</option>
                         <option value="15">15s</option>
                         <option value="30">30s</option>
                         <option value="60">1min</option>
                         <option value="300">5min</option>
                         <option value="600">10min</option>
+                        <option value="1200">20min</option>
+                        <option value="1800">30min</option>
+                        <option value="3600">60min</option>
                     </select>
                 </div>
                 <div style="display: none">
@@ -939,8 +954,10 @@
             let desiredScanRunning = false;
             let manualStopSerial = 0;
             let userStopped = false;
+            let manualStopSuppressUntilMs = 0;
             let autoRestartTimer = 0;
             let autoRestartInFlight = false;
+            const MANUAL_STOP_RESTART_SUPPRESS_MS = 5000;
             let configuredFreq0 = 0;
             let configuredFreq1 = 0;
             let configuredBwRatio = 0.85;
@@ -978,7 +995,7 @@
             let redrawFrame = 0;
             let waterfallRenderToken = 0;
             let waterfallRenderActiveToken = 0;
-            let timeMarksSeconds = 10;
+            let timeMarksSeconds = 0;
             let currentViewRedrawWaiters = [];
             let binRangeCache = null;
             let freqScaleSignature = "";
@@ -1005,7 +1022,9 @@
             let sseReconnectTimer = 0;
             let sseFailureCount = 0;
             const MAX_ZOOM_FACTOR = 1000000;
-            const TIME_MARK_VALUES = [10, 15, 30, 60, 300, 600];
+            const TIME_MARK_VALUES = [
+                0, 10, 15, 30, 60, 300, 600, 1200, 1800, 3600,
+            ];
             const TIME_MARK_STORAGE_KEY = "timeMarksSeconds";
             const MIN_AIR_FREQ_START_MHZ = 0;
             const MIN_SCAN_SPAN_MHZ = 0.1;
@@ -1025,6 +1044,7 @@
             let waterfallAuto = true;
             let autoWfMin = null;
             let autoWfMax = null;
+            let autoWfPlanSignature = "";
             let rateMinDirty = false;
             let rateMaxDirty = false;
             const RATE_VALUES = [0, 1, 2, 5, 10, 20, 50, 100];
@@ -1151,7 +1171,7 @@
              */
             function normalizeTimeMarksSeconds(value) {
                 const seconds = Number(value);
-                return TIME_MARK_VALUES.includes(seconds) ? seconds : 10;
+                return TIME_MARK_VALUES.includes(seconds) ? seconds : 0;
             }
 
             /**
@@ -2413,13 +2433,16 @@
             }
 
             function gotoNeedsBackendDetailUpdate(finalStep) {
-                return finalStep;
+                void finalStep;
+                return true;
             }
 
             /**
-             * Animate Go To locally, then retune the backend only at the final
-             * target. This preserves fast visual feedback without repeated Pluto
-             * reconnect/restart loops while the animation is in flight.
+             * Animate Go To by requesting a true backend view at every step.
+             *
+             * Each step waits for a matching waterfall row so the animation
+             * refines FFT/CIC resolution instead of stretching the previous
+             * lower-resolution waterfall image over a narrower span.
              */
             async function runGotoAnimation(freqHz, targetZoom) {
                 cancelGotoAnimation();
@@ -2687,19 +2710,61 @@
                 );
             }
 
-            function decimalsForFrequencyStep(stepHz) {
-                const stepMHz = stepHz / 1e6;
-                for (let decimals = 0; decimals <= 5; decimals++) {
-                    const scaled = stepMHz * Math.pow(10, decimals);
-                    if (Math.abs(scaled - Math.round(scaled)) < 1e-6)
-                        return decimals;
+            /**
+             * Choose shared MHz decimals for all visible major scale ticks.
+             *
+             * @param {Array<{kind:string,freq:number,step:number}>} ticks Tick model.
+             * @returns {number} Decimal places for MHz labels: 0, 3, or 6.
+             */
+            function frequencyDecimalsForTicks(ticks) {
+                let decimals = 0;
+                for (const tick of ticks) {
+                    if (tick.kind !== "major") continue;
+                    const freqHz = Math.round(Number(tick.freq));
+                    const stepHz = Math.abs(Number(tick.step));
+                    if (
+                        (Number.isFinite(freqHz) && freqHz % 1000 !== 0) ||
+                        (Number.isFinite(stepHz) && stepHz > 0 && stepHz < 1000)
+                    ) {
+                        return 6;
+                    }
+                    if (
+                        (Number.isFinite(freqHz) && freqHz % 1000000 !== 0) ||
+                        (Number.isFinite(stepHz) && stepHz > 0 && stepHz < 1000000)
+                    ) {
+                        decimals = Math.max(decimals, 3);
+                    }
                 }
-                return 5;
+                return decimals;
             }
 
-            function formatTickMHz(freq, stepHz) {
-                const decimals = decimalsForFrequencyStep(stepHz);
+            /**
+             * Format one frequency-scale label in MHz.
+             *
+             * @param {number} freq Frequency in hertz.
+             * @param {number} decimals Number of MHz fractional digits.
+             * @returns {string} Label such as `96.123 MHz`.
+             */
+            function formatTickMHz(freq, decimals) {
                 return (freq / 1e6).toFixed(decimals) + " MHz";
+            }
+
+            /**
+             * Format the spacing label between adjacent major frequency ticks.
+             *
+             * @param {number} deltaHz Tick spacing in hertz.
+             * @returns {string} Compact hertz or kilohertz spacing label.
+             */
+            function formatScaleDelta(deltaHz) {
+                const hz = Math.abs(Number(deltaHz));
+                if (!Number.isFinite(hz) || hz <= 0) return "";
+                const trim = (value, decimals) =>
+                    value
+                        .toFixed(decimals)
+                        .replace(/0+$/, "")
+                        .replace(/\.$/, "");
+                if (hz < 1000) return trim(hz, hz < 10 ? 2 : 1) + "Hz";
+                return trim(hz / 1000, hz < 10000 ? 2 : 1) + "kHz";
             }
 
             function parseBandsIni(text) {
@@ -3289,28 +3354,43 @@
                     axis.right,
                     width,
                 );
+                const tickDecimals = frequencyDecimalsForTicks(ticks);
+                const majorTicks = ticks.filter((tick) => tick.kind === "major");
+                const nodes = ticks.map((tick) => {
+                    const mark = document.createElement("div");
+                    const label = document.createElement("div");
+                    mark.className =
+                        "wf-tick" +
+                        (tick.kind === "major" ? "" : " " + tick.kind);
+                    if (tick.pos < 2) mark.classList.add("edge-start");
+                    if (tick.pos > 98) mark.classList.add("edge-end");
+                    mark.style.left = tick.pos + "%";
+                    if (tick.kind === "major") {
+                        label.className = "wf-tick-label";
+                        label.textContent = formatTickMHz(
+                            tick.freq,
+                            tickDecimals,
+                        );
+                        mark.appendChild(label);
+                    }
+                    return mark;
+                });
 
-                overlay.replaceChildren(
-                    ...ticks.map((tick) => {
-                        const mark = document.createElement("div");
-                        const label = document.createElement("div");
-                        mark.className =
-                            "wf-tick" +
-                            (tick.kind === "major" ? "" : " " + tick.kind);
-                        if (tick.pos < 2) mark.classList.add("edge-start");
-                        if (tick.pos > 98) mark.classList.add("edge-end");
-                        mark.style.left = tick.pos + "%";
-                        if (tick.kind === "major") {
-                            label.className = "wf-tick-label";
-                            label.textContent = formatTickMHz(
-                                tick.freq,
-                                tick.step,
-                            );
-                            mark.appendChild(label);
-                        }
-                        return mark;
-                    }),
-                );
+                if (majorTicks.length >= 3) {
+                    const deltaText = formatScaleDelta(
+                        majorTicks[2].freq - majorTicks[1].freq,
+                    );
+                    if (deltaText) {
+                        const delta = document.createElement("div");
+                        delta.className = "wf-step-delta";
+                        delta.style.left =
+                            (majorTicks[1].pos + majorTicks[2].pos) * 0.5 + "%";
+                        delta.textContent = "<- " + deltaText + " ->";
+                        nodes.push(delta);
+                    }
+                }
+
+                overlay.replaceChildren(...nodes);
                 updateZoomIndicator();
             }
 
@@ -3347,6 +3427,28 @@
                     ),
                 );
                 return values[idx];
+            }
+
+            /**
+             * Reset automatic waterfall levels when FFT/CIC density changes.
+             *
+             * @param {Object} plan Backend plan/status metadata.
+             * @returns {void}
+             */
+            function resetAutoWaterfallLevelsForPlan(plan) {
+                if (!plan || !waterfallAuto) return;
+                const signature = [
+                    plan.mode || "",
+                    plan.effective_fft_size || plan.fft_size || "",
+                    plan.decim_factor || 1,
+                    plan.decim_hop || "",
+                    plan.visible_bins_per_pixel || "",
+                    plan.visible_raw_bins_per_pixel || "",
+                ].join(":");
+                if (!signature || signature === autoWfPlanSignature) return;
+                autoWfPlanSignature = signature;
+                autoWfMin = null;
+                autoWfMax = null;
             }
 
             /**
@@ -3450,7 +3552,9 @@
                 const h = wfCanvas.height;
                 const rows = Math.min(wfRows.length, h);
                 wfCtx.save();
-                wfCtx.lineWidth = 1;
+                wfCtx.lineWidth = 2;
+                wfCtx.setLineDash([4, 4]);
+                wfCtx.strokeStyle = "rgba(255,255,255,0.55)";
                 wfCtx.font =
                     "11px system-ui, -apple-system, BlinkMacSystemFont, sans-serif";
                 wfCtx.textBaseline = "top";
@@ -3472,24 +3576,22 @@
 
                     const boundaryMs = newerBucket * intervalMs;
                     const yy = Math.max(0.5, Math.min(h - 0.5, y + 0.5));
-                    for (let x = 0; x < w; x += 12) {
-                        wfCtx.strokeStyle =
-                            Math.floor(x / 12) % 2
-                                ? "rgba(255,255,255,0.95)"
-                                : "rgba(0,0,0,0.95)";
-                        wfCtx.beginPath();
-                        wfCtx.moveTo(x + 0.5, yy);
-                        wfCtx.lineTo(Math.min(w, x + 8) + 0.5, yy);
-                        wfCtx.stroke();
-                    }
+                    wfCtx.beginPath();
+                    wfCtx.moveTo(0.5, yy);
+                    wfCtx.lineTo(w + 0.5, yy);
+                    wfCtx.stroke();
 
                     const label = formatTimeMarkLabel(boundaryMs);
                     const labelY = y + 3 < h - 13 ? y + 3 : Math.max(0, y - 13);
+                    wfCtx.setLineDash([]);
                     wfCtx.strokeStyle = "rgba(0,0,0,0.9)";
                     wfCtx.lineWidth = 3;
                     wfCtx.strokeText(label, 6, labelY);
                     wfCtx.fillStyle = "rgba(255,255,255,0.95)";
                     wfCtx.fillText(label, 6, labelY);
+                    wfCtx.lineWidth = 2;
+                    wfCtx.setLineDash([4, 4]);
+                    wfCtx.strokeStyle = "rgba(255,255,255,0.55)";
                 }
 
                 wfCtx.restore();
@@ -3947,6 +4049,37 @@
             // ===================================================================
             let eventSource = null;
 
+            /**
+             * Decode the compressed SSE waterfall row payload.
+             *
+             * @param {string} text Base64 encoded packed `uint8` values.
+             * @param {number} expectedBins Expected number of display bins.
+             * @returns {?Uint8Array} Decoded row, or null on validation failure.
+             */
+            function decodeBase64U8(text, expectedBins) {
+                if (typeof text !== "string") return null;
+                let binary = "";
+                try {
+                    binary = atob(text);
+                } catch (e) {
+                    return null;
+                }
+                if (binary.length !== expectedBins) return null;
+                const values = new Uint8Array(expectedBins);
+                for (let i = 0; i < expectedBins; i++)
+                    values[i] = binary.charCodeAt(i) & 0xff;
+                return values;
+            }
+
+            /**
+             * Parse one SSE waterfall event.
+             *
+             * New backends send `encoding:"u8b64"` plus `db` packed bytes; legacy
+             * rows with numeric `d` arrays are still accepted for compatibility.
+             *
+             * @param {string} raw JSON payload from an EventSource line event.
+             * @returns {?Object} Validated row object with `d` as `Uint8Array`.
+             */
             function parseLineEventPayload(raw) {
                 let data;
                 try {
@@ -3954,24 +4087,38 @@
                 } catch (e) {
                     return null;
                 }
-                if (!data || !Array.isArray(data.d)) return null;
-                const expectedBins = Number(data.display_bins || data.d.length);
+                if (!data) return null;
+                const expectedBins = Number(
+                    data.display_bins ||
+                        (Array.isArray(data.d) ? data.d.length : 0),
+                );
                 if (
                     !Number.isInteger(expectedBins) ||
-                    expectedBins <= 0 ||
-                    data.d.length !== expectedBins
+                    expectedBins <= 0
                 ) {
+                    return null;
+                }
+                let values = null;
+                if (data.encoding === "u8b64") {
+                    values = decodeBase64U8(data.db, expectedBins);
+                    if (!values) return null;
+                } else if (Array.isArray(data.d)) {
+                    if (data.d.length !== expectedBins) return null;
+                    values = new Uint8Array(expectedBins);
+                    for (let i = 0; i < data.d.length; i++) {
+                        const v = Number(data.d[i]);
+                        if (!Number.isInteger(v) || v < 0 || v > 255)
+                            return null;
+                        values[i] = v;
+                    }
+                } else {
                     return null;
                 }
                 if (expectedBins !== displayBins()) {
                     scheduleViewUpdate(currentFreq0, currentFreq1, false);
                     return null;
                 }
-                for (let i = 0; i < data.d.length; i++) {
-                    const v = Number(data.d[i]);
-                    if (!Number.isInteger(v) || v < 0 || v > 255) return null;
-                    data.d[i] = v;
-                }
+                data.d = values;
                 if (
                     data.f0 !== undefined &&
                     data.f1 !== undefined &&
@@ -3985,6 +4132,7 @@
             }
 
             function scheduleSSEReconnect() {
+                if (userStopped || manualStopRestartSuppressed()) return;
                 if (!backendOnline || !scanRunning) return;
                 if (sseReconnectTimer) clearTimeout(sseReconnectTimer);
                 const delay = Math.min(
@@ -3993,7 +4141,13 @@
                 );
                 sseReconnectTimer = setTimeout(() => {
                     sseReconnectTimer = 0;
-                    if (backendOnline && scanRunning && !eventSource)
+                    if (
+                        !userStopped &&
+                        !manualStopRestartSuppressed() &&
+                        backendOnline &&
+                        scanRunning &&
+                        !eventSource
+                    )
                         connectSSE();
                 }, delay);
             }
@@ -4008,7 +4162,7 @@
                     const data = parseLineEventPayload(e.data);
                     if (!data) return;
                     try {
-                        const bins = Uint8Array.from(data.d);
+                        const bins = data.d;
                         const rowView =
                             data.view !== undefined
                                 ? Number(data.view)
@@ -4095,7 +4249,11 @@
                         eventSource = null;
                     }
                     const status = await checkBackendStatus();
-                    if (status || (backendOnline && scanRunning))
+                    if (
+                        !userStopped &&
+                        !manualStopRestartSuppressed() &&
+                        (status || (backendOnline && scanRunning))
+                    )
                         scheduleSSEReconnect();
                 };
             }
@@ -4145,13 +4303,30 @@
                 }
             }
 
+            /**
+             * Return whether automatic scan restarts are temporarily suppressed.
+             *
+             * Explicit Stop must win over late SSE reconnect/status-poll recovery
+             * work. A later user Start clears the suppression immediately.
+             *
+             * @returns {boolean} True when only user Start may start scanning.
+             */
+            function manualStopRestartSuppressed() {
+                return Date.now() < manualStopSuppressUntilMs;
+            }
+
             function statusDevicePresent(status) {
                 if (!status || status.device_present === undefined) return true;
                 return !!Number(status.device_present);
             }
 
             function scheduleDesiredScanRestart(status) {
-                if (userStopped || !desiredScanRunning || autoRestartInFlight)
+                if (
+                    userStopped ||
+                    manualStopRestartSuppressed() ||
+                    !desiredScanRunning ||
+                    autoRestartInFlight
+                )
                     return;
                 if (
                     !backendOnline ||
@@ -4166,6 +4341,7 @@
                     autoRestartTimer = 0;
                     if (
                         stopSerial !== manualStopSerial ||
+                        manualStopRestartSuppressed() ||
                         !desiredScanRunning ||
                         autoRestartInFlight ||
                         scanRunning ||
@@ -5652,9 +5828,34 @@
                         : Math.round(value) + " kB/s";
             }
 
+            /**
+             * Format true FFT cadence before minimum-rate overlap boosting.
+             *
+             * @param {Object} plan Backend plan/status metadata.
+             * @returns {string} Suffix such as ` 2.5 lines/s` or ` 1.3 s/line`.
+             */
+            function formatTrueWaterfallRate(plan) {
+                if (!plan) return "";
+                const value =
+                    plan.true_line_rate !== undefined
+                        ? Number(plan.true_line_rate)
+                        : plan.raw_line_rate !== undefined
+                          ? Number(plan.raw_line_rate)
+                          : NaN;
+                if (!Number.isFinite(value) || value <= 0) return "";
+                if (value >= 1)
+                    return (
+                        " " +
+                        (value < 10 ? value.toFixed(1) : value.toFixed(0)) +
+                        " lines/s"
+                    );
+                return " " + (1 / value).toFixed(1) + " s/line";
+            }
+
             function updateFFTInfo(plan) {
                 if (!plan) return;
                 updateWaterfallLineRateEstimate(plan);
+                resetAutoWaterfallLevelsForPlan(plan);
                 const fftInfo = document.getElementById("infoFFT");
                 if (!fftInfo) return;
                 const fft =
@@ -5669,7 +5870,8 @@
                         : 1;
                 if (!fft) return;
                 fftInfo.textContent =
-                    decim > 1 ? fft + " x" + decim : String(fft);
+                    (decim > 1 ? fft + " x" + decim : String(fft)) +
+                    formatTrueWaterfallRate(plan);
                 updateScanInfo(plan);
                 updateTrafficInfo(plan);
             }
@@ -5798,8 +6000,22 @@
                 }
             }
 
+            /**
+             * Build a backend start request from the current controls.
+             *
+             * A preserved visible range is only valid when it belongs to the
+             * same configured air-frequency band being submitted. This prevents
+             * stale saved views such as 70-1000 MHz from overriding a newly
+             * typed converter band on manual Start.
+             *
+             * @param {Object} options Start options.
+             * @param {boolean} options.preserveView Include current visible range.
+             * @returns {Object} JSON request for `/api/start`.
+             */
             function buildScanRequest(options = {}) {
                 sanitizeScanFrequencyInputs();
+                const configuredStartHz = inputMhzToHz("freqStart");
+                const configuredEndHz = inputMhzToHz("freqEnd");
                 const request = {
                     freq_start: parseFloat(
                         document.getElementById("freqStart").value,
@@ -5823,7 +6039,15 @@
                     ),
                     display_bins: displayBins(),
                 };
-                if (options.preserveView && hasFrequencyWindow()) {
+                if (
+                    options.preserveView &&
+                    hasFrequencyWindow() &&
+                    sameStoredFrequency(configuredStartHz, configuredFreq0) &&
+                    sameStoredFrequency(configuredEndHz, configuredFreq1) &&
+                    currentFreq0 >= configuredStartHz &&
+                    currentFreq1 <= configuredEndHz &&
+                    currentFreq1 > currentFreq0
+                ) {
                     request.visible_start_hz = currentFreq0;
                     request.visible_end_hz = currentFreq1;
                 }
@@ -5861,6 +6085,7 @@
                 if (options.autoRetry) {
                     if (
                         userStopped ||
+                        manualStopRestartSuppressed() ||
                         !desiredScanRunning ||
                         options.stopSerial !== manualStopSerial
                     ) {
@@ -5868,11 +6093,15 @@
                     }
                 } else {
                     if (userStopped && !userInitiated) return null;
-                    if (userInitiated) userStopped = false;
+                    if (userInitiated) {
+                        userStopped = false;
+                        manualStopSuppressUntilMs = 0;
+                    }
                     desiredScanRunning = true;
                 }
                 const stopSerial = manualStopSerial;
                 if (
+                    !userInitiated &&
                     options.resetView !== false &&
                     scanControlsMatchAppliedSettings()
                 ) {
@@ -6004,6 +6233,8 @@
                 .addEventListener("click", async function () {
                     manualStopSerial++;
                     userStopped = true;
+                    manualStopSuppressUntilMs =
+                        Date.now() + MANUAL_STOP_RESTART_SUPPRESS_MS;
                     desiredScanRunning = false;
                     autoRestartInFlight = false;
                     clearAutoRestartTimer();
@@ -6098,6 +6329,7 @@
                 if (!waterfallAuto) {
                     autoWfMin = null;
                     autoWfMax = null;
+                    autoWfPlanSignature = "";
                 }
                 localStorage.setItem("wfAuto", waterfallAuto ? "1" : "0");
             }

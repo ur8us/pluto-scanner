@@ -103,6 +103,10 @@ line before the exact display-bin reducer. `visible raw bins/px` is the raw
 FFT/CIC-bin density across the visible slice; it should stay at or above `1.0`
 where hardware limits allow it.
 
+The SSE transport sends those `display_bins` values as packed `uint8` bytes
+base64 encoded in `encoding:"u8b64"` / `db`. This reduces wire text overhead
+but does not change any FFT, CIC, weighting, or line-rate formula below.
+
 `2nd IF kHz` is the effective LO/source-center offset from the visible center.
 It moves the zero-IF/DC artifact away from the middle of the screen. When the
 source span is wide enough, zero IF is outside the visible span by the listed

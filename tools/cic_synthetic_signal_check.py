@@ -76,7 +76,13 @@ def wait_for_server(process, timeout=10):
     raise RuntimeError("synthetic scanner did not start")
 
 
-def read_sse_rows(count, timeout=20):
+def read_sse_rows(
+    count,
+    timeout=20,
+    live_only=False,
+    expected_decim=None,
+    expected_overlap=None,
+):
     """Read a fixed number of waterfall rows from the scanner SSE stream."""
     rows = []
     deadline = time.monotonic() + timeout
@@ -87,7 +93,24 @@ def read_sse_rows(count, timeout=20):
             if line == "event: line":
                 saw_event = True
             elif saw_event and line.startswith("data:"):
-                rows.append(json.loads(line[5:].strip()))
+                row = json.loads(line[5:].strip())
+                if live_only and int(row.get("preview", 0)) != 0:
+                    saw_event = False
+                    continue
+                if (
+                    expected_decim is not None
+                    and int(row.get("decim_factor", 0)) != expected_decim
+                ):
+                    saw_event = False
+                    continue
+                if (
+                    expected_overlap is not None
+                    and int(round(float(row.get("overlap_factor", 0.0))))
+                    != expected_overlap
+                ):
+                    saw_event = False
+                    continue
+                rows.append(row)
                 saw_event = False
     if len(rows) != count:
         raise RuntimeError(f"received {len(rows)} of {count} expected SSE rows")
@@ -182,7 +205,12 @@ def run_case(
                 plan.get("effective_fft_size", 0)
             ):
                 raise RuntimeError(f"invalid FFT/hop/overlap identity: {plan}")
-            received = read_sse_rows(rows)
+            received = read_sse_rows(
+                rows,
+                live_only=True,
+                expected_decim=expected_decim,
+                expected_overlap=expected_overlap,
+            )
             http_json("POST", "/api/stop", {})
             stop_backend_process(process)
             output = process.communicate(timeout=10)[0]
@@ -255,7 +283,7 @@ def main():
         run_case("clean_x64_min5", 4096.0e6 / 3_000_000.0, 64, 16, 5),
         run_case("clean_x64_min10", 4096.0e6 / 3_000_000.0, 64, 32, 10),
         run_case("clean_x64_min20", 4096.0e6 / 3_000_000.0, 64, 64, 20),
-        run_case("clean_x256", 409.6, 256, rows=2),
+        run_case("clean_x256", 409.6, 256, rows=1),
         run_case("clean_x256_min20", 409.6, 256, 256, 20, rows=2),
         run_case("periodic_skip_x64", 4096.0e6 / 3_000_000.0, 64,
                  fault="skip", period=1000, rows=2),

@@ -272,10 +272,15 @@ http://localhost:8080
 - Sample rate, RF bandwidth, and passband usage are auto-profiled for Pluto performance and shown read-only in the UI.
 - RF bandwidth is kept strictly below sample rate in every auto profile.
 - Waterfall rows are published as exactly one processed output bin per screen pixel; raw FFT/CIC bin counts are kept as debug metadata.
+- Waterfall row samples are transported over SSE as packed `uint8` base64
+  (`encoding:"u8b64"`) instead of JSON number arrays. This keeps the simple
+  EventSource stream but removes most of the avoidable per-bin text overhead.
 - The frontend sends `display_bins` with view/start requests so backend rows match the current canvas width.
 - Passband usage still defines hop spacing internally as `rf_bandwidth * ratio`.
 - Gain mode and hardware gain map to AD936x `gain_control_mode` and `hardwaregain`.
 - FFT/CIC status shows the active backend plan used for the current zoom.
+- The FFT/CIC status also shows the true base waterfall cadence before
+  minimum-rate overlap boosting, for example `FFT: 65536 x64 1.4 s/line`.
 - Narrow single-frequency CIC mode preserves raw-buffer continuity before the
   decimator; throttling happens after complete FFT lines so the filter state is
   not corrupted by dropped raw buffers.

@@ -294,8 +294,8 @@ CORS headers. `OPTIONS` preflight is answered with `204 No Content`.
 `samplerate` (or alias `sample_rate`), `rf_bandwidth` (or alias
 `rf_bandwidth_hz`), and `bw_ratio` are **ignored and forced** to the auto
 profile (`61.44 MSPS`, `20 MHz`, `0.85`); `direct_sampling` is always reset to
-`0`. The frontend disables those selectors (`index.html` selects are
-`disabled`) to reflect this.
+`0`. The frontend shows those values as read-only status text instead of
+ordinary user-editable controls.
 
 ### 3.9 `/api/status` response fields
 
@@ -317,7 +317,8 @@ profile (`61.44 MSPS`, `20 MHz`, `0.85`); `direct_sampling` is always reset to
 | `step_hz`, `steps`, `required_points` | Hop step, hop count, planning points |
 | `mode`, `active_mode` | `"scan"` / `"single"` |
 | `min_rate_lps`, `rate_limit_lps` | Waterfall rate budget |
-| `rate_drop_factor`, `raw_line_rate` | Empirical line-rate estimate & throttle |
+| `rate_drop_factor`, `raw_line_rate` | Empirical boosted line-rate estimate & throttle |
+| `true_line_rate` | Base FFT line cadence before minimum-rate overlap boosting |
 | `minimum_rate_overlap`, `minimum_rate_limited`, `minimum_rate_achieved` | Min-rate overlap state; `minimum_rate_limited` is a legacy alias |
 | `traffic_kbytes_s` | Measured frontend traffic (2 s window) |
 | `bins_per_step`, `line_bins`, `raw_line_bins`, `display_bins` | Bin accounting |
@@ -357,12 +358,16 @@ data: {"view":<id>,"n":<line#>,"b":<total_steps>,"mode":"scan|single",
        "effective_fft_size":<fft>,"decim_factor":<d>,"decim_hop":<h>,
        "overlap_factor":<o>,
        "minimum_rate_overlap":<0|1>,"minimum_rate_achieved":<0|1>,
+       "true_line_rate":<lines_per_second>,
        "preview":<0|1>,"preview_age_ms":<ms>,
        "preview_sequence":<i>,"preview_count":<n>,
-       "d":[<u8>, ...]}
+       "encoding":"u8b64","db":"<base64 packed uint8 row>"}
 ```
 
-- `d` contains exactly `display_bins` `uint8` values (one per screen pixel).
+- `encoding:"u8b64"` means `db` is base64 for exactly `display_bins` packed
+  `uint8` values, one per screen pixel. This avoids the 4-5x overhead of JSON
+  decimal arrays while staying compatible with EventSource.
+- Legacy rows with `d:[<u8>, ...]` are still accepted by the frontend.
 - `source_bins` is intentionally set to `display_bins` (the published width).
 - `raw_source_bins` exposes the pre-reduction FFT/CIC bin count for diagnostics.
 - `view` is the `view_id`; the frontend ignores rows whose `view` is older than
@@ -404,7 +409,8 @@ manual dual slider); auto levels use robust percentiles (8 % noise floor,
 
 `EventSource("/api/waterfall")`. Each `line` payload is validated:
 - `display_bins` must match the canvas width; mismatch requests a fresh view.
-- `d` must be a length-`display_bins` array of integers `0..255`.
+- `encoding:"u8b64"`/`db` must decode to `display_bins` bytes, or legacy `d`
+  must be a length-`display_bins` array of integers `0..255`.
 - `f0 < f1` and finite.
 
 On stall (no line for 6× the expected line interval, clamped `5–30 s`) the
@@ -424,8 +430,9 @@ client reconnects. Heartbeat shows `disconnected` / `idle` / `scanning`.
   (`scheduleViewUpdate`), preventing rapid restart loops.
 - **Go To dialog** — target frequency + zoom (`1×..1,000,000×`), optional
   animation with delay (`0.2/0.5/1/2/3/5 s`). Non-animated Go To retunes
-  immediately. Animated Go To animates locally and retunes the backend only at
-  the final target (avoids Pluto restart floods).
+  immediately. Animated Go To requests a backend view at every step and waits
+  for a matching waterfall row so each step uses the true current resolution
+  instead of only stretching the previous lower-resolution image.
 - **Persistence** — the visible viewport is saved to `localStorage` and the URL
   hash (`#view=start-end`); restored on page load. A saved scan is **not**
   auto-started if the backend was idle.
@@ -548,8 +555,8 @@ Frontend: validate row → update scope → scroll waterfall → relabel → aut
 
 - Shift-wheel / zoom buttons / pan update the canvas immediately but coalesce
   backend retune (`VIEW_RETUNE_IDLE_DELAY_MS = 300 ms`).
-- Non-animated Go To retunes immediately; animated Go To retunes only at the
-  final target.
+- Non-animated Go To retunes immediately; animated Go To retunes at every
+  animation step and waits for a matching row before advancing.
 - libiio may print `ERROR: READ ... -9` on cancelled buffers during
   stop/restart — treated as expected noise unless followed by
   `Closing SDR device after I/O error` or `Device reconnected`.

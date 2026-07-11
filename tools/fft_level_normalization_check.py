@@ -49,7 +49,7 @@ def main():
 
     cic_rows = []
     raw_samplerate = 61_440_000.0
-    for decim in (2, 32, 4096):
+    for decim in (2, 32, 512, 1024, 2048, 4096):
         decimated_rate = raw_samplerate / decim
         for fraction in (0.0, 0.125, 0.25, 0.45):
             freq = decimated_rate * fraction

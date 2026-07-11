@@ -266,6 +266,7 @@ static int g_display_bins    = 1024;
 static uint32_t g_min_rate_lps = 10;
 static uint32_t g_rate_limit_lps = 20;
 static uint32_t g_view_id    = 1;
+static int g_next_preview_max_lines = 0;
 static double g_hardwaregain_db = PLUTO_DEFAULT_GAIN_DB;
 static char g_gain_mode[32] = "manual";
 static char g_rf_port[32] = "A_BALANCED";
@@ -3666,6 +3667,65 @@ static int current_minimum_rate_achieved(void)
         line_rate + 1.0e-9 >= (double)g_min_rate_lps;
 }
 
+/**
+ * @brief Return true FFT line cadence before min-rate overlap boosting.
+ *
+ * The returned rate is the base cadence of fresh FFT windows for the current
+ * plan. It intentionally excludes single-mode overlap used to satisfy the
+ * minimum waterfall-rate slider.
+ *
+ * @return Fresh FFT lines per second for the current visible span.
+ */
+static double current_true_line_rate(void)
+{
+    run_mode_t mode = planned_run_mode();
+    if (mode == RUN_MODE_SINGLE) {
+        double start;
+        double end;
+        single_fft_plan_t plan;
+        raw_visible_band(&start, &end);
+        plan = single_fft_plan_for_span(end - start);
+        return single_candidate_line_rate(plan.hardware_samplerate,
+                                          plan.fft_size,
+                                          plan.decim_factor);
+    }
+
+    {
+        double step = 0.0;
+        double scan_end = 0.0;
+        int total_steps = current_scan_plan(&step, &scan_end);
+        double hop_ms = estimated_scan_hop_ms_for_samples(
+            current_line_sample_count());
+        if (total_steps <= 0 || hop_ms <= 0.0)
+            return 0.0;
+        return 1000.0 / (hop_ms * (double)total_steps);
+    }
+}
+
+/**
+ * @brief Return one scan context's true FFT cadence before overlap boosting.
+ *
+ * @param ctx Active scan context containing FFT, decimation, and samplerate.
+ * @return Fresh FFT lines per second for that context, or zero if unavailable.
+ */
+static double ctx_true_line_rate(const scan_ctx_t *ctx)
+{
+    double stream_sps;
+
+    if (!ctx)
+        return 0.0;
+    if (!ctx->single_mode)
+        return ctx->estimated_line_rate;
+    stream_sps = ctx->decim_factor > 1 ?
+        PLUTO_EST_CIC_STREAM_SPS : PLUTO_EST_SINGLE_STREAM_SPS;
+    if (ctx->raw_samplerate > 0.0 && stream_sps > ctx->raw_samplerate)
+        stream_sps = ctx->raw_samplerate;
+    if (ctx->fft_size <= 0 || ctx->decim_factor <= 0)
+        return 0.0;
+    return stream_sps /
+        ((double)ctx->fft_size * (double)ctx->decim_factor);
+}
+
 /** Return raw FFT-bin coverage of the current visible single-mode interval. */
 static double current_visible_raw_bins(void)
 {
@@ -4562,6 +4622,45 @@ static uint8_t magnitude_to_u8(float mag)
 }
 
 /**
+ * @brief Compute encoded base64 length for packed waterfall bytes.
+ *
+ * @param len Number of raw bytes.
+ * @return Number of base64 characters, excluding the terminating NUL.
+ */
+static size_t base64_encoded_len(size_t len)
+{
+    return ((len + 2U) / 3U) * 4U;
+}
+
+/**
+ * @brief Encode packed uint8 waterfall bytes as base64.
+ *
+ * @param src Source byte array.
+ * @param len Number of source bytes.
+ * @param dst Destination buffer with at least `base64_encoded_len(len)` bytes.
+ */
+static void base64_encode_u8(const uint8_t *src, size_t len, char *dst)
+{
+    static const char table[] =
+        "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    size_t in = 0;
+    size_t out = 0;
+
+    while (in < len) {
+        size_t chunk = len - in;
+        uint32_t a = src[in++];
+        uint32_t b = chunk > 1 ? src[in++] : 0U;
+        uint32_t c = chunk > 2 ? src[in++] : 0U;
+        uint32_t triple = (a << 16) | (b << 8) | c;
+
+        dst[out++] = table[(triple >> 18) & 0x3fU];
+        dst[out++] = table[(triple >> 12) & 0x3fU];
+        dst[out++] = chunk > 1 ? table[(triple >> 6) & 0x3fU] : '=';
+        dst[out++] = chunk > 2 ? table[triple & 0x3fU] : '=';
+    }
+}
+
+/**
  * @brief Publish one exact-width waterfall row to every SSE client.
  *
  * `ctx->line_buf` contains the raw stitched FFT/CIC product. This function
@@ -4582,8 +4681,10 @@ static void publish_scan_line(scan_ctx_t *ctx)
     double visible_span = ctx->visible_end - ctx->visible_start;
     uint8_t *line_packed;
     char *json;
+    char *packed_b64;
     int pos;
     int prefix_len;
+    size_t packed_len;
     size_t json_size;
     const char *prefix_fmt =
         "event: line\ndata: {\"view\":%u,\"n\":%d,\"b\":%d,"
@@ -4598,9 +4699,11 @@ static void publish_scan_line(scan_ctx_t *ctx)
         "\"decim_factor\":%d,\"decim_hop\":%d,\"overlap_factor\":%.3f,"
         "\"minimum_rate_overlap\":%d,\"minimum_rate_limited\":%d,"
         "\"minimum_rate_achieved\":%d,"
+        "\"true_line_rate\":%.3f,"
         "\"visible_raw_bins\":%.3f,\"visible_bins_per_pixel\":%.6f,"
         "\"preview\":%d,\"preview_age_ms\":%lld,"
-        "\"preview_sequence\":%d,\"preview_count\":%d,\"d\":[";
+        "\"preview_sequence\":%d,\"preview_count\":%d,"
+        "\"encoding\":\"u8b64\",\"db\":\"";
 
     if (source_bins <= 0 || display_bins <= 0 || source_span <= 0.0 || visible_span <= 0.0)
         return;
@@ -4639,6 +4742,7 @@ static void publish_scan_line(scan_ctx_t *ctx)
         ctx->decim_factor, ctx->decim_hop, ctx->overlap_factor,
         ctx->minimum_rate_limited, ctx->minimum_rate_limited,
         ctx->minimum_rate_achieved,
+        ctx_true_line_rate(ctx),
         ctx->visible_raw_bins, ctx->visible_bins_per_pixel,
         ctx->preview_mode, ctx->preview_age_ms,
         ctx->preview_sequence, ctx->preview_count);
@@ -4646,12 +4750,14 @@ static void publish_scan_line(scan_ctx_t *ctx)
         free(line_packed);
         return;
     }
-    json_size = (size_t)prefix_len + (size_t)display_bins * 4 + 8;
+    packed_len = base64_encoded_len((size_t)display_bins);
+    json_size = (size_t)prefix_len + packed_len + 6;
     json = malloc(json_size);
     if (!json) {
         free(line_packed);
         return;
     }
+    packed_b64 = json + prefix_len;
 
     pos = snprintf(json, json_size, prefix_fmt,
         ctx->view_id, ctx->line_num, ctx->total_steps,
@@ -4664,15 +4770,19 @@ static void publish_scan_line(scan_ctx_t *ctx)
         ctx->decim_factor, ctx->decim_hop, ctx->overlap_factor,
         ctx->minimum_rate_limited, ctx->minimum_rate_limited,
         ctx->minimum_rate_achieved,
+        ctx_true_line_rate(ctx),
         ctx->visible_raw_bins, ctx->visible_bins_per_pixel,
         ctx->preview_mode, ctx->preview_age_ms,
         ctx->preview_sequence, ctx->preview_count);
 
-    for (int i = 0; i < display_bins; i++)
-        pos += snprintf(json + pos, json_size - (size_t)pos,
-                        "%s%d", (i ? "," : ""), line_packed[i]);
-
-    pos += snprintf(json + pos, json_size - (size_t)pos, "]}\n\n");
+    if (pos < 0 || (size_t)pos != (size_t)prefix_len) {
+        free(line_packed);
+        free(json);
+        return;
+    }
+    base64_encode_u8(line_packed, (size_t)display_bins, packed_b64);
+    pos += (int)packed_len;
+    pos += snprintf(json + pos, json_size - (size_t)pos, "\"}\n\n");
     record_frontend_traffic(sse_broadcast(json, pos));
     free(line_packed);
     free(json);
@@ -5435,6 +5545,7 @@ static void *scan_thread_func(void *arg)
     uint32_t line_sample_count;
     uint32_t preview_sample_count = 0;
     int preview_line_count = 0;
+    int preview_max_lines_override = 0;
     unsigned int kernel_buffers;
     single_fft_plan_t single_plan = {0};
     float *preview_samples = NULL;
@@ -5442,6 +5553,8 @@ static void *scan_thread_func(void *arg)
 
     mode = planned_run_mode();
     g_active_mode = mode;
+    preview_max_lines_override = g_next_preview_max_lines;
+    g_next_preview_max_lines = 0;
 
     if (mode != RUN_MODE_SINGLE)
         recent_sample_cache_invalidate();
@@ -5545,6 +5658,9 @@ static void *scan_thread_func(void *arg)
     if (ctx.single_mode && !ctx.direct_sampling) {
         int max_preview_lines = ctx.decim_factor > 1 ?
             (int)CACHED_PREVIEW_MAX_LINES : 1;
+        if (preview_max_lines_override > 0 &&
+            max_preview_lines > preview_max_lines_override)
+            max_preview_lines = preview_max_lines_override;
 
         for (int lines = max_preview_lines; lines >= 1; lines--) {
             uint64_t needed_decimated = (uint64_t)ctx.fft_size;
@@ -6709,6 +6825,7 @@ static void handle_request(int client_fd, const char *req, size_t req_len,
         double overlap_factor = current_overlap_factor();
         uint32_t line_sample_count;
         double raw_line_rate = 0.0;
+        double true_line_rate;
         double traffic_kbytes_s;
         double first_line_ms;
         double source_span_hz;
@@ -6744,6 +6861,7 @@ static void handle_request(int client_fd, const char *req, size_t req_len,
                                                      decim_factor,
                                                      g_rate_limit_lps,
                                                      &raw_line_rate);
+        true_line_rate = current_true_line_rate();
         first_line_ms = current_first_line_ms(total_steps, line_sample_count);
         minimum_rate_achieved = mode == RUN_MODE_SINGLE ?
             current_minimum_rate_achieved() :
@@ -6791,6 +6909,7 @@ static void handle_request(int client_fd, const char *req, size_t req_len,
             "\"required_points\":%d,\"mode\":\"%s\",\"active_mode\":\"%s\","
             "\"min_rate_lps\":%u,\"rate_limit_lps\":%u,"
             "\"rate_drop_factor\":%d,\"raw_line_rate\":%.3f,"
+            "\"true_line_rate\":%.3f,"
             "\"first_line_ms\":%.3f,"
             "\"minimum_rate_overlap\":%d,\"minimum_rate_limited\":%d,"
             "\"minimum_rate_achieved\":%d,"
@@ -6826,6 +6945,7 @@ static void handle_request(int client_fd, const char *req, size_t req_len,
             step, total_steps,
             required_points, run_mode_name(mode), run_mode_name(g_active_mode),
             g_min_rate_lps, g_rate_limit_lps, rate_drop_factor, raw_line_rate,
+            true_line_rate,
             first_line_ms,
             minimum_rate_limited, minimum_rate_limited,
             minimum_rate_achieved,
@@ -7125,12 +7245,14 @@ static void handle_request(int client_fd, const char *req, size_t req_len,
         int minimum_rate_limited = current_minimum_rate_limited();
         int minimum_rate_achieved;
         double raw_line_rate = 0.0;
+        double true_line_rate;
         double first_line_ms;
         int rate_drop_factor = rate_drop_factor_for_plan(current_active_samplerate(), line_sample_count,
                                                          total_steps,
                                                          decim_factor,
                                                          g_rate_limit_lps,
                                                          &raw_line_rate);
+        true_line_rate = current_true_line_rate();
         first_line_ms = current_first_line_ms(total_steps, line_sample_count);
         minimum_rate_achieved = mode == RUN_MODE_SINGLE ?
             current_minimum_rate_achieved() :
@@ -7159,6 +7281,7 @@ static void handle_request(int client_fd, const char *req, size_t req_len,
             "\"required_points\":%d,\"mode\":\"%s\","
             "\"min_rate_lps\":%u,\"rate_limit_lps\":%u,"
             "\"rate_drop_factor\":%d,\"raw_line_rate\":%.3f,"
+            "\"true_line_rate\":%.3f,"
             "\"first_line_ms\":%.3f,"
             "\"minimum_rate_overlap\":%d,\"minimum_rate_limited\":%d,"
             "\"minimum_rate_achieved\":%d,"
@@ -7185,6 +7308,7 @@ static void handle_request(int client_fd, const char *req, size_t req_len,
             g_converter_freq, total_steps, step,
             planned_required_points(), run_mode_name(mode),
             g_min_rate_lps, g_rate_limit_lps, rate_drop_factor, raw_line_rate,
+            true_line_rate,
             first_line_ms, minimum_rate_limited, minimum_rate_limited,
             minimum_rate_achieved, traffic_kbytes_s,
             current_display_bins(), g_view_id, effective_fft,
@@ -7298,6 +7422,7 @@ start_bad_json:
             double overlap_factor = current_overlap_factor();
             uint32_t line_sample_count = current_line_sample_count();
             double raw_line_rate = 0.0;
+            double true_line_rate;
             double first_line_ms;
             int minimum_rate_limited = current_minimum_rate_limited();
             int minimum_rate_achieved;
@@ -7308,6 +7433,7 @@ start_bad_json:
                                                              decim_factor,
                                                              g_rate_limit_lps,
                                                              &raw_line_rate);
+            true_line_rate = current_true_line_rate();
             first_line_ms = current_first_line_ms(total_steps, line_sample_count);
             minimum_rate_achieved = mode == RUN_MODE_SINGLE ?
                 current_minimum_rate_achieved() :
@@ -7329,6 +7455,7 @@ start_bad_json:
                 "\"required_points\":%d,\"mode\":\"%s\","
                 "\"min_rate_lps\":%u,\"rate_limit_lps\":%u,"
                 "\"rate_drop_factor\":%d,\"raw_line_rate\":%.3f,"
+                "\"true_line_rate\":%.3f,"
                 "\"first_line_ms\":%.3f,"
                 "\"minimum_rate_overlap\":%d,\"minimum_rate_limited\":%d,"
                 "\"minimum_rate_achieved\":%d,"
@@ -7351,6 +7478,7 @@ start_bad_json:
                 total_steps, step, current_display_bins(),
                 planned_required_points(), run_mode_name(mode),
                 g_min_rate_lps, g_rate_limit_lps, rate_drop_factor, raw_line_rate,
+                true_line_rate,
                 first_line_ms, minimum_rate_limited, minimum_rate_limited,
                 minimum_rate_achieved,
                 visible_raw_bins, visible_bins_per_pixel, traffic_kbytes_s,
@@ -7508,6 +7636,7 @@ start_bad_json:
                 (min_changed && planned_run_mode() == RUN_MODE_SINGLE);
             if (g_scanning && restart_needed) {
                 g_view_id++;
+                g_next_preview_max_lines = 1;
                 ret = start_scan();
             }
         }
@@ -7523,6 +7652,7 @@ start_bad_json:
             double overlap_factor = current_overlap_factor();
             uint32_t line_sample_count = current_line_sample_count();
             double raw_line_rate = 0.0;
+            double true_line_rate;
             double first_line_ms;
             int minimum_rate_limited = current_minimum_rate_limited();
             int minimum_rate_achieved;
@@ -7531,6 +7661,7 @@ start_bad_json:
                                                              decim_factor,
                                                              g_rate_limit_lps,
                                                              &raw_line_rate);
+            true_line_rate = current_true_line_rate();
             first_line_ms = current_first_line_ms(total_steps, line_sample_count);
             minimum_rate_achieved = mode == RUN_MODE_SINGLE ?
                 current_minimum_rate_achieved() :
@@ -7543,6 +7674,7 @@ start_bad_json:
             snprintf(json_body, sizeof(json_body),
                 "{\"status\":\"%s\",\"min_rate_lps\":%u,\"rate_limit_lps\":%u,"
                 "\"rate_drop_factor\":%d,\"raw_line_rate\":%.3f,"
+                "\"true_line_rate\":%.3f,"
                 "\"first_line_ms\":%.3f,"
                 "\"traffic_kbytes_s\":%.1f,"
                 "\"mode\":\"%s\",\"view_id\":%u,\"effective_fft_size\":%d,"
@@ -7555,6 +7687,7 @@ start_bad_json:
                 "\"scanning\":%d}",
                 (ret == 0) ? "ok" : "error",
                 g_min_rate_lps, g_rate_limit_lps, rate_drop_factor, raw_line_rate,
+                true_line_rate,
                 first_line_ms, traffic_kbytes_s,
                 run_mode_name(mode), g_view_id, effective_fft,
                 decim_factor, decim_hop, overlap_factor,
@@ -7593,6 +7726,7 @@ start_bad_json:
         save_config();
         if (g_scanning && planned_run_mode() == RUN_MODE_SINGLE) {
             g_view_id++;
+            g_next_preview_max_lines = 1;
             ret = start_scan();
         }
 
@@ -7607,6 +7741,7 @@ start_bad_json:
             double overlap_factor = current_overlap_factor();
             uint32_t line_sample_count = current_line_sample_count();
             double raw_line_rate = 0.0;
+            double true_line_rate;
             double first_line_ms;
             int minimum_rate_limited = current_minimum_rate_limited();
             int minimum_rate_achieved;
@@ -7615,6 +7750,7 @@ start_bad_json:
                                                              decim_factor,
                                                              g_rate_limit_lps,
                                                              &raw_line_rate);
+            true_line_rate = current_true_line_rate();
             first_line_ms = current_first_line_ms(total_steps, line_sample_count);
             minimum_rate_achieved = mode == RUN_MODE_SINGLE ?
                 current_minimum_rate_achieved() :
@@ -7627,6 +7763,7 @@ start_bad_json:
             snprintf(json_body, sizeof(json_body),
                 "{\"status\":\"%s\",\"min_rate_lps\":%u,"
                 "\"rate_drop_factor\":%d,\"raw_line_rate\":%.3f,"
+                "\"true_line_rate\":%.3f,"
                 "\"first_line_ms\":%.3f,"
                 "\"traffic_kbytes_s\":%.1f,"
                 "\"mode\":\"%s\",\"view_id\":%u,\"effective_fft_size\":%d,"
@@ -7638,6 +7775,7 @@ start_bad_json:
                 "\"active_bw_ratio\":%.3f,\"scanning\":%d}",
                 (ret == 0) ? "ok" : "error",
                 g_min_rate_lps, rate_drop_factor, raw_line_rate,
+                true_line_rate,
                 first_line_ms, traffic_kbytes_s,
                 run_mode_name(mode), g_view_id, effective_fft,
                 decim_factor, decim_hop, overlap_factor,

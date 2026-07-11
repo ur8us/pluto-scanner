@@ -95,7 +95,9 @@ The planner publishes an exact display product. Every SSE waterfall row must
 contain exactly `display_bins` processed output values, one output bin per
 screen pixel. Keep raw FFT/CIC bin counts in metadata as `raw_source_bins` or
 `raw_line_bins` for debugging, but do not expose oversized raw rows as the
-frontend data model.
+frontend data model. Current SSE rows compress the display bytes as
+`encoding:"u8b64"` with `db` containing base64 packed `uint8` values; keep
+frontend compatibility with legacy `d:[...]` rows when editing this path.
 
 RF bandwidth must be strictly lower than sample rate for all Pluto profiles:
 
@@ -170,7 +172,9 @@ Pluto scan mode is sensitive to rapid retune/restart loops. The frontend intenti
 
 - Shift-wheel, zoom buttons, and pan controls should update the canvas immediately but should not restart the SDR for every small step.
 - Non-animated Go To may retune immediately to the final target.
-- Animated Go To should animate locally and retune the backend only at the final target.
+- Animated Go To requests a backend view at each animation step and waits for a
+  matching row, so every step shows true current-resolution data rather than a
+  stretched preview of the previous lower-resolution row.
 - When stopping or restarting a scan, libiio can print `ERROR: READ ... -9` from canceled buffer operations. Treat those as expected cancellation-side noise unless followed by `Closing SDR device after I/O error` or `Device reconnected`.
 - A small number of `pluto_sdr_read_async failed: -1; retrying RX buffer` lines can occur during stress tests. That is acceptable if the retry recovers and the device is not closed.
 
@@ -336,7 +340,12 @@ scan_hop_ms(8192) = 8.9
 raw_scan_lps = 1000 / (scan_hop_ms(scan_async_samples) * hops)
 raw_single_lps = min(hardware_sample_rate_hz, 2.1e6) / fft
 raw_cic_lps = min(hardware_sample_rate_hz, 1.85e6) / (decim_hop * decim)
+true_line_rate = min(hardware_sample_rate_hz, cic_or_single_stream_sps) / (fft * decim)
 ```
+
+`raw_line_rate` may include minimum-rate overlap boosting. `true_line_rate`
+must remain the base FFT cadence before that boost and is what the frontend
+shows in the FFT status text.
 
 Line-rate throttling is per-mode:
 - **Scan mode**: if the estimated scan line rate exceeds the maximum rate,
