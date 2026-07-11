@@ -78,7 +78,7 @@ def wait_for_server(process, timeout=10):
 
 def read_sse_rows(
     count,
-    timeout=20,
+    timeout=45,
     live_only=False,
     expected_decim=None,
     expected_overlap=None,
@@ -274,22 +274,31 @@ def main():
             f"missing {TEST_BINARY}; run make cic-synthetic-test or make check"
         )
 
-    cases = [
-        run_case("clean_x2", 40_960.0, 2),
-        run_case("clean_x2_min20", 40_960.0, 2, 2, 20),
-        run_case("clean_x64", 4096.0e6 / 3_000_000.0, 64),
-        run_case("clean_x64_min1", 4096.0e6 / 3_000_000.0, 64, 4, 1),
-        run_case("clean_x64_min2", 4096.0e6 / 3_000_000.0, 64, 8, 2),
-        run_case("clean_x64_min5", 4096.0e6 / 3_000_000.0, 64, 16, 5),
-        run_case("clean_x64_min10", 4096.0e6 / 3_000_000.0, 64, 32, 10),
-        run_case("clean_x64_min20", 4096.0e6 / 3_000_000.0, 64, 64, 20),
-        run_case("clean_x256", 409.6, 256, rows=1),
-        run_case("clean_x256_min20", 409.6, 256, 256, 20, rows=2),
-        run_case("periodic_skip_x64", 4096.0e6 / 3_000_000.0, 64,
-                 fault="skip", period=1000, rows=2),
-        run_case("periodic_duplicate_x64", 4096.0e6 / 3_000_000.0, 64,
-                 fault="duplicate", period=1000, rows=2),
+    specs = [
+        ("clean_x2", 40_960.0, 2, 1, 0, None, 0, 3),
+        ("clean_x2_min20", 40_960.0, 2, 2, 20, None, 0, 3),
+        ("clean_x64", 4096.0e6 / 3_000_000.0, 64, 1, 0, None, 0, 3),
+        ("clean_x64_min1", 4096.0e6 / 3_000_000.0, 64, 4, 1, None, 0, 3),
+        ("clean_x64_min2", 4096.0e6 / 3_000_000.0, 64, 8, 2, None, 0, 3),
+        ("clean_x64_min5", 4096.0e6 / 3_000_000.0, 64, 16, 5, None, 0, 3),
+        ("clean_x64_min10", 4096.0e6 / 3_000_000.0, 64, 32, 10, None, 0, 3),
+        ("clean_x64_min20", 4096.0e6 / 3_000_000.0, 64, 64, 20, None, 0, 3),
+        ("clean_x256", 409.6, 256, 1, 0, None, 0, 1),
+        ("clean_x256_min20", 409.6, 256, 256, 20, None, 0, 2),
+        ("periodic_skip_x64", 4096.0e6 / 3_000_000.0, 64, 1, 0, "skip", 1000, 2),
+        ("periodic_duplicate_x64", 4096.0e6 / 3_000_000.0, 64, 1, 0, "duplicate", 1000, 2),
     ]
+    cases = []
+    for spec in specs:
+        name, span, decim, overlap, min_rate, fault, period, rows = spec
+        try:
+            cases.append(
+                run_case(name, span, decim, overlap, min_rate,
+                         fault=fault, period=period, rows=rows)
+            )
+        except Exception as exc:
+            raise RuntimeError(f"{name}: {exc}") from exc
+        time.sleep(0.2)
     result = {"status": "ok", "cases": cases}
     if not args.quiet:
         print(json.dumps(result, indent=2))

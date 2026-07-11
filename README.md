@@ -12,6 +12,9 @@ set RX LO -> discard stale buffers -> refill useful buffer -> FFT -> publish row
 
 This project is focused on ADALM-Pluto SDR and directly compatible devices.
 Support for other receiver families is not planned for now.
+Multiple simultaneous receivers and multi-user operation are also not planned
+for the current program; the UI and backend are designed around one local
+operator controlling one Pluto.
 
 Demodulators and decoders are also out of scope for now. This includes SSB, FM,
 AM, and digital-mode decoding. The program is intended as a spectrum/waterfall
@@ -280,7 +283,10 @@ http://localhost:8080
 - Gain mode and hardware gain map to AD936x `gain_control_mode` and `hardwaregain`.
 - FFT/CIC status shows the active backend plan used for the current zoom.
 - The FFT/CIC status also shows the true base waterfall cadence before
-  minimum-rate overlap boosting, for example `FFT: 65536 x64 1.4 s/line`.
+  minimum-rate overlap boosting, for example
+  `FFT: 65536 x64 (0.44 lines/s)`.
+- The traffic readout is measured as compressed SSE bytes for one frontend
+  stream, not as raw FFT bins and not multiplied by extra debugging clients.
 - Narrow single-frequency CIC mode preserves raw-buffer continuity before the
   decimator; throttling happens after complete FFT lines so the filter state is
   not corrupted by dropped raw buffers.

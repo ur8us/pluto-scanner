@@ -315,7 +315,7 @@ static long long g_auto_restart_suppress_until_msec = 0;
 static int g_sse_fds[MAX_SSE_CLIENTS];
 static pthread_mutex_t g_sse_mutex = PTHREAD_MUTEX_INITIALIZER;
 
-/* Frontend traffic accounting: actual SSE bytes successfully written. */
+/* Frontend traffic accounting: compressed SSE bytes for one frontend stream. */
 #define TRAFFIC_SAMPLE_COUNT 1024
 #define TRAFFIC_WINDOW_MS    2000LL
 typedef struct {
@@ -4783,7 +4783,8 @@ static void publish_scan_line(scan_ctx_t *ctx)
     base64_encode_u8(line_packed, (size_t)display_bins, packed_b64);
     pos += (int)packed_len;
     pos += snprintf(json + pos, json_size - (size_t)pos, "\"}\n\n");
-    record_frontend_traffic(sse_broadcast(json, pos));
+    if (sse_broadcast(json, pos) > 0)
+        record_frontend_traffic((size_t)pos);
     free(line_packed);
     free(json);
 }

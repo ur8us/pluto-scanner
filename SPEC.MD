@@ -320,7 +320,7 @@ ordinary user-editable controls.
 | `rate_drop_factor`, `raw_line_rate` | Empirical boosted line-rate estimate & throttle |
 | `true_line_rate` | Base FFT line cadence before minimum-rate overlap boosting |
 | `minimum_rate_overlap`, `minimum_rate_limited`, `minimum_rate_achieved` | Min-rate overlap state; `minimum_rate_limited` is a legacy alias |
-| `traffic_kbytes_s` | Measured frontend traffic (2 s window) |
+| `traffic_kbytes_s` | Compressed SSE traffic for one frontend stream (2 s window) |
 | `bins_per_step`, `line_bins`, `raw_line_bins`, `display_bins` | Bin accounting |
 | `view_id` | Monotonic id incremented on every view change |
 | `fft_size`, `effective_fft_size` | Selected vs planner-chosen FFT |

@@ -638,8 +638,10 @@
 
             <div class="info-bar">
                 <span>SW: <span class="val" id="infoSw">---</span></span>
-                <span>Pluto: <span class="val" id="infoHw">---</span></span>
-                <span>S/N: <span class="val" id="infoSn">---</span></span>
+                <span id="infoDeviceWrap" hidden
+                    >Device:
+                    <span class="val" id="infoDevice">---</span></span
+                >
                 <span
                     >Markers (SHIFT+click):
                     <span class="val" id="infoMarkers">0</span></span
@@ -955,6 +957,7 @@
             let manualStopSerial = 0;
             let userStopped = false;
             let manualStopSuppressUntilMs = 0;
+            let deviceInfoRevealed = false;
             let autoRestartTimer = 0;
             let autoRestartInFlight = false;
             const MANUAL_STOP_RESTART_SUPPRESS_MS = 5000;
@@ -1377,18 +1380,50 @@
                 );
             }
 
-            /** Copy backend identity/range metadata into the compact top bar. */
-            function syncDeviceInfo(status) {
+            /**
+             * Return whether a backend identity string contains real content.
+             *
+             * @param {string} value Backend identity field.
+             * @returns {boolean} True when the field should be shown.
+             */
+            function hasDeviceIdentityValue(value) {
+                const text = String(value || "").trim();
+                return !!text && text !== "---" && text !== "unknown";
+            }
+
+            /**
+             * Copy backend identity/range metadata into the compact top bar.
+             *
+             * Hardware and serial details stay hidden until a scan has actually
+             * started, because before device open they are placeholders rather
+             * than useful Pluto information.
+             *
+             * @param {Object} status Backend status/start/view payload.
+             * @param {boolean} revealDeviceInfo True after scan start.
+             * @returns {void}
+             */
+            function syncDeviceInfo(status, revealDeviceInfo = false) {
                 if (!status) return;
                 if (status.sw_version !== undefined)
                     document.getElementById("infoSw").textContent =
                         status.sw_version || "---";
-                if (status.hardware !== undefined)
-                    document.getElementById("infoHw").textContent =
-                        status.hardware || "---";
-                if (status.serial !== undefined)
-                    document.getElementById("infoSn").textContent =
-                        status.serial || "---";
+                if (revealDeviceInfo || Number(status.scanning))
+                    deviceInfoRevealed = true;
+                const wrap = document.getElementById("infoDeviceWrap");
+                const value = document.getElementById("infoDevice");
+                if (!wrap || !value) return;
+                const parts = [];
+                if (hasDeviceIdentityValue(status.hardware))
+                    parts.push("rev " + String(status.hardware).trim());
+                if (hasDeviceIdentityValue(status.serial))
+                    parts.push("serial " + String(status.serial).trim());
+                if (deviceInfoRevealed && parts.length > 0) {
+                    value.textContent = parts.join(" · ");
+                    wrap.hidden = false;
+                } else {
+                    value.textContent = "---";
+                    wrap.hidden = true;
+                }
             }
 
             function syncRateRangeFromSliders(changed) {
@@ -4394,15 +4429,7 @@
                     !Number(status.scanning) &&
                     !!Number(status.auto_restart_on_reconnect || 0);
                 updateUI(!!status.scanning, true, reconnecting);
-                if (status.sw_version !== undefined)
-                    document.getElementById("infoSw").textContent =
-                        status.sw_version || "---";
-                if (status.hardware !== undefined)
-                    document.getElementById("infoHw").textContent =
-                        status.hardware || "---";
-                if (status.serial !== undefined)
-                    document.getElementById("infoSn").textContent =
-                        status.serial || "---";
+                syncDeviceInfo(status, Number(status.scanning));
                 if (!gotoAnimationActive && status.view_id !== undefined)
                     currentViewId = Number(status.view_id);
                 if (status.configured_start_hz !== undefined)
@@ -5832,7 +5859,7 @@
              * Format true FFT cadence before minimum-rate overlap boosting.
              *
              * @param {Object} plan Backend plan/status metadata.
-             * @returns {string} Suffix such as ` 2.5 lines/s` or ` 1.3 s/line`.
+             * @returns {string} Suffix such as ` (2.5 lines/s)`.
              */
             function formatTrueWaterfallRate(plan) {
                 if (!plan) return "";
@@ -5843,13 +5870,13 @@
                           ? Number(plan.raw_line_rate)
                           : NaN;
                 if (!Number.isFinite(value) || value <= 0) return "";
-                if (value >= 1)
-                    return (
-                        " " +
-                        (value < 10 ? value.toFixed(1) : value.toFixed(0)) +
-                        " lines/s"
-                    );
-                return " " + (1 / value).toFixed(1) + " s/line";
+                const text =
+                    value >= 10
+                        ? value.toFixed(0)
+                        : value >= 1
+                          ? value.toFixed(1)
+                          : value.toFixed(2);
+                return " (" + text + " lines/s)";
             }
 
             function updateFFTInfo(plan) {
@@ -6500,7 +6527,7 @@
                 restoreTimeMarksSetting();
                 const status = await apiGet("/api/status");
                 if (status) {
-                    syncDeviceInfo(status);
+                    syncDeviceInfo(status, Number(status.scanning));
                     currentSteps = status.steps || 0;
                     updateFFTInfo(status);
                     configuredFreq0 =
