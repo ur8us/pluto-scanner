@@ -224,19 +224,21 @@ receiver interval.
 ### 3.4.2 RFPLL coordinate correction
 
 `fq_err_correction = 1` is a local configuration flag enabled by default. In
-single-frequency mode, the backend models fractional-N RX RFPLL rounding from
-a 40 MHz reference and the power-of-two divider that places the RF VCO in the
-6–12 GHz range. It converts the signed receiver-LO rounding error through the
-active converter branch and shifts the *source-bin coordinate* by that amount.
-The user-visible air range and IIO `altvoltage0/frequency` request do not
-change. This keeps FFT bins, scale labels, markers, and rulers on the same
-coordinate model without claiming to correct an external reference-clock or
-converter error.
-
-`GET /api/status` exposes `fq_err_correction`, `fq_err_model_hz`, and
-`fq_err_effective_hz`; SSE row metadata exposes `fq_err_correction_hz` for the
-active row. The model is a diagnostic estimate; validate hardware alignment
-against a known reference before treating a remaining offset as software error.
+single-frequency mode, the backend applies the exact integer-hertz `llround()`
+used for the IIO RX-LO write, then the AD936x driver's even-hertz clock bridge
+(`freq >> 1`, followed by `freq << 1`), and finally models fractional-N RFPLL
+quantization from the stock driver's doubled 80 MHz RFPLL parent for a 40 MHz
+Pluto reference input, and the power-of-two divider that places the RF VCO in
+the 6–12 GHz range. It converts the signed
+actual-minus-requested receive-LO error through the active converter branch and
+shifts the *source-bin coordinate* by that per-tune amount. The user-visible air range and IIO
+`altvoltage0/frequency` request do not change. No fixed local calibration
+constant is supported. `GET /api/status` exposes `fq_err_correction`,
+`fq_err_model_hz`, and `fq_err_effective_hz`; SSE row metadata exposes the
+applied `fq_err_correction_hz` and interpolated `raw_peak_hz` for live
+verification. The RFPLL model is a diagnostic estimate; validate hardware
+alignment against a known reference before treating a remaining offset as
+software error.
 
 ### 3.5 Acquisition loop details
 
@@ -306,6 +308,9 @@ Converted to complex `float[2*i], float[2*i+1]` layout for the FFT.
   raw-bin count in the screen pixel.
 - Final transport: `display_mag → dB (20·log10) → uint8` mapped over
   `[−100, −20] dB`.
+- Automatic waterfall mode keeps the same palette and SSE bytes, but expands
+  its robust upper level target by `2.12` after the existing `1.2` headroom
+  factor. Manual level controls are unchanged.
 
 `magnitude_to_u8` performs the dB→byte mapping. This keeps a
 coherently calibrated tone stable before display presentation, while the
@@ -389,6 +394,10 @@ ordinary user-editable controls.
 `fft_size`, `display_bins`, `min_rate_lps`, `rate_limit_lps`,
 `visible_start_hz`, `visible_end_hz`. (*forced to auto profile, see §3.8.)
 
+`rf_port` is one of `A_BALANCED`, `B_BALANCED`, or `C_BALANCED`, selected by
+the `Input` control as Pluto RX input 1, 2, or 3. It is written to the standard
+AD936x `rf_port_select` attribute immediately before a stream starts.
+
 `freq_start`/`freq_end` are air-frequency values in MHz. Receiver limits are
 validated after applying `converter_freq`; invalid converted bands return
 HTTP `400` without changing the persisted configured band.
@@ -405,6 +414,11 @@ data: {"view":<id>,"n":<line#>,"b":<total_steps>,"mode":"scan|single",
        "full_f0":<configured_start_hz>,"full_f1":<configured_end_hz>,
        "visible_start_hz":<start>,"visible_end_hz":<end>,
        "second_if_hz":<if_offset>,"zero_if_guard_hz":<guard>,
+       "fq_err_correction_hz":<total_coordinate_correction>,
+       "raw_peak_hz":<interpolated_raw_fft_peak>,
+       "live_capture_age_ms":<monotonic_age>,
+       "live_first_input_ms":<delay>,"live_first_fft_ms":<delay>,
+       "live_first_publish_ms":<delay>,
        "display_bins":<N>,"source_bins":<N>,"raw_source_bins":<N>,
        "effective_fft_size":<fft>,"decim_factor":<d>,"decim_hop":<h>,
        "overlap_factor":<o>,
@@ -423,6 +437,12 @@ data: {"view":<id>,"n":<line#>,"b":<total_steps>,"mode":"scan|single",
 - Legacy rows with `d:[<u8>, ...]` are still accepted by the frontend.
 - `source_bins` is intentionally set to `display_bins` (the published width).
 - `raw_source_bins` exposes the pre-reduction FFT/CIC bin count for diagnostics.
+- `raw_peak_hz` is the strongest pre-reduction bin with bounded three-point
+  interpolation. It is diagnostic metadata for a known carrier, not a second
+  display row or an RF tuning command.
+- The `live_*_ms` fields are monotonic delays from live capture start. Preview
+  rows report zero until fresh acquisition reaches that stage; they make a
+  preview-to-live pause measurable without mixing the two sample streams.
 - `view` is the `view_id`; the frontend ignores rows whose `view` is older than
   the one it requested, so zoom/pan changes never show stale data.
 - `minimum_rate_overlap=1` means the min-rate control shortened `decim_hop`
@@ -430,11 +450,12 @@ data: {"view":<id>,"n":<line#>,"b":<total_steps>,"mode":"scan|single",
 - `preview=1` rows are compatible historical samples processed through the same
   CIC/Hann/FFT path for low-latency high-resolution changes. They provide the
   first waterfall rows from memory while the live stream fills the larger FFT
-  window. `preview_interval_ms` is the planned display cadence; the frontend
-  queues previews and following live rows in arrival order, so cached rows do
-  not burst and then leave an empty pause. Animated Go To accepts a matching
-  current-resolution preview row and does not stretch an older row into the
-  new viewport.
+  window. When previews exist, `preview_interval_ms` is exactly the estimated
+  fresh-line wait divided by `preview_count`, not the prior raw FFT cadence.
+  The frontend queues previews and following live rows in arrival order, so
+  cached rows do not burst and then leave an empty pause. Animated Go To
+  accepts a matching current-resolution preview row and does not stretch an
+  older row into the new viewport.
 
 ---
 

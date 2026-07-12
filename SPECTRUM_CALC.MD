@@ -84,17 +84,27 @@ source interval*, not to the IIO tuning request:
 
 ```text
 requested_rx_hz = receiver_frequency_from_air(requested_source_center_hz)
+iio_requested_rx_hz = round(requested_rx_hz)
+driver_requested_rx_hz = 2 * floor(iio_requested_rx_hz / 2)
 divider = smallest power of two where
-  6e9 <= requested_rx_hz * divider <= 12e9
-rfpll_ratio = requested_rx_hz * divider / 40e6
+  6e9 <= driver_requested_rx_hz * divider <= 12e9
+rfpll_parent_hz = 2 * 40e6
+rfpll_ratio = driver_requested_rx_hz * divider / rfpll_parent_hz
 fractional_word = round(frac(rfpll_ratio) * 8388593)
-modeled_actual_rx_hz = 40e6 *
+modeled_actual_rx_hz = rfpll_parent_hz *
   (floor(rfpll_ratio) + fractional_word / 8388593) / divider
 receiver_error_hz = modeled_actual_rx_hz - requested_rx_hz
 air_error_hz = receiver_error_hz for a positive converter
 air_error_hz = +/- receiver_error_hz for a negative converter branch
-effective_error_hz = air_error_hz when fq_err_correction = 1, else 0
+model_error_hz = air_error_hz when fq_err_correction = 1, else 0
+effective_error_hz = model_error_hz
 ```
+
+For the normal `40e6` Pluto reference input, the stock AD936x driver selects
+an `80e6` RFPLL parent through its reference doubler. Therefore the two
+RFPLL calculations above use `rfpll_parent_hz = 2 * reference_input_hz =
+80e6`; `40e6` remains the physical input-reference value. The fractional-N
+word is rounded against this 80 MHz parent.
 
 The reducer uses `actual_source_start_hz = requested_source_start_hz +
 effective_error_hz`. The displayed `visible_start_hz`/`visible_end_hz` remain
@@ -103,11 +113,19 @@ actual LO maps to the same pixel as the unchanged scale label. The correction
 does not alter the IIO `altvoltage0/frequency` write, converter math, or
 hardware RFPLL/DDS setup.
 
-The AD936x driver owns final divider selection and calibration, so this model
-is diagnostic compensation, not a substitute for a measurement against a known
-reference. `/api/status` reports `fq_err_correction`, `fq_err_model_hz`, and
-`fq_err_effective_hz`; `tools/frequency_coordinate_check.py` verifies the
-same binary64 coordinate equations with correction enabled and disabled.
+The model deliberately includes both the integer-hertz `llround()` performed
+by the IIO frequency write and the AD936x clock bridge's `freq >> 1` / `freq
+<< 1` representation. An odd IIO request therefore becomes the preceding even
+hertz before frequency-dependent fractional-N quantization is applied. These
+steps must not be replaced by a fixed local residual. The AD936x driver still
+owns final divider selection and calibration, therefore this is diagnostic
+coordinate compensation rather than a substitute for a known external
+reference.
+`/api/status` reports `fq_err_correction`, `fq_err_model_hz`, and
+`fq_err_effective_hz`; `tools/frequency_coordinate_check.py` verifies both
+the IIO-rounding and RFPLL terms, while
+`tools/live_frequency_coordinate_check.py` measures a live carrier for at
+least five minutes.
 
 ## RF Profiles
 
@@ -481,6 +499,13 @@ not changed. The peak reducer uses the median of a Rayleigh peak distribution
 to compensate the extra background brightness created when the exact
 one-pixel row reducer selects the maximum of multiple raw bins.
 
+Automatic waterfall levels retain the 8th-percentile lower bound and use the
+98.5th-percentile upper source level with `18` units of headroom. The automatic
+upper target is then multiplied by `1.2 * 2.12` and clamped to `400`. This
+increases auto-mode display headroom to make the waterfall approximately twice
+dimmer without changing the palette, packed SSE bytes, manual level controls,
+FFT amplitude, or CIC state.
+
 Runtime CIC realization:
 
 ```text
@@ -541,8 +566,9 @@ they are marked `preview=1` and are never joined to post-restart live samples.
 Live CIC state is reset after preview processing, and the first live row is
 marked `preview=0`. The backend chooses enough preview rows to cover the
 estimated fresh-frame wait where cached history permits and includes
-`preview_interval_ms` in every SSE row. The frontend queues those previews and
-releases them at that cadence while live acquisition fills independently. This
+`preview_interval_ms = estimated_first_line_ms / preview_count` in every SSE
+row. The frontend queues those previews and releases them at that cadence while
+live acquisition fills independently. This
 avoids both an immediate preview burst and a subsequent empty pause, without
 ever forming an FFT from a mixture of pre-restart and post-restart samples.
 

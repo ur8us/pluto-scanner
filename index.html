@@ -714,6 +714,14 @@
                     />
                 </div>
                 <div class="ctrl-group">
+                    <label>Input</label>
+                    <select id="rfPort">
+                        <option value="A_BALANCED" selected>1 (A balanced)</option>
+                        <option value="B_BALANCED">2 (B balanced)</option>
+                        <option value="C_BALANCED">3 (C balanced)</option>
+                    </select>
+                </div>
+                <div class="ctrl-group">
                     <label>TIME MARKS</label>
                     <select id="timeMarks">
                         <option value="0" selected>Off</option>
@@ -1062,6 +1070,8 @@
             const SSE_STALL_MAX_MS = 30000;
             const SPECTRUM_DB_FLOOR = -100;
             const SPECTRUM_DB_CEIL = -20;
+            /* Auto mode adds display headroom without changing manual levels. */
+            const AUTO_WATERFALL_MAX_HEADROOM_SCALE = 2.12;
 
             /** Return true when a frequency interval is finite and non-empty. */
             function hasFrequencyWindow(
@@ -1120,26 +1130,33 @@
                     1,
                     Math.round(cssWidth * canvasDevicePixelRatio()),
                 );
+                const waterfallSizeChanged =
+                    wfCanvas.width !== w || wfCanvas.height !== 600 ||
+                    rulerCanvas.width !== w || rulerCanvas.height !== 600;
+                const scopeSizeChanged =
+                    scCanvas.width !== w || scCanvas.height !== 135 ||
+                    scopeRulerCanvas.width !== w || scopeRulerCanvas.height !== 135;
 
-                wfCanvas.width = w;
-                wfCanvas.height = 600;
-                rulerCanvas.width = w;
-                rulerCanvas.height = 600;
-                clearRulerOverlay();
-
-                if (!wfImageData || wfImageData.width !== w) {
+                if (waterfallSizeChanged || !wfImageData || wfImageData.width !== w) {
+                    wfCanvas.width = w;
+                    wfCanvas.height = 600;
+                    rulerCanvas.width = w;
+                    rulerCanvas.height = 600;
+                    clearRulerOverlay();
                     wfImageData = wfCtx.createImageData(w, 600);
                     wfScratchImageData = null;
                     clearWaterfallPixelBuffer(wfImageData.data);
                     presentWaterfallImage();
-                    if (lutReady) scheduleCurrentViewRedraw();
+                    if (lutReady && wfRows.length) scheduleCurrentViewRedraw();
                 }
 
-                scCanvas.width = w;
-                scCanvas.height = 135;
-                scopeRulerCanvas.width = w;
-                scopeRulerCanvas.height = 135;
-                clearScopeRulerOverlay();
+                if (scopeSizeChanged) {
+                    scCanvas.width = w;
+                    scCanvas.height = 135;
+                    scopeRulerCanvas.width = w;
+                    scopeRulerCanvas.height = 135;
+                    clearScopeRulerOverlay();
+                }
                 if (rulerCanvasKind === "waterfall") drawRulerOverlay();
                 if (rulerCanvasKind === "scope") drawScopeRulerOverlay();
                 binRangeCache = null;
@@ -1209,6 +1226,10 @@
 
             function formatFrequencyDistance(deltaHz) {
                 const hz = Math.abs(Number(deltaHz) || 0);
+                if (hz < 1e3) {
+                    const decimals = hz < 10 ? 3 : hz < 100 ? 2 : 1;
+                    return formatCompactNumber(hz, decimals) + " Hz";
+                }
                 if (hz < 1e6) {
                     const khz = hz / 1e3;
                     const decimals = khz < 10 ? 3 : khz < 100 ? 2 : 1;
@@ -1519,6 +1540,7 @@
                 document.getElementById("freqStart").disabled = locked;
                 document.getElementById("freqEnd").disabled = locked;
                 document.getElementById("converterFreq").disabled = locked;
+                document.getElementById("rfPort").disabled = locked;
                 document.getElementById("directSampling").disabled = locked;
                 document.getElementById("clockIn").disabled = locked;
                 document.getElementById("btnStart").disabled =
@@ -2088,17 +2110,25 @@
                 panPreviewBaseHeight = 0;
             }
 
+            /**
+             * Rebuild retained waterfall rows and the current spectrum after local geometry changes.
+             *
+             * @param {number} renderToken Waterfall redraw generation identifier.
+             * @returns {void}
+             */
             function redrawCurrentView(renderToken) {
-                if (currentBins && currentBins.length) {
+                if (wfRows.length) {
                     redrawWaterfallHistory(renderToken);
+                } else {
+                    resolveCurrentViewRedrawWaiters();
+                }
+                if (currentBins && currentBins.length) {
                     drawScope(
                         currentBins,
                         currentSourceStart(),
                         currentSourceEnd(),
                         currentSteps,
                     );
-                } else {
-                    resolveCurrentViewRedrawWaiters();
                 }
                 if (hasFrequencyWindow() && currentSteps) {
                     updateFrequencyLabels(
@@ -2932,33 +2962,76 @@
             }
 
             /**
-             * Select adjacent major ticks whose midpoint is nearest the view centre.
+             * Select the second and third visible major frequency ticks.
              *
-             * The returned pair only controls the blue numerical tick-spacing
-             * label. It does not describe an RF gap, zero-IF guard, or hop seam.
+             * The returned pair controls the blue numerical tick-spacing label.
+             * Keeping it away from the middle preserves an unobstructed centre
+             * ruler/spectrum area. It does not describe an RF gap, zero-IF guard,
+             * or hop seam.
              *
              * @param {Array<{pos:number,freq:number}>} majorTicks Ordered major ticks.
-             * @returns {?{left:Object,right:Object,midpoint:number}} Central pair.
+             * @returns {?{left:Object,right:Object,midpoint:number}} Chosen pair.
              */
-            function centralMajorTickPair(majorTicks) {
-                if (!Array.isArray(majorTicks) || majorTicks.length < 2)
+            function secondMajorTickPair(majorTicks) {
+                if (!Array.isArray(majorTicks) || majorTicks.length < 3)
                     return null;
-                let best = null;
-                for (let index = 0; index < majorTicks.length - 1; index++) {
-                    const left = majorTicks[index];
-                    const right = majorTicks[index + 1];
-                    const midpoint = (Number(left.pos) + Number(right.pos)) * 0.5;
-                    if (!Number.isFinite(midpoint)) continue;
-                    const candidate = {
-                        left,
-                        right,
-                        midpoint,
-                        distance: Math.abs(midpoint - 50),
-                    };
-                    if (!best || candidate.distance < best.distance)
-                        best = candidate;
+                const left = majorTicks[1];
+                const right = majorTicks[2];
+                const midpoint = (Number(left.pos) + Number(right.pos)) * 0.5;
+                if (!Number.isFinite(midpoint)) return null;
+                return { left, right, midpoint };
+            }
+
+            /**
+             * Return scale-spacing label fallbacks from most to least decorated.
+             *
+             * @param {string} deltaText Compact tick spacing, such as `10Hz`.
+             * @returns {string[]} Candidate labels in preferred display order.
+             */
+            function scaleDeltaTextCandidates(deltaText) {
+                return [
+                    "<- " + deltaText + " ->",
+                    "<-" + deltaText + "->",
+                    "<" + deltaText + ">",
+                    deltaText,
+                ];
+            }
+
+            /**
+             * Place the scale-spacing label only in the measured free label gap.
+             *
+             * @param {HTMLElement} overlay Frequency-scale overlay.
+             * @param {{mark:HTMLElement,label:HTMLElement}} left Rendered left tick.
+             * @param {{mark:HTMLElement,label:HTMLElement}} right Rendered right tick.
+             * @param {string} deltaText Compact tick spacing.
+             * @returns {void}
+             */
+            function appendScaleDeltaLabel(overlay, left, right, deltaText) {
+                if (!overlay || !left || !right || !deltaText) return;
+                const overlayRect = overlay.getBoundingClientRect();
+                const leftRect = left.label.getBoundingClientRect();
+                const rightRect = right.label.getBoundingClientRect();
+                const freeWidth = rightRect.left - leftRect.right;
+                if (!Number.isFinite(freeWidth) || !overlayRect.width) return;
+
+                const delta = document.createElement("div");
+                delta.className = "wf-step-delta";
+                delta.style.left = "0px";
+                delta.style.visibility = "hidden";
+                overlay.appendChild(delta);
+
+                let chosen = deltaText;
+                for (const candidate of scaleDeltaTextCandidates(deltaText)) {
+                    delta.textContent = candidate;
+                    if (delta.getBoundingClientRect().width + 4 <= freeWidth) {
+                        chosen = candidate;
+                        break;
+                    }
                 }
-                return best;
+                delta.textContent = chosen;
+                delta.style.left =
+                    (leftRect.right + rightRect.left) * 0.5 - overlayRect.left + "px";
+                delta.style.visibility = "";
             }
 
             function parseBandsIni(text) {
@@ -3553,7 +3626,7 @@
                     width,
                 );
                 const tickDecimals = frequencyDecimalsForTicks(ticks);
-                const majorTicks = ticks.filter((tick) => tick.kind === "major");
+                const renderedMajorTicks = [];
                 const nodes = ticks.map((tick) => {
                     const mark = document.createElement("div");
                     const label = document.createElement("div");
@@ -3570,25 +3643,27 @@
                             tickDecimals,
                         );
                         mark.appendChild(label);
+                        renderedMajorTicks.push({ tick, mark, label });
                     }
                     return mark;
                 });
 
-                const centralPair = centralMajorTickPair(majorTicks);
-                if (centralPair) {
-                    const deltaText = formatScaleDelta(
-                        centralPair.right.freq - centralPair.left.freq,
-                    );
-                    if (deltaText) {
-                        const delta = document.createElement("div");
-                        delta.className = "wf-step-delta";
-                        delta.style.left = centralPair.midpoint + "%";
-                        delta.textContent = "<" + deltaText + ">";
-                        nodes.push(delta);
-                    }
-                }
-
                 overlay.replaceChildren(...nodes);
+
+                const renderedPair = secondMajorTickPair(
+                    renderedMajorTicks.map((item) => item.tick),
+                );
+                if (renderedPair) {
+                    const deltaText = formatScaleDelta(
+                        renderedPair.right.freq - renderedPair.left.freq,
+                    );
+                    appendScaleDeltaLabel(
+                        overlay,
+                        renderedMajorTicks[1],
+                        renderedMajorTicks[2],
+                        deltaText,
+                    );
+                }
                 updateZoomIndicator();
             }
 
@@ -3657,19 +3732,9 @@
              */
             function updateAutoWaterfallLevels(data) {
                 if (!waterfallAuto || !data || !data.length) return;
-                const sampleStep = Math.max(1, Math.floor(data.length / 2048));
-                const samples = [];
-                for (let i = 0; i < data.length; i += sampleStep)
-                    samples.push(data[i] | 0);
-                samples.sort((a, b) => a - b);
-                const low = percentileFromSorted(samples, 0.08);
-                const high = percentileFromSorted(samples, 0.985);
-                const targetMin = Math.max(0, Math.min(398, low - 8));
-                const autoMaxBase = Math.max(targetMin + 2, high + 18);
-                const targetMax = Math.max(
-                    targetMin + 2,
-                    Math.min(400, Math.round(autoMaxBase * 1.2)),
-                );
+                const targets = automaticWaterfallTargets(data);
+                const targetMin = targets.min;
+                const targetMax = targets.max;
 
                 if (autoWfMin === null || autoWfMax === null) {
                     autoWfMin = targetMin;
@@ -3690,6 +3755,40 @@
                 updateWaterfallLevelDisplay();
                 localStorage.setItem("wfMin", String(nextMin));
                 localStorage.setItem("wfMax", String(nextMax));
+            }
+
+            /**
+             * Calculate robust automatic waterfall limits for one transport row.
+             *
+             * The upper bound has 2.12 times the historic auto-mode headroom.
+             * This makes auto mode approximately twice as dimmer while retaining
+             * the original palette and leaving manual level values untouched.
+             *
+             * @param {number[]|Uint8Array} data Packed waterfall values.
+             * @returns {{min:number,max:number}} Target inclusive display levels.
+             */
+            function automaticWaterfallTargets(data) {
+                if (!data || !data.length) return { min: 0, max: 2 };
+                const sampleStep = Math.max(1, Math.floor(data.length / 2048));
+                const samples = [];
+                for (let i = 0; i < data.length; i += sampleStep)
+                    samples.push(data[i] | 0);
+                samples.sort((a, b) => a - b);
+                const low = percentileFromSorted(samples, 0.08);
+                const high = percentileFromSorted(samples, 0.985);
+                const targetMin = Math.max(0, Math.min(398, low - 8));
+                const autoMaxBase = Math.max(targetMin + 2, high + 18);
+                const targetMax = Math.max(
+                    targetMin + 2,
+                    Math.min(
+                        400,
+                        Math.round(
+                            autoMaxBase * 1.2 *
+                                AUTO_WATERFALL_MAX_HEADROOM_SCALE,
+                        ),
+                    ),
+                );
+                return { min: targetMin, max: targetMax };
             }
 
             function mapWaterfallValue(value) {
@@ -4443,6 +4542,18 @@
                     preview: Number(data && data.preview) !== 0 ? 1 : 0,
                     at_ms: performance.now(),
                     interval_ms: previewPresentationIntervalMs(data),
+                    server_capture_age_ms: Number(
+                        data && data.live_capture_age_ms,
+                    ),
+                    server_first_input_ms: Number(
+                        data && data.live_first_input_ms,
+                    ),
+                    server_first_fft_ms: Number(
+                        data && data.live_first_fft_ms,
+                    ),
+                    server_first_publish_ms: Number(
+                        data && data.live_first_publish_ms,
+                    ),
                 });
                 if (waterfallPresentationHistory.length > 512)
                     waterfallPresentationHistory.splice(
@@ -6091,6 +6202,10 @@
                     const gainMode = document.getElementById("gainMode");
                     if (gainMode) gainMode.value = String(plan.gain_mode);
                 }
+                if (plan.rf_port !== undefined) {
+                    const port = document.getElementById("rfPort");
+                    if (port) port.value = String(plan.rf_port);
+                }
                 if (plan.hardwaregain_db !== undefined) {
                     const gain = Number(plan.hardwaregain_db);
                     const gainEl = document.getElementById("vgaGain");
@@ -6338,6 +6453,7 @@
                     converter_freq: parseFloat(
                         document.getElementById("converterFreq").value,
                     ),
+                    rf_port: document.getElementById("rfPort").value,
                     samplerate: configuredSampleRate || 61440000,
                     rf_bandwidth: configuredRfBandwidth || 20000000,
                     bw_ratio: configuredBwRatio || 0.85,
@@ -6817,7 +6933,7 @@
                     };
                 },
                 scaleFormatting() {
-                    const centralPair = centralMajorTickPair([
+                    const secondPair = secondMajorTickPair([
                         { freq: 10489500000, pos: 25 },
                         { freq: 10489500100, pos: 48 },
                         { freq: 10489500200, pos: 71 },
@@ -6832,8 +6948,13 @@
                         khz: formatTickMHz(10489500000, 3),
                         hz: formatTickMHz(10489500300, 6),
                         delta: formatScaleDelta(10),
-                        central_delta_left: centralPair && centralPair.left.freq,
-                        central_delta_right: centralPair && centralPair.right.freq,
+                        second_delta_left: secondPair && secondPair.left.freq,
+                        second_delta_right: secondPair && secondPair.right.freq,
+                        delta_candidates: scaleDeltaTextCandidates("10Hz"),
+                        ruler_hz: formatFrequencyDistance(999.5),
+                        auto_levels: automaticWaterfallTargets(
+                            new Uint8Array(2048).fill(53),
+                        ),
                         coordinate_fraction: frequencyAxisFraction(
                             testFrequency,
                             axis,
@@ -6859,6 +6980,24 @@
                         queued_rows: waterfallPresentationQueue.length,
                         stream_display_bins: streamDisplayBins,
                         canvas_display_bins: displayBins(),
+                    };
+                },
+                /** Return local retained-history and presentation diagnostics for browser tests. */
+                waterfallDiagnostics() {
+                    const data = wfImageData ? wfImageData.data : null;
+                    let nonblack = 0;
+                    if (data) {
+                        for (let i = 0; i < data.length; i += 4) {
+                            if (data[i] || data[i + 1] || data[i + 2])
+                                nonblack++;
+                        }
+                    }
+                    return {
+                        history_rows: wfRows.length,
+                        nonblack_pixels: nonblack,
+                        canvas_width: wfCanvas.width,
+                        canvas_height: wfCanvas.height,
+                        presentation_rows: waterfallPresentationHistory.length,
                     };
                 },
             };
@@ -6931,6 +7070,10 @@
                         currentConverterFreq = status.converter_freq;
                         document.getElementById("converterFreq").value =
                             status.converter_freq / 1e6;
+                    }
+                    if (status.rf_port !== undefined) {
+                        document.getElementById("rfPort").value =
+                            String(status.rf_port);
                     }
                     syncPlutoControls(status);
                     if (status.direct_sampling_max_hz !== undefined) {

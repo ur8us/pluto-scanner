@@ -15,7 +15,3 @@ playwright-report/
 ui-test-screenshots/
 PHASE*/
 .release/
-# Local engineering notes. These can contain device-specific observations and
-# are intentionally not part of the published repository.
-PLAN.MD
-FQ_ERR.MD

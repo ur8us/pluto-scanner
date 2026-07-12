@@ -104,6 +104,7 @@ def main():
         )
         assert driver.find_element(By.ID, "gainMode").is_displayed()
         assert driver.find_element(By.ID, "vgaGain").is_displayed()
+        assert driver.find_element(By.ID, "rfPort").is_displayed()
         scale_format = driver.execute_script(
             "return window.__plutoTestHooks.scaleFormatting();"
         )
@@ -115,8 +116,11 @@ def main():
             "khz": "10489.500 MHz",
             "hz": "10489.500 300 MHz",
             "delta": "10Hz",
-            "central_delta_left": 10489500100,
-            "central_delta_right": 10489500200,
+            "second_delta_left": 10489500100,
+            "second_delta_right": 10489500200,
+            "delta_candidates": ["<- 10Hz ->", "<-10Hz->", "<10Hz>", "10Hz"],
+            "ruler_hz": "999.5 Hz",
+            "auto_levels": {"min": 45, "max": 181},
             "coordinate_fraction": 0.75,
             "coordinate_hz": 10489500300,
         }:
@@ -130,6 +134,7 @@ def main():
             el.clear()
             el.send_keys(value)
         Select(driver.find_element(By.ID, "gainMode")).select_by_value("manual")
+        Select(driver.find_element(By.ID, "rfPort")).select_by_value("B_BALANCED")
         driver.execute_script(
             "const el=document.getElementById('vgaGain');"
             "el.value='20'; el.dispatchEvent(new Event('input',{bubbles:true}));"
@@ -138,6 +143,8 @@ def main():
         WebDriverWait(driver, 12).until(
             lambda d: d.find_element(By.ID, "statusText").text == "scanning"
         )
+        if api_status(driver).get("rf_port") != "B_BALANCED":
+            raise RuntimeError("selected Pluto RX input was not sent to the backend")
         WebDriverWait(driver, 15).until(
             lambda d: "steps" in d.find_element(By.ID, "infoScan").text.lower()
         )
@@ -155,11 +162,29 @@ def main():
         before_layout_state = driver.execute_script(
             "return window.__plutoTestHooks.viewState();"
         )
+        before_layout_history = driver.execute_script(
+            "return window.__plutoTestHooks.waterfallDiagnostics();"
+        )
+        if int(before_layout_history.get("history_rows", 0)) <= 0:
+            raise RuntimeError("no retained rows before layout-only zoom")
+        if int(before_layout_history.get("nonblack_pixels", 0)) <= 0:
+            raise RuntimeError("waterfall was blank before layout-only zoom")
         driver.execute_script(
             "document.documentElement.style.zoom='125%';"
             "window.dispatchEvent(new Event('resize'));"
         )
         time.sleep(0.8)
+        WebDriverWait(driver, 10).until(
+            lambda d: int(
+                d.execute_script(
+                    "return window.__plutoTestHooks.waterfallDiagnostics();"
+                ).get("nonblack_pixels", 0)
+            )
+            > 0
+        )
+        layout_in_history = driver.execute_script(
+            "return window.__plutoTestHooks.waterfallDiagnostics();"
+        )
         after_layout_status = api_status(driver)
         after_layout_state = driver.execute_script(
             "return window.__plutoTestHooks.viewState();"
@@ -167,6 +192,18 @@ def main():
         driver.execute_script(
             "document.documentElement.style.zoom='';"
             "window.dispatchEvent(new Event('resize'));"
+        )
+        time.sleep(0.8)
+        WebDriverWait(driver, 10).until(
+            lambda d: int(
+                d.execute_script(
+                    "return window.__plutoTestHooks.waterfallDiagnostics();"
+                ).get("nonblack_pixels", 0)
+            )
+            > 0
+        )
+        layout_out_history = driver.execute_script(
+            "return window.__plutoTestHooks.waterfallDiagnostics();"
         )
         if int(after_layout_status.get("view_id", 0)) != before_layout_view:
             raise RuntimeError("layout-only zoom restarted the scanner backend")
@@ -176,6 +213,16 @@ def main():
             before_layout_state.get("stream_display_bins", 0)
         ):
             raise RuntimeError("layout-only zoom changed the active stream width")
+        for label, history in [
+            ("layout zoom-in", layout_in_history),
+            ("layout zoom-out", layout_out_history),
+        ]:
+            if int(history.get("history_rows", 0)) < int(
+                before_layout_history.get("history_rows", 0)
+            ):
+                raise RuntimeError(f"{label} discarded retained waterfall rows")
+            if int(history.get("nonblack_pixels", 0)) <= 0:
+                raise RuntimeError(f"{label} left the retained waterfall blank")
         zoom_before_keyboard = driver.find_element(By.ID, "infoZoom").text
         driver.execute_script(
             "window.dispatchEvent(new KeyboardEvent('keydown',"

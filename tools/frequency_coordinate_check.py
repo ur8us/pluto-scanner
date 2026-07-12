@@ -74,7 +74,10 @@ def allocate_loopback_port():
 
 def start_payload(center_hz):
     """Build a narrow single-frequency request around the test coordinate."""
-    span_hz = 1000.0
+    # An odd span places this plan's source centre on a half-hertz boundary,
+    # proving that the model includes the integer-Hz IIO write before RFPLL
+    # fractional-word quantization.
+    span_hz = 1001.0
     return {
         "freq_start": (center_hz - 1000.0) / 1e6,
         "freq_end": (center_hz + 1000.0) / 1e6,
@@ -91,9 +94,9 @@ def start_payload(center_hz):
 
 
 def run_case(enabled):
-    """Start one backend whose local config enables or disables correction."""
+    """Start one backend with the RFPLL model enabled or disabled."""
     global BASE
-    center_hz = 840_000_123.0
+    center_hz = 840_000_123.5
     port = allocate_loopback_port()
     BASE = f"http://127.0.0.1:{port}"
     with tempfile.TemporaryDirectory(prefix="pluto-fq-coordinate-") as temp_dir:
@@ -139,10 +142,17 @@ def run_case(enabled):
                     "coordinate model mismatch: "
                     f"actual={actual_x_error} expected={expected_x_error}"
                 )
-            if enabled and abs(actual_x_error) > 1e-6:
-                raise RuntimeError(f"enabled correction left {actual_x_error} px error")
-            if not enabled and abs(effective_hz) > 1e-12:
-                raise RuntimeError(f"disabled correction remained active: {effective_hz}")
+            expected_effective = model_hz if enabled else 0.0
+            if abs(effective_hz - expected_effective) > 1e-9:
+                raise RuntimeError(
+                    f"wrong effective correction: got {effective_hz}, "
+                    f"expected {expected_effective}"
+                )
+            if abs(model_hz) < 0.5:
+                raise RuntimeError(
+                    "test view did not exercise the integer-Hz IIO request "
+                    f"rounding contribution: {model_hz}"
+                )
             http_json("POST", "/api/stop", {})
             return {
                 "enabled": enabled,

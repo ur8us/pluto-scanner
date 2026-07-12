@@ -118,7 +118,9 @@ static int win32_nanosleep(const struct timespec *req, struct timespec *rem)
 #define CACHED_PREVIEW_MAX_LINES 128U
 #define CACHED_PREVIEW_MAX_AGE_MS 5000LL
 #define SINGLE_ZERO_IF_GUARD_HZ 50000.0
-#define PLUTO_RFPLL_REFERENCE_HZ 40000000.0
+#define PLUTO_REFERENCE_INPUT_HZ 40000000.0
+/* The stock AD936x driver doubles a 40 MHz input reference for the RFPLL. */
+#define PLUTO_RFPLL_REFERENCE_HZ (2.0 * PLUTO_REFERENCE_INPUT_HZ)
 #define PLUTO_RFPLL_FRACTIONAL_MODULUS 8388593.0
 #define PLUTO_RFPLL_VCO_MIN_HZ 6000000000.0
 #define PLUTO_RFPLL_VCO_MAX_HZ 12000000000.0
@@ -1895,6 +1897,29 @@ static int pluto_sdr_set_gain_mode(pluto_sdr_dev_t *dev, const char *mode)
     return PLUTO_ERR_OK;
 }
 
+/**
+ * @brief Select the AD936x receive input port.
+ *
+ * The value is written through the stock `rf_port_select` IIO channel
+ * attribute. The selected port takes effect on the next stream start.
+ *
+ * @param dev Open Pluto device.
+ * @param port AD936x port name, such as `A_BALANCED`.
+ * @return `PLUTO_ERR_OK` on success, otherwise the negative IIO error.
+ */
+static int pluto_sdr_set_rf_port(pluto_sdr_dev_t *dev, const char *port)
+{
+    int rc;
+
+    if (!dev || !port || !*port)
+        return -1;
+    rc = (int)iio_channel_attr_write(dev->phy_rx0, "rf_port_select", port);
+    if (rc < 0)
+        return rc;
+    copy_cstr(dev->rf_port, sizeof(dev->rf_port), port);
+    return PLUTO_ERR_OK;
+}
+
 static int pluto_sdr_set_hardwaregain(pluto_sdr_dev_t *dev, double gain_db)
 {
     int rc;
@@ -2487,6 +2512,11 @@ typedef struct {
     int preview_count;
     /* Planned display pacing for cached preview rows, in milliseconds. */
     double preview_interval_ms;
+    /* Monotonic live-capture timing, used only for transition diagnostics. */
+    long long live_capture_started_msec;
+    long long live_first_input_msec;
+    long long live_first_fft_msec;
+    long long live_first_publish_msec;
     uint32_t direct_sampling;
     double direct_mix_phase;
     double direct_mix_inc;
@@ -2869,10 +2899,15 @@ static int receiver_frequency_valid(double rx_freq)
  *
  * The supported IIO frequency attribute accepts an integer-Hz RX LO request.
  * Stock Pluto hardware normally derives the RX LO from a 40 MHz reference,
- * selects a power-of-two VCO divider for the 6..12 GHz RFPLL range, and rounds
- * the fractional numerator to the AD936x `8,388,593` modulus. The driver owns
- * the actual divider and calibration; this is intentionally a display/bin
- * coordinate model, never a replacement for IIO LO control.
+ * first rounds the supported IIO request to an integer hertz. The AD936x Linux
+ * clock bridge then represents that rate as `freq >> 1` and reads it back as
+ * `freq << 1`, so an odd request is programmed as the preceding even hertz.
+ * With the normal 40 MHz Pluto reference, the stock driver doubles the RFPLL
+ * parent to 80 MHz. It then selects a power-of-two VCO divider for the 6..12
+ * GHz RFPLL range and rounds the fractional numerator to the AD936x
+ * `8,388,593` modulus. The driver owns the actual divider and calibration;
+ * this is intentionally a display/bin coordinate model, never a replacement
+ * for IIO LO control.
  *
  * @param requested_rx_hz Requested Pluto receive LO in hertz.
  * @return Modeled actual-minus-requested receive-LO error in hertz, or zero
@@ -2881,6 +2916,8 @@ static int receiver_frequency_valid(double rx_freq)
 static double pluto_rfpll_modeled_error_hz(double requested_rx_hz)
 {
     double divider = 1.0;
+    double iio_requested_rx_hz;
+    double driver_requested_rx_hz;
     double vco_hz;
     double ratio;
     double integer_part;
@@ -2889,10 +2926,12 @@ static double pluto_rfpll_modeled_error_hz(double requested_rx_hz)
 
     if (!isfinite(requested_rx_hz) || requested_rx_hz <= 0.0)
         return 0.0;
-    while (requested_rx_hz * divider < PLUTO_RFPLL_VCO_MIN_HZ &&
+    iio_requested_rx_hz = (double)llround(requested_rx_hz);
+    driver_requested_rx_hz = 2.0 * floor(iio_requested_rx_hz * 0.5);
+    while (driver_requested_rx_hz * divider < PLUTO_RFPLL_VCO_MIN_HZ &&
            divider < 64.0)
         divider *= 2.0;
-    vco_hz = requested_rx_hz * divider;
+    vco_hz = driver_requested_rx_hz * divider;
     if (vco_hz < PLUTO_RFPLL_VCO_MIN_HZ ||
         vco_hz > PLUTO_RFPLL_VCO_MAX_HZ)
         return 0.0;
@@ -2907,6 +2946,8 @@ static double pluto_rfpll_modeled_error_hz(double requested_rx_hz)
     }
     actual_vco_hz = PLUTO_RFPLL_REFERENCE_HZ *
         (integer_part + fractional_part / PLUTO_RFPLL_FRACTIONAL_MODULUS);
+    /* Include the same integer-Hz IIO request rounding used by
+     * pluto_sdr_set_frequency(), then the fractional-N tuning-word error. */
     return actual_vco_hz / divider - requested_rx_hz;
 }
 
@@ -2931,18 +2972,12 @@ static double air_error_from_receiver_error(double air_hz,
 }
 
 /**
- * @brief Return the configured display/bin correction for one air-frequency LO.
- *
- * The correction moves the assumed source interval onto the modeled RFPLL LO.
- * It does not change the IIO write request, configured air range, converter
- * math, or RFPLL/DDS hardware state. Keeping the source interval corrected is
- * preferable to visibly shifting only scale text because FFT bins, markers,
- * rulers, and tick labels then share the same coordinate model.
+ * @brief Return the RFPLL-model source-coordinate correction for one air LO.
  *
  * @param air_hz Requested air/source center frequency in hertz.
- * @return Signed source-center correction in hertz; zero when disabled.
+ * @return Signed modeled source-center correction in hertz; zero when disabled.
  */
-static double configured_frequency_correction_hz(double air_hz)
+static double modeled_frequency_correction_hz(double air_hz)
 {
     double receiver_hz;
 
@@ -2951,6 +2986,21 @@ static double configured_frequency_correction_hz(double air_hz)
     receiver_hz = receiver_frequency_from_radio(air_hz);
     return air_error_from_receiver_error(
         air_hz, pluto_rfpll_modeled_error_hz(receiver_hz));
+}
+
+/**
+ * @brief Return the total display/bin correction for one air-frequency LO.
+ *
+ * The correction moves the assumed source interval onto the deterministic
+ * RFPLL model. It never changes the IIO tuning request, configured air range,
+ * converter math, or RFPLL/DDS hardware state.
+ *
+ * @param air_hz Requested air/source center frequency in hertz.
+ * @return Signed source-center correction in hertz.
+ */
+static double configured_frequency_correction_hz(double air_hz)
+{
+    return modeled_frequency_correction_hz(air_hz);
 }
 
 static int append_air_interval(freq_interval_t *intervals, int count,
@@ -4898,6 +4948,58 @@ static float peak_reducer_noise_scale(int raw_bins)
 }
 
 /**
+ * @brief Estimate the strongest raw FFT/CIC bin coordinate before display reduction.
+ *
+ * The result is diagnostic metadata for live frequency validation. It uses a
+ * three-point log-magnitude parabola when both adjacent bins are available;
+ * the interpolation is bounded to one half-bin so noise or an edge maximum
+ * cannot invent a coordinate outside the selected source bin.
+ *
+ * @param values Raw magnitude bins in increasing source-frequency order.
+ * @param count Number of valid raw bins.
+ * @param start_hz Source-coordinate frequency at the lower bin edge, in hertz.
+ * @param span_hz Source-coordinate span represented by `values`, in hertz.
+ * @return Interpolated peak source coordinate in hertz, or zero when invalid.
+ */
+static double raw_peak_frequency_hz(const float *values, int count,
+                                    double start_hz, double span_hz)
+{
+    int peak_index = 0;
+    float peak = 0.0f;
+    double bin_fraction = 0.5;
+
+    if (!values || count <= 0 || !isfinite(start_hz) ||
+        !isfinite(span_hz) || span_hz <= 0.0)
+        return 0.0;
+
+    for (int i = 0; i < count; i++) {
+        if (isfinite(values[i]) && values[i] > peak) {
+            peak = values[i];
+            peak_index = i;
+        }
+    }
+    if (!(peak > 0.0f))
+        return 0.0;
+
+    if (peak_index > 0 && peak_index + 1 < count &&
+        values[peak_index - 1] > 0.0f && values[peak_index + 1] > 0.0f) {
+        double left = log((double)values[peak_index - 1]);
+        double center = log((double)values[peak_index]);
+        double right = log((double)values[peak_index + 1]);
+        double denominator = left - 2.0 * center + right;
+        double offset;
+
+        if (isfinite(denominator) && fabs(denominator) > 1.0e-12) {
+            offset = 0.5 * (left - right) / denominator;
+            if (isfinite(offset))
+                bin_fraction += fmax(-0.5, fmin(0.5, offset));
+        }
+    }
+    return start_hz + ((double)peak_index + bin_fraction) *
+        span_hz / (double)count;
+}
+
+/**
  * @brief Convert normalized FFT magnitude into the 8-bit waterfall transport.
  *
  * Input magnitudes are already corrected for Hann coherent gain and optional
@@ -4981,6 +5083,12 @@ static void publish_scan_line(scan_ctx_t *ctx)
     int prefix_len;
     size_t packed_len;
     size_t json_size;
+    double raw_peak_hz;
+    long long now;
+    long long live_capture_age_ms = 0;
+    long long live_first_input_ms = 0;
+    long long live_first_fft_ms = 0;
+    long long live_first_publish_ms = 0;
     const char *prefix_fmt =
         "event: line\ndata: {\"view\":%u,\"n\":%d,\"b\":%d,"
         "\"mode\":\"%s\","
@@ -4989,6 +5097,10 @@ static void publish_scan_line(scan_ctx_t *ctx)
         "\"visible_start_hz\":%.0f,\"visible_end_hz\":%.0f,"
         "\"second_if_hz\":%.0f,\"zero_if_guard_hz\":%.0f,"
         "\"fq_err_correction_hz\":%.9f,"
+        "\"raw_peak_hz\":%.9f,"
+        "\"live_capture_age_ms\":%lld,"
+        "\"live_first_input_ms\":%lld,\"live_first_fft_ms\":%lld,"
+        "\"live_first_publish_ms\":%lld,"
         "\"display_bins\":%d,\"source_bins\":%d,\"published_bins\":%d,"
         "\"raw_source_bins\":%d,"
         "\"effective_fft_size\":%d,"
@@ -5005,6 +5117,24 @@ static void publish_scan_line(scan_ctx_t *ctx)
 
     if (source_bins <= 0 || display_bins <= 0 || source_span <= 0.0 || visible_span <= 0.0)
         return;
+
+    now = now_msec();
+    if (!ctx->preview_mode && ctx->live_first_publish_msec == 0)
+        ctx->live_first_publish_msec = now;
+    if (ctx->live_capture_started_msec > 0) {
+        live_capture_age_ms = now - ctx->live_capture_started_msec;
+        if (ctx->live_first_input_msec > 0)
+            live_first_input_ms = ctx->live_first_input_msec -
+                ctx->live_capture_started_msec;
+        if (ctx->live_first_fft_msec > 0)
+            live_first_fft_ms = ctx->live_first_fft_msec -
+                ctx->live_capture_started_msec;
+        if (ctx->live_first_publish_msec > 0)
+            live_first_publish_ms = ctx->live_first_publish_msec -
+                ctx->live_capture_started_msec;
+    }
+    raw_peak_hz = raw_peak_frequency_hz(ctx->line_buf, source_bins,
+                                        ctx->scan_start, source_span);
 
     line_packed = malloc((size_t)display_bins);
     if (!line_packed)
@@ -5039,6 +5169,8 @@ static void publish_scan_line(scan_ctx_t *ctx)
         ctx->visible_start, ctx->visible_end,
         ctx->second_if_hz, ctx->zero_if_guard_hz,
         ctx->frequency_correction_hz,
+        raw_peak_hz, live_capture_age_ms, live_first_input_ms,
+        live_first_fft_ms, live_first_publish_ms,
         display_bins, display_bins, display_bins, source_bins, ctx->fft_size,
         ctx->decim_factor, ctx->decim_hop, ctx->overlap_factor,
         ctx->minimum_rate_limited, ctx->minimum_rate_limited,
@@ -5069,6 +5201,8 @@ static void publish_scan_line(scan_ctx_t *ctx)
         ctx->visible_start, ctx->visible_end,
         ctx->second_if_hz, ctx->zero_if_guard_hz,
         ctx->frequency_correction_hz,
+        raw_peak_hz, live_capture_age_ms, live_first_input_ms,
+        live_first_fft_ms, live_first_publish_ms,
         display_bins, display_bins, display_bins, source_bins, ctx->fft_size,
         ctx->decim_factor, ctx->decim_hop, ctx->overlap_factor,
         ctx->minimum_rate_limited, ctx->minimum_rate_limited,
@@ -5167,6 +5301,8 @@ static void complete_processed_channel(scan_ctx_t *ctx, int channel)
     if (!ctx || channel < 0 || channel >= ctx->total_steps)
         return;
     preview_completion = ctx->preview_mode;
+    if (!preview_completion && ctx->live_first_fft_msec == 0)
+        ctx->live_first_fft_msec = now_msec();
     if (!should_publish_processed_line(ctx)) {
         if (preview_completion)
             ctx->preview_sequence++;
@@ -5585,6 +5721,9 @@ static void scan_callback(float *buf, uint32_t buf_len, uint32_t refill_flags,
     }
 
     ctx->last_callback_msec = now_msec();
+    if (ctx->live_capture_started_msec > 0 &&
+        ctx->live_first_input_msec == 0)
+        ctx->live_first_input_msec = ctx->last_callback_msec;
     channel = ctx->single_mode ? 0 : pluto_sdr_get_scan_index(dev);
     if (channel < 0) {
         ctx->tuning_skipped++;
@@ -5774,6 +5913,9 @@ static int run_pseudo_random_sample_source(scan_ctx_t *ctx, uint32_t async_len)
         ctx->capture_sample_next = sample_index_end;
 #endif
         ctx->last_callback_msec = now_msec();
+        if (ctx->live_capture_started_msec > 0 &&
+            ctx->live_first_input_msec == 0)
+            ctx->live_first_input_msec = ctx->last_callback_msec;
 
         recent_sample_cache_append(ctx, buf, async_len, 0);
 
@@ -6018,15 +6160,17 @@ static void *scan_thread_func(void *arg)
             ctx.center_freq + single_plan.hardware_rf_bandwidth * 0.5,
             ctx.raw_samplerate, single_plan.hardware_rf_bandwidth);
         if (preview_samples) {
-            /* A cache can be shorter than the ideal count immediately after a
-             * prior transition. Slow preview playback just enough to bridge the
-             * predicted fresh live frame instead of displaying a burst then a
-             * blank gap. This only affects historical presentation timing. */
+            /* Distribute every cached row across the predicted fresh live
+             * fill. Keeping the old raw-line cadence here can show one preview
+             * and then leave a visible pause, especially at x64 CIC where the
+             * cache contains several overlapping target frames. This affects
+             * display timing only; each preview remains one independent FFT. */
             if (preview_line_count > 0 && preview_first_line_ms > 0.0) {
                 double coverage_interval = preview_first_line_ms /
                     (double)preview_line_count;
-                if (coverage_interval > ctx.preview_interval_ms)
-                    ctx.preview_interval_ms = coverage_interval;
+                ctx.preview_interval_ms = coverage_interval;
+                if (ctx.preview_interval_ms < 10.0)
+                    ctx.preview_interval_ms = 10.0;
             }
             ctx.preview_mode = 1;
             ctx.preview_age_ms = preview_age_ms;
@@ -6073,6 +6217,8 @@ static void *scan_thread_func(void *arg)
     if (ret != PLUTO_ERR_OK) { fprintf(stderr, "[SDR] set_samplerate failed: %d\n", ret); device_error = 1; }
     ret = pluto_sdr_set_bandwidth(g_dev, ctx.single_mode ? single_plan.hardware_rf_bandwidth : g_rf_bandwidth);
     if (ret != PLUTO_ERR_OK) { fprintf(stderr, "[SDR] set_rf_bandwidth failed: %d\n", ret); device_error = 1; }
+    ret = pluto_sdr_set_rf_port(g_dev, g_rf_port);
+    if (ret != PLUTO_ERR_OK) { fprintf(stderr, "[SDR] set_rf_port_select failed: %d\n", ret); device_error = 1; }
     ret = pluto_sdr_set_gain_mode(g_dev, g_gain_mode);
     if (ret != PLUTO_ERR_OK) { fprintf(stderr, "[SDR] set_gain_mode failed: %d\n", ret); device_error = 1; }
     if (strcmp(g_gain_mode, "manual") == 0) {
@@ -6142,6 +6288,7 @@ static void *scan_thread_func(void *arg)
     }
 
     if (g_scanning) {
+        ctx.live_capture_started_msec = now_msec();
         ctx.last_callback_msec = now_msec();
         ctx.watchdog_stop = 0;
         ctx.watchdog_triggered = 0;
@@ -6971,6 +7118,19 @@ static int validate_pluto_settings(double samplerate, double rf_bandwidth, const
     return 0;
 }
 
+/**
+ * @brief Check whether a frontend-selectable AD936x RX input name is supported.
+ *
+ * @param port Requested `rf_port_select` value.
+ * @return Nonzero for a supported balanced input, otherwise zero.
+ */
+static int rf_port_is_supported(const char *port)
+{
+    return port && (strcmp(port, "A_BALANCED") == 0 ||
+                    strcmp(port, "B_BALANCED") == 0 ||
+                    strcmp(port, "C_BALANCED") == 0);
+}
+
 static int validate_visible_range(double start, double end,
                                   char *err, size_t err_len)
 {
@@ -7264,7 +7424,7 @@ static void handle_request(int client_fd, const char *req, size_t req_len,
             "\"view_id\":%u,\"fft_size\":%d,\"effective_fft_size\":%d,"
             "\"decim_factor\":%d,\"decim_hop\":%d,\"overlap_factor\":%.3f,"
             "\"effective_input_samples\":%u,"
-            "\"gain_mode\":\"%s\",\"hardwaregain_db\":%.1f,"
+            "\"gain_mode\":\"%s\",\"hardwaregain_db\":%.1f,\"rf_port\":\"%s\","
             "\"rssi_db\":%.2f,\"input_peak\":%.0f,\"clipped_samples\":%llu,"
             "\"goto_freq_hz\":%.0f,\"goto_target_zoom\":%.6g,"
             "\"goto_animate\":%u,"
@@ -7298,7 +7458,8 @@ static void handle_request(int client_fd, const char *req, size_t req_len,
             bins_per_step, line_bins, raw_line_bins, display_bins,
             g_view_id, current_fft_size(), effective_fft,
             decim_factor, decim_hop, overlap_factor, line_sample_count,
-            g_gain_mode, g_hardwaregain_db, g_last_rssi_db, g_last_input_peak,
+            g_gain_mode, g_hardwaregain_db, g_rf_port,
+            g_last_rssi_db, g_last_input_peak,
             (unsigned long long)g_last_clipped_samples,
             g_goto_freq, g_goto_target_zoom, g_goto_animate, g_goto_delay_s,
             sample_rates);
@@ -7437,6 +7598,7 @@ static void handle_request(int client_fd, const char *req, size_t req_len,
         double hardwaregain_tmp = g_hardwaregain_db;
         char gain_mode_tmp[32];
         char rf_port_tmp[32];
+        char string_tmp[32];
         double visible_start_tmp = 0.0;
         double visible_end_tmp = 0.0;
         uint32_t fft_tmp = (uint32_t)current_fft_size();
@@ -7472,10 +7634,14 @@ static void handle_request(int client_fd, const char *req, size_t req_len,
         samplerate_tmp = PLUTO_AUTO_SAMPLE_RATE_HZ;
         rf_bandwidth_tmp = PLUTO_AUTO_RF_BANDWIDTH_HZ;
         bw_ratio_tmp = PLUTO_AUTO_BW_RATIO;
-        if (json_get_string(&json, "gain_mode", gain_mode_tmp, sizeof(gain_mode_tmp), &present) != 0) goto start_bad_json;
+        if (json_get_string(&json, "gain_mode", string_tmp, sizeof(string_tmp), &present) != 0) goto start_bad_json;
+        if (present)
+            copy_cstr(gain_mode_tmp, sizeof(gain_mode_tmp), string_tmp);
         if (json_get_double(&json, "hardwaregain_db", &number_tmp, &present) != 0) goto start_bad_json;
         if (present) hardwaregain_tmp = number_tmp;
-        if (json_get_string(&json, "rf_port", rf_port_tmp, sizeof(rf_port_tmp), &present) != 0) goto start_bad_json;
+        if (json_get_string(&json, "rf_port", string_tmp, sizeof(string_tmp), &present) != 0) goto start_bad_json;
+        if (present)
+            copy_cstr(rf_port_tmp, sizeof(rf_port_tmp), string_tmp);
         if (json_get_uint(&json, "fft_size", &uint_tmp, &present) != 0) goto start_bad_json;
         if (present) fft_tmp = uint_tmp;
         if (json_get_uint(&json, "display_bins", &uint_tmp, &present) != 0) goto start_bad_json;
@@ -7517,6 +7683,12 @@ static void handle_request(int client_fd, const char *req, size_t req_len,
                                     gain_mode_tmp, hardwaregain_tmp,
                                     err, sizeof(err)) != 0) {
             send_json_error(client_fd, 400, "Bad Request", cors, err);
+            close(client_fd);
+            return;
+        }
+        if (!rf_port_is_supported(rf_port_tmp)) {
+            send_json_error(client_fd, 400, "Bad Request", cors,
+                            "rf_port must be A_BALANCED, B_BALANCED, or C_BALANCED");
             close(client_fd);
             return;
         }
@@ -7638,7 +7810,7 @@ static void handle_request(int client_fd, const char *req, size_t req_len,
             "\"hardware_bw_ratio\":%.2f,"
             "\"active_samplerate\":%.0f,\"active_rf_bandwidth\":%.0f,"
             "\"active_bw_ratio\":%.3f,"
-            "\"gain_mode\":\"%s\",\"hardwaregain_db\":%.1f,"
+            "\"gain_mode\":\"%s\",\"hardwaregain_db\":%.1f,\"rf_port\":\"%s\","
             "\"rssi_db\":%.2f,\"input_peak\":%.0f,\"clipped_samples\":%llu,"
             "\"sample_rates\":%s}",
             status,
@@ -7661,7 +7833,7 @@ static void handle_request(int client_fd, const char *req, size_t req_len,
             active_bw_ratio,
             active_samplerate, active_rf_bandwidth, active_bw_ratio,
             active_samplerate, active_rf_bandwidth, active_bw_ratio,
-            g_gain_mode, g_hardwaregain_db,
+            g_gain_mode, g_hardwaregain_db, g_rf_port,
             g_last_rssi_db, g_last_input_peak,
             (unsigned long long)g_last_clipped_samples,
             sample_rates);

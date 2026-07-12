@@ -85,7 +85,7 @@ I want this project to explore new principles for SDR tools:
 1. AI-first development.
 2. A web interface that minimizes traffic.
 3. A spectrum view with very large zoom: from gigahertz-wide full-screen spans down to hertz-per-pixel detail, one million times zoom.
-4. Seamless merging of scan/hop mode and single-frequency reception, hidden from the user.
+4. Seamless merging of scan/hop mode and single-frequency reception, hidden from the user, while zoom changes preserve the waterfall noise-floor background color rather than keeping an individual carrier at a fixed visual level.
 5. Waterfall speed limits expressed as a range from and to lines per second instead of tying behavior directly to FFT size. The program should do its best to satisfy the user's desired behavior.
 6. Persistent waterfall history: when zooming or moving through frequencies, the waterfall is not cleared. It shows all recorded data that still applies, even when stretched. This is a known SDR UI principle, but it still needs better implementation so history remains useful across large zoom and frequency changes.
 7. Low-latency resolution changes: very fine frequency resolution needs FFTs built from many seconds of samples. Traditional SDR programs can make the user wait several seconds after switching resolution before the first new waterfall line appears. This scanner reuses compatible samples already held in memory for the first preview lines, so the display responds quickly while live acquisition catches up.
@@ -299,7 +299,7 @@ http://localhost:8080
 
 ## UI Controls
 
-- Start/end frequency and converter are air-frequency settings. Receiver limits are checked after converter conversion, so invalid bands are rejected instead of silently rewritten.
+- Start/end frequency and converter are air-frequency settings. Receiver limits are checked after converter conversion, so invalid bands are rejected instead of silently rewritten. The adjacent `Input` control selects Pluto RX input 1/2/3 through `rf_port_select` as `A_BALANCED`, `B_BALANCED`, or `C_BALANCED`.
 - Sample rate, RF bandwidth, and passband usage are auto-profiled for Pluto performance and shown read-only in the UI.
 - RF bandwidth is kept strictly below sample rate in every auto profile.
 - Waterfall rows are published as exactly one processed output bin per screen pixel; raw FFT/CIC bin counts are kept as debug metadata.
@@ -334,17 +334,24 @@ http://localhost:8080
   immediate preview burst followed by a blank pause.
 - The `Shown` status reports the visible interval in MHz and selects MHz, kHz,
   or Hz for `Span`; this is presentation-only and never feeds back into tuning
-  or coordinate calculations. The light-blue `<gap>` label on the frequency
-  scale is the spacing between its central adjacent ticks, not a receiver gap.
+  or coordinate calculations. Rulers also use Hz below 1 kHz. The light-blue
+  scale-spacing label is placed between the second and third major ticks and
+  uses the shortest arrow form that fits between their rendered labels; it is
+  not a receiver gap.
 - `fq_err_correction = 1` is the default local configuration. It applies a
-  conservative 40 MHz-reference Pluto RFPLL rounding model to the source-bin
-  coordinate in single-frequency mode, keeping scale and FFT coordinates
-  aligned without changing the requested IIO LO. `/api/status` exposes the
-  modeled and effective values for diagnosis; a known external reference or
-  converter error still requires real measurement.
+  conservative 40 MHz-reference Pluto RFPLL quantization model to the
+  source-bin coordinate in single-frequency mode. It includes the exact
+  integer-hertz IIO LO request rounding and AD936x even-hertz clock bridge
+  before the fractional-N tuning word. For Pluto's 40 MHz reference input the
+  model uses the driver's doubled 80 MHz RFPLL parent, keeping scale and FFT
+  coordinates aligned without changing the requested LO. `/api/status` exposes modeled and effective values for diagnosis; a
+  known external reference or converter error still requires real measurement.
 - Coherent FFT magnitude remains Hann/CIC calibrated. The packed waterfall
   applies a separate Hann-ENBW noise-density and peak-reducer presentation
   factor, so the background does not become artificially dark at fine zoom.
+  Automatic waterfall mode increases its robust upper display target by a
+  further `2.12` factor, making auto mode approximately twice dimmer without
+  changing the palette, transport values, or manual level behavior.
 - Recovered RX-buffer retries and short reads reset CIC before the first
   post-gap block. The first complete frame after that reset is discarded.
 - Frequency-response compensation and legacy LNA/VGA/direct-sampling controls are not part of the Pluto UI.
