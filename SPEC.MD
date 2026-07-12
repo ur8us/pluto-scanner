@@ -258,12 +258,14 @@ hidden sample discontinuity.
 For compatible single-frequency view changes, the backend keeps a bounded
 recent raw-sample cache. If the new visible interval, sample rate, RF bandwidth,
 and source coverage match the cached stream, the backend snapshots enough past
-samples for one to four complete FFT windows, digitally rotates them if the
+samples for the predicted live-fill interval, digitally rotates them if the
 source center moved, and runs them through the normal CIC/Hann/FFT path as
 `preview=1` rows. Very fine frequency resolution can require many seconds of
 samples per FFT, so this avoids the traditional multi-second blank delay after
 a resolution change. Preview samples are never concatenated with new live
-samples; CIC state is reset before live acquisition resumes.
+samples; CIC state is reset before live acquisition resumes. The number of
+preview rows is calculated from the fresh-frame latency and the planned output
+cadence, subject to the bounded compatible cache.
 
 ### 3.6 I/Q decoding
 
@@ -280,11 +282,16 @@ Converted to complex `float[2*i], float[2*i+1]` layout for the FFT.
 - CIC runtime state: three bounded moving sums of length `decim`, one delay
   ring per stage, sampled every `decim` raw samples.
 - CIC frequency droop: inverse normalised CIC response, clamped `[0.05, 8]`.
-- Final transport: `mag → dB (20·log10) → uint8` mapped over `[−100, −20] dB`.
+- Waterfall noise presentation: multiply only the packed display magnitude by
+  `sqrt(90000 / Hann_ENBW)` and a Rayleigh peak-reducer factor for the actual
+  raw-bin count in the screen pixel.
+- Final transport: `display_mag → dB (20·log10) → uint8` mapped over
+  `[−100, −20] dB`.
 
 `magnitude_to_u8` performs the dB→byte mapping. This keeps a
-steady tone at the same displayed level across FFT size, CIC factor, and
-passband position.
+coherently calibrated tone stable before display presentation, while the
+additional ENBW factor keeps white-noise background brightness stable as
+resolution narrows.
 
 The raw buffers feeding CIC must remain contiguous. The scanner may drop
 queued buffers in non-CIC paths, but single-frequency CIC mode waits for queue
@@ -384,6 +391,8 @@ data: {"view":<id>,"n":<line#>,"b":<total_steps>,"mode":"scan|single",
        "overlap_factor":<o>,
        "minimum_rate_overlap":<0|1>,"minimum_rate_achieved":<0|1>,
        "true_line_rate":<lines_per_second>,
+       "preview_interval_ms":<planned_playback_interval>,
+       "waterfall_noise_scale":<enbw_display_factor>,
        "preview":<0|1>,"preview_age_ms":<ms>,
        "preview_sequence":<i>,"preview_count":<n>,
        "encoding":"u8b64","db":"<base64 packed uint8 row>"}
@@ -402,8 +411,11 @@ data: {"view":<id>,"n":<line#>,"b":<total_steps>,"mode":"scan|single",
 - `preview=1` rows are compatible historical samples processed through the same
   CIC/Hann/FFT path for low-latency high-resolution changes. They provide the
   first waterfall rows from memory while the live stream fills the larger FFT
-  window. Animated Go To waits for a matching `preview=0` row before treating
-  the final live view as settled.
+  window. `preview_interval_ms` is the planned display cadence; the frontend
+  queues previews and following live rows in arrival order, so cached rows do
+  not burst and then leave an empty pause. Animated Go To accepts a matching
+  current-resolution preview row and does not stretch an older row into the
+  new viewport.
 
 ---
 
@@ -421,7 +433,9 @@ bundler, no framework, no npm runtime dependency.
 - **Ruler overlays** — two `<canvas>` layers (`#rulerOverlay`,
   `#scopeRulerOverlay`) drawn on top of the main canvases.
 - **Frequency scale** — auto-ticked ruler below the scope with major/mid/minor
-  ticks chosen for the current span (`chooseFrequencyStep`).
+  ticks chosen for the current span (`chooseFrequencyStep`). Labels group Hz
+  digits after the kHz group (`10489.500 300 MHz`), and a centred light-blue
+  `<10Hz>`-style marker shows the major-tick distance.
 
 ### 4.2 Color map
 
@@ -437,6 +451,8 @@ manual dual slider); auto levels use robust percentiles (8 % noise floor,
 - `encoding:"u8b64"`/`db` must decode to `display_bins` bytes, or legacy `d`
   must be a length-`display_bins` array of integers `0..255`.
 - `f0 < f1` and finite.
+- Cached previews are queued and rendered at `preview_interval_ms`; live rows
+  arriving behind that queue retain chronological order.
 
 On stall (no line for 6× the expected line interval, clamped `5–30 s`) the
 client reconnects. Heartbeat shows `disconnected` / `idle` / `scanning`.
@@ -456,8 +472,8 @@ client reconnects. Heartbeat shows `disconnected` / `idle` / `scanning`.
 - **Go To dialog** — target frequency + zoom (`1×..1,000,000×`), optional
   animation with delay (`0.2/0.5/1/2/3/5 s`). Non-animated Go To retunes
   immediately. Animated Go To requests a backend view at every step and waits
-  for a matching waterfall row so each step uses the true current resolution
-  instead of only stretching the previous lower-resolution image.
+  for a matching current-resolution FFT/CIC row (a compatible preview or live
+  row) so each step does not stretch the previous lower-resolution image.
 - **Persistence** — the visible viewport is saved to `localStorage` and the URL
   hash (`#view=start-end`); restored on page load. A saved scan is **not**
   auto-started if the backend was idle.

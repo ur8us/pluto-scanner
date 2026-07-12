@@ -54,6 +54,16 @@ fetch('/api/stop', {method: 'POST', headers: {'Content-Type': 'application/json'
     return driver.execute_async_script(script)
 
 
+def api_status(driver):
+    """Return the current scanner status through the browser origin."""
+    script = """
+const done = arguments[arguments.length - 1];
+fetch('/api/status').then(r => r.json()).then(done)
+  .catch(e => done({status: 'error', message: String(e)}));
+"""
+    return driver.execute_async_script(script)
+
+
 def main():
     os.environ["NO_PROXY"] = "localhost,127.0.0.1"
     os.environ["no_proxy"] = "localhost,127.0.0.1"
@@ -94,6 +104,17 @@ def main():
         )
         assert driver.find_element(By.ID, "gainMode").is_displayed()
         assert driver.find_element(By.ID, "vgaGain").is_displayed()
+        scale_format = driver.execute_script(
+            "return window.__plutoTestHooks.scaleFormatting();"
+        )
+        if scale_format != {
+            "range": "10489.5003 - 10489.5006 MHz, Span: 0.0003 MHz",
+            "whole_mhz": "10489 MHz",
+            "khz": "10489.500 MHz",
+            "hz": "10489.500 300 MHz",
+            "delta": "10Hz",
+        }:
+            raise RuntimeError(f"unexpected scale formatting: {scale_format}")
 
         api_stop(driver)
         time.sleep(1.0)
@@ -115,7 +136,8 @@ def main():
             lambda d: "steps" in d.find_element(By.ID, "infoScan").text.lower()
         )
         WebDriverWait(driver, 15).until(
-            lambda d: "430 - 470" in d.find_element(By.ID, "infoRange").text
+            lambda d: "430 - 470 MHz, Span: 40 MHz"
+            in d.find_element(By.ID, "infoRange").text
         )
         wait_nonblank_waterfall(driver)
 
@@ -160,7 +182,59 @@ fetch('/api/status')
             "document.getElementById('gotoTargetZoom').value='100';"
             "document.getElementById('gotoOk').click();"
         )
-        time.sleep(0.8)
+        WebDriverWait(driver, 15).until(
+            lambda d: abs(
+                d.execute_script("return window.__plutoTestHooks.viewState();")[
+                    "center_hz"
+                ]
+                - 435_000_000
+            )
+            < 1
+        )
+        goto_state = driver.execute_script(
+            "return window.__plutoTestHooks.viewState();"
+        )
+        if abs(goto_state["span_hz"] - 400_000) > 5:
+            raise RuntimeError(f"static Go To did not apply target zoom: {goto_state}")
+        WebDriverWait(driver, 15).until(
+            lambda d: (
+                (status := api_status(d)).get("scanning")
+                and abs(float(status.get("visible_start_hz", 0)) - 434_800_000)
+                < 5
+                and abs(float(status.get("visible_end_hz", 0)) - 435_200_000)
+                < 5
+                and abs(
+                    d.execute_script("return window.__plutoTestHooks.viewState();")[
+                        "span_hz"
+                    ]
+                    - 400_000
+                )
+                < 5
+            )
+        )
+
+        driver.execute_script("document.getElementById('gotoButton').click();")
+        driver.execute_script(
+            "document.getElementById('gotoFreq').value='435';"
+            "document.getElementById('gotoTargetZoom').value='200';"
+            "const animate=document.getElementById('gotoAnimate');"
+            "animate.checked=true; animate.dispatchEvent(new Event('change',{bubbles:true}));"
+            "document.getElementById('gotoDelay').value='0.2';"
+            "document.getElementById('gotoOk').click();"
+        )
+        WebDriverWait(driver, 30).until(
+            lambda d: not d.execute_script(
+                "return window.__plutoTestHooks.viewState().goto_active;"
+            )
+        )
+        goto_state = driver.execute_script(
+            "return window.__plutoTestHooks.viewState();"
+        )
+        if (
+            abs(goto_state["center_hz"] - 435_000_000) > 1
+            or abs(goto_state["span_hz"] - 200_000) > 5
+        ):
+            raise RuntimeError(f"animated Go To did not finish at target: {goto_state}")
 
         driver.execute_script(
             "const el=arguments[0]; const r=el.getBoundingClientRect();"

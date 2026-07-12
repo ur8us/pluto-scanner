@@ -115,11 +115,13 @@ static int win32_nanosleep(const struct timespec *req, struct timespec *rem)
 #define SINGLE_DECIM_ASYNC_MIN_LEN 8192U
 #define SINGLE_DECIM_ASYNC_MAX_LEN 262144U
 #define CACHED_PREVIEW_MAX_SAMPLES 16777984U
-#define CACHED_PREVIEW_MAX_LINES 4U
+#define CACHED_PREVIEW_MAX_LINES 128U
 #define CACHED_PREVIEW_MAX_AGE_MS 5000LL
 #define SINGLE_ZERO_IF_GUARD_HZ 50000.0
 #define CIC_STAGES          3
-#define FFT_LEVEL_REF_SIZE  FFT_SIZE_MIN
+/* The minimum scan FFT has a Hann ENBW close to 90 kHz at 61.44 MSPS.
+ * Waterfall presentation uses this as the common white-noise reference. */
+#define WATERFALL_NOISE_REFERENCE_ENBW_HZ 90000.0
 #define FFTS_PER_STEP       32
 #define SCAN_FFTS_PER_STEP  1
 /* Phase-1 measured best scan profile for Pluto: 1024-sample buffers,
@@ -268,7 +270,6 @@ static int g_display_bins    = 1024;
 static uint32_t g_min_rate_lps = 10;
 static uint32_t g_rate_limit_lps = 20;
 static uint32_t g_view_id    = 1;
-static int g_next_preview_max_lines = 0;
 static int g_http_port = DEFAULT_HTTP_PORT;
 static char g_bind_address[128] = DEFAULT_BIND_ADDRESS;
 static double g_hardwaregain_db = PLUTO_DEFAULT_GAIN_DB;
@@ -2471,9 +2472,13 @@ typedef struct {
     long long preview_age_ms;
     int preview_sequence;
     int preview_count;
+    /* Planned display pacing for cached preview rows, in milliseconds. */
+    double preview_interval_ms;
     uint32_t direct_sampling;
     double direct_mix_phase;
     double direct_mix_inc;
+    /* Display-only white-noise density factor; coherent FFT data is unchanged. */
+    float waterfall_noise_scale;
     float mag_scale;
     float *window;
     float *fft_scratch;
@@ -3230,6 +3235,68 @@ static float fft_window_magnitude_scale(const float *window, int fft_size)
 }
 
 /**
+ * @brief Calculate the equivalent noise bandwidth of the active FFT window.
+ *
+ * The returned ENBW is in hertz. Unlike coherent gain, ENBW describes the
+ * noise power admitted by one FFT bin: `Fs * sum(w^2) / sum(w)^2`.
+ *
+ * @param window Exact FFT window coefficients.
+ * @param fft_size Number of window/FFT samples.
+ * @param samplerate_hz Sample rate at the FFT input in samples/s.
+ * @return Positive equivalent noise bandwidth in hertz, or zero on invalid input.
+ */
+static double fft_window_equivalent_noise_bandwidth(const float *window,
+                                                    int fft_size,
+                                                    double samplerate_hz)
+{
+    double sum = 0.0;
+    double sum_sq = 0.0;
+
+    if (!window || fft_size <= 0 || !isfinite(samplerate_hz) ||
+        samplerate_hz <= 0.0)
+        return 0.0;
+    for (int i = 0; i < fft_size; i++) {
+        double w = window[i];
+        sum += w;
+        sum_sq += w * w;
+    }
+    if (sum <= 0.0 || sum_sq <= 0.0)
+        return 0.0;
+    return samplerate_hz * sum_sq / (sum * sum);
+}
+
+/**
+ * @brief Return the display-only white-noise normalization for one FFT plan.
+ *
+ * Coherent amplitude remains normalized by `1 / sum(window)`. A white-noise
+ * bin instead scales with `sqrt(ENBW)`, so its apparent waterfall brightness
+ * falls at fine resolution unless this presentation factor is applied.
+ *
+ * @param window Exact FFT window coefficients.
+ * @param fft_size FFT length in samples.
+ * @param samplerate_hz FFT input sample rate in samples/s.
+ * @return Dimensionless display factor relative to the common 90 kHz ENBW.
+ */
+static float waterfall_noise_presentation_scale(const float *window,
+                                                 int fft_size,
+                                                 double samplerate_hz)
+{
+    double enbw = fft_window_equivalent_noise_bandwidth(window, fft_size,
+                                                         samplerate_hz);
+    double scale;
+
+    if (enbw <= 0.0)
+        return 1.0f;
+    scale = sqrt(WATERFALL_NOISE_REFERENCE_ENBW_HZ / enbw);
+    if (!isfinite(scale) || scale <= 0.0)
+        return 1.0f;
+    /* Invalid plans must not turn into an unbounded display gain. */
+    if (scale > 1024.0)
+        scale = 1024.0;
+    return (float)scale;
+}
+
+/**
  * cic_frequency_weight:
  * Return inverse normalized CIC magnitude at a baseband frequency offset.
  *
@@ -3729,6 +3796,27 @@ static double ctx_true_line_rate(const scan_ctx_t *ctx)
         ((double)ctx->fft_size * (double)ctx->decim_factor);
 }
 
+/**
+ * @brief Estimate the cadence at which this context publishes display rows.
+ *
+ * This includes CIC overlap used by the minimum-rate control and the final
+ * maximum-rate keep ratio, unlike `ctx_true_line_rate()`.
+ *
+ * @param ctx Active scan context.
+ * @return Estimated emitted waterfall rows per second.
+ */
+static double ctx_published_line_rate(const scan_ctx_t *ctx)
+{
+    double rate;
+
+    if (!ctx)
+        return 0.0;
+    rate = ctx->estimated_line_rate;
+    if (ctx->rate_keep_ratio > 0.0 && ctx->rate_keep_ratio < 1.0)
+        rate *= ctx->rate_keep_ratio;
+    return rate;
+}
+
 /** Return raw FFT-bin coverage of the current visible single-mode interval. */
 static double current_visible_raw_bins(void)
 {
@@ -4136,6 +4224,8 @@ static int scan_ctx_apply_fft_config(scan_ctx_t *ctx)
             ctx->direct_mix_inc += 2.0 * M_PI;
     }
     ctx->mag_scale = mag_scale;
+    ctx->waterfall_noise_scale = waterfall_noise_presentation_scale(
+        window, fft_size, fft_samplerate);
     ctx->window = window;
     ctx->fft_scratch = fft_scratch;
     ctx->decim_accum = decim_accum;
@@ -4606,11 +4696,52 @@ static void prepare_direct_sampling_samples(scan_ctx_t *ctx, float *buf, uint32_
 }
 
 /**
+ * @brief Return the median Rayleigh magnitude after selecting the peak of N bins.
+ *
+ * White complex Gaussian FFT bins have Rayleigh magnitudes. The exact median
+ * of the peak of `count` independent bins makes peak-per-pixel reduction less
+ * bright at low zoom without reducing a narrow signal's peak sensitivity.
+ *
+ * @param count Number of raw FFT bins reduced into one display pixel.
+ * @return Median magnitude in units of the underlying Rayleigh sigma.
+ */
+static double rayleigh_peak_median(int count)
+{
+    double root;
+    double tail;
+
+    if (count <= 1)
+        return sqrt(2.0 * log(2.0));
+    root = exp(log(0.5) / (double)count);
+    tail = 1.0 - root;
+    if (tail <= 0.0)
+        return sqrt(2.0 * log(2.0));
+    return sqrt(-2.0 * log(tail));
+}
+
+/**
+ * @brief Return a display-only normalization for peak-per-pixel aggregation.
+ *
+ * @param raw_bins Number of FFT/CIC bins contributing to one screen pixel.
+ * @return Dimensionless factor that keeps median white-noise brightness near
+ *         the one-bin reference while retaining peak aggregation for signals.
+ */
+static float peak_reducer_noise_scale(int raw_bins)
+{
+    double one = rayleigh_peak_median(1);
+    double many = rayleigh_peak_median(raw_bins);
+
+    if (many <= 0.0 || !isfinite(many))
+        return 1.0f;
+    return (float)(one / many);
+}
+
+/**
  * @brief Convert normalized FFT magnitude into the 8-bit waterfall transport.
  *
  * Input magnitudes are already corrected for Hann coherent gain and optional
- * CIC DC/droop effects. This function only applies the common dB display
- * window so FFT size and CIC factor do not shift signal amplitude.
+ * CIC DC/droop effects. `publish_scan_line()` additionally applies the
+ * documented display-only noise-density factor before this common dB window.
  *
  * @param mag Linear normalized magnitude.
  * @return Packed unsigned waterfall level.
@@ -4703,6 +4834,8 @@ static void publish_scan_line(scan_ctx_t *ctx)
         "\"minimum_rate_overlap\":%d,\"minimum_rate_limited\":%d,"
         "\"minimum_rate_achieved\":%d,"
         "\"true_line_rate\":%.3f,"
+        "\"preview_interval_ms\":%.3f,"
+        "\"waterfall_noise_scale\":%.6f,"
         "\"visible_raw_bins\":%.3f,\"visible_bins_per_pixel\":%.6f,"
         "\"preview\":%d,\"preview_age_ms\":%lld,"
         "\"preview_sequence\":%d,\"preview_count\":%d,"
@@ -4731,7 +4864,9 @@ static void publish_scan_line(scan_ctx_t *ctx)
             if (ctx->line_buf[i] > peak)
                 peak = ctx->line_buf[i];
         }
-        line_packed[x] = magnitude_to_u8(peak);
+        line_packed[x] = magnitude_to_u8(
+            peak * ctx->waterfall_noise_scale *
+            peak_reducer_noise_scale(last - first));
     }
 
     prefix_len = snprintf(NULL, 0, prefix_fmt,
@@ -4746,6 +4881,7 @@ static void publish_scan_line(scan_ctx_t *ctx)
         ctx->minimum_rate_limited, ctx->minimum_rate_limited,
         ctx->minimum_rate_achieved,
         ctx_true_line_rate(ctx),
+        ctx->preview_interval_ms, ctx->waterfall_noise_scale,
         ctx->visible_raw_bins, ctx->visible_bins_per_pixel,
         ctx->preview_mode, ctx->preview_age_ms,
         ctx->preview_sequence, ctx->preview_count);
@@ -4774,6 +4910,7 @@ static void publish_scan_line(scan_ctx_t *ctx)
         ctx->minimum_rate_limited, ctx->minimum_rate_limited,
         ctx->minimum_rate_achieved,
         ctx_true_line_rate(ctx),
+        ctx->preview_interval_ms, ctx->waterfall_noise_scale,
         ctx->visible_raw_bins, ctx->visible_bins_per_pixel,
         ctx->preview_mode, ctx->preview_age_ms,
         ctx->preview_sequence, ctx->preview_count);
@@ -5549,17 +5686,14 @@ static void *scan_thread_func(void *arg)
     uint32_t line_sample_count;
     uint32_t preview_sample_count = 0;
     int preview_line_count = 0;
-    int preview_max_lines_override = 0;
     unsigned int kernel_buffers;
     single_fft_plan_t single_plan = {0};
     float *preview_samples = NULL;
     long long preview_age_ms = 0;
+    double preview_first_line_ms = 0.0;
 
     mode = planned_run_mode();
     g_active_mode = mode;
-    preview_max_lines_override = g_next_preview_max_lines;
-    g_next_preview_max_lines = 0;
-
     if (mode != RUN_MODE_SINGLE)
         recent_sample_cache_invalidate();
 
@@ -5658,13 +5792,28 @@ static void *scan_thread_func(void *arg)
                                                         ctx.rate_limit_lps,
                                                         ctx.single_mode);
     ctx.rate_keep_credit = 1.0;
+    {
+        double published_rate = ctx_published_line_rate(&ctx);
+        ctx.preview_interval_ms = published_rate > 0.0 ?
+            1000.0 / published_rate : 0.0;
+        if (ctx.preview_interval_ms > 0.0 && ctx.preview_interval_ms < 10.0)
+            ctx.preview_interval_ms = 10.0;
+    }
 
     if (ctx.single_mode && !ctx.direct_sampling) {
-        int max_preview_lines = ctx.decim_factor > 1 ?
-            (int)CACHED_PREVIEW_MAX_LINES : 1;
-        if (preview_max_lines_override > 0 &&
-            max_preview_lines > preview_max_lines_override)
-            max_preview_lines = preview_max_lines_override;
+        int max_preview_lines = 1;
+        if (ctx.decim_factor > 1) {
+            preview_first_line_ms = estimated_first_line_ms_for_plan(
+                ctx.raw_samplerate, ctx.fft_size, line_sample_count,
+                ctx.total_steps, ctx.decim_factor);
+            if (ctx.preview_interval_ms > 0.0)
+                max_preview_lines = (int)ceil(preview_first_line_ms /
+                                              ctx.preview_interval_ms) + 1;
+            if (max_preview_lines < 1)
+                max_preview_lines = 1;
+            if (max_preview_lines > (int)CACHED_PREVIEW_MAX_LINES)
+                max_preview_lines = (int)CACHED_PREVIEW_MAX_LINES;
+        }
 
         for (int lines = max_preview_lines; lines >= 1; lines--) {
             uint64_t needed_decimated = (uint64_t)ctx.fft_size;
@@ -5694,6 +5843,16 @@ static void *scan_thread_func(void *arg)
             ctx.center_freq + single_plan.hardware_rf_bandwidth * 0.5,
             ctx.raw_samplerate, single_plan.hardware_rf_bandwidth);
         if (preview_samples) {
+            /* A cache can be shorter than the ideal count immediately after a
+             * prior transition. Slow preview playback just enough to bridge the
+             * predicted fresh live frame instead of displaying a burst then a
+             * blank gap. This only affects historical presentation timing. */
+            if (preview_line_count > 0 && preview_first_line_ms > 0.0) {
+                double coverage_interval = preview_first_line_ms /
+                    (double)preview_line_count;
+                if (coverage_interval > ctx.preview_interval_ms)
+                    ctx.preview_interval_ms = coverage_interval;
+            }
             ctx.preview_mode = 1;
             ctx.preview_age_ms = preview_age_ms;
             ctx.preview_sequence = 1;
@@ -7640,7 +7799,6 @@ start_bad_json:
                 (min_changed && planned_run_mode() == RUN_MODE_SINGLE);
             if (g_scanning && restart_needed) {
                 g_view_id++;
-                g_next_preview_max_lines = 1;
                 ret = start_scan();
             }
         }
@@ -7730,7 +7888,6 @@ start_bad_json:
         save_config();
         if (g_scanning && planned_run_mode() == RUN_MODE_SINGLE) {
             g_view_id++;
-            g_next_preview_max_lines = 1;
             ret = start_scan();
         }
 

@@ -116,7 +116,8 @@ still covering the visible span.
 
 `FFT weight` is the Hann coherent-gain correction, `1 / sum(window)`.
 `CIC DC scale` is `1 / decim^3`. `CIC edge weight` is the maximum CIC droop
-compensation expected at the visible edge for that row.
+compensation expected at the visible edge for that row. The coherent path is
+kept independent from the display-only waterfall noise factor below.
 
 | Zoom | Span MHz | Mode | SR MSPS | RF/display BW MHz | PB | Hops | 2nd IF kHz | Zero guard kHz | Decim | FFT | Raw source bins | Output bins | visible raw bins/px | FFT weight | CIC DC scale | CIC edge weight | line ms | first/raw ms |
 | ---: | ---: | :--- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
@@ -139,6 +140,32 @@ compensation expected at the visible edge for that row.
 | 200000 | 0.00465 | single | 4.00 | 2.00 | 0.50 | 1 | 52.3 | 50.0 | 32 | 65536 | 65536 | 1920 | 1.27 | 0.000030518044 | 0.000030517578 | 2.745 | 100 | 1134 |
 | 500000 | 0.00186 | single | 4.00 | 2.00 | 0.50 | 1 | 30.3 | 50.0 | 64 | 65536 | 65536 | 1920 | 1.02 | 0.000030518044 | 0.0000038146973 | 3.875 | 100 | 2267 |
 | 1000000 | 0.00093 | single | 4.00 | 2.00 | 0.50 | 1 | 15.2 | 50.0 | 128 | 65536 | 65536 | 1920 | 1.02 | 0.000030518044 | 0.00000047683716 | 3.875 | 100 | 4534 |
+
+### Waterfall Noise Presentation Factor
+
+The waterfall uses `90 kHz` as a common Hann ENBW reference. This factor is
+applied only while converting a completed row into packed display bytes; it
+does not alter coherent FFT amplitudes, CIC state, or the raw FFT output.
+
+| Zoom | FFT | Decim | FFT rate MSPS | Hann ENBW Hz | WF noise scale |
+| ---: | ---: | ---: | ---: | ---: | ---: |
+| 1 / 2 / 5 | 1024 | 1 | 61.44 | 90087.98 | 1.000 |
+| 10 | 2048 | 1 | 61.44 | 45021.98 | 1.414 |
+| 20 | 4096 | 1 | 61.44 | 22505.49 | 1.999 |
+| 50 | 8192 | 1 | 61.44 | 11251.37 | 2.828 |
+| 100 | 8192 | 1 | 20.00 | 3662.56 | 4.957 |
+| 200 | 8192 | 1 | 16.00 | 2930.05 | 5.542 |
+| 500 | 8192 | 1 | 4.00 | 732.51 | 11.084 |
+| 1000 | 16384 | 1 | 4.00 | 366.23 | 15.676 |
+| 2000 | 32768 | 1 | 4.00 | 183.11 | 22.170 |
+| 5000 | 65536 | 1 | 4.00 | 91.55 | 31.353 |
+| 10000 | 65536 | 2 | 2.00 | 45.78 | 44.340 |
+| 20000 | 65536 | 4 | 1.00 | 22.89 | 62.706 |
+| 50000 | 65536 | 8 | 0.50 | 11.44 | 88.680 |
+| 100000 | 65536 | 16 | 0.25 | 5.72 | 125.413 |
+| 200000 | 65536 | 32 | 0.125 | 2.86 | 177.361 |
+| 500000 | 65536 | 64 | 0.0625 | 1.43 | 250.826 |
+| 1000000 | 65536 | 128 | 0.03125 | 0.715 | 354.721 |
 
 ## Goals
 
@@ -165,8 +192,11 @@ compensation expected at the visible edge for that row.
 - Place zero IF outside the visible span by `50 kHz` when the source span has
   enough room; otherwise use the largest offset that still covers the visible
   range.
-- Normalize FFT output so a coherent tone has the same displayed level across
-  FFT size, CIC decimation, and CIC passband position.
+- Normalize coherent FFT output so a bin-centred tone has the same calibrated
+  magnitude across FFT size, CIC decimation, and CIC passband position.
+- Keep white-noise waterfall background at a comparable visual level across
+  FFT lengths, CIC factors, and FFT sample rates. This is a spectrum-density
+  presentation correction, distinct from coherent tone calibration.
 - Keep SSE rows at exactly `display_bins` values. Raw FFT bins are reduced to
   pixels by peak-per-pixel mapping; raw counts are reported as debug metadata.
 - Preserve persistent waterfall history across zoom and frequency changes.
@@ -386,7 +416,33 @@ fft_output_level =
 
 cic_decimated_sample =
   cic_output_sample * cic_dc_scale
+
+hann_enbw_hz =
+  fft_sample_rate_hz * sum(hann_window^2) / sum(hann_window)^2
+
+waterfall_noise_scale =
+  sqrt(90000 / hann_enbw_hz)
+  clamped to 1024
+
+rayleigh_peak_median(raw_bins) =
+  sqrt(-2 * ln(1 - 0.5^(1 / raw_bins)))
+
+peak_reducer_noise_scale(raw_bins) =
+  rayleigh_peak_median(1) / rayleigh_peak_median(raw_bins)
+
+waterfall_display_level =
+  fft_output_level * waterfall_noise_scale *
+  peak_reducer_noise_scale(raw_bins_in_this_pixel)
 ```
+
+`fft_output_level` is the calibrated coherent magnitude. A unit white-noise
+power spectral density produces `sqrt(hann_enbw_hz)` after coherent
+normalization, so multiplying by `waterfall_noise_scale` holds its displayed
+magnitude at `sqrt(90000)`. This necessarily makes a narrow-bin tone brighter
+in the waterfall density display; the underlying coherent FFT calibration is
+not changed. The peak reducer uses the median of a Rayleigh peak distribution
+to compensate the extra background brightness created when the exact
+one-pixel row reducer selects the maximum of multiple raw bins.
 
 Runtime CIC realization:
 
@@ -446,7 +502,12 @@ preview_raw_samples =
 Preview rows are valid historical measurements for display responsiveness, but
 they are marked `preview=1` and are never joined to post-restart live samples.
 Live CIC state is reset after preview processing, and the first live row is
-marked `preview=0`.
+marked `preview=0`. The backend chooses enough preview rows to cover the
+estimated fresh-frame wait where cached history permits and includes
+`preview_interval_ms` in every SSE row. The frontend queues those previews and
+releases them at that cadence while live acquisition fills independently. This
+avoids both an immediate preview burst and a subsequent empty pause, without
+ever forming an FFT from a mixture of pre-restart and post-restart samples.
 
 `tools/cic_stability_check.py` validates the bounded-state realization with a
 tone plus DC offset for decimations `2`, `4`, `8`, `64`, and `256`. It is a numeric

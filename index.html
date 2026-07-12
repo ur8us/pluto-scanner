@@ -198,7 +198,7 @@
                 position: absolute;
                 bottom: 14px;
                 transform: translateX(-50%);
-                color: rgba(150, 160, 172, 0.82);
+                color: #6cb4ee;
                 text-shadow: 0 1px 2px #000;
                 white-space: nowrap;
                 pointer-events: none;
@@ -987,6 +987,9 @@
             let lastWaterfallLineMs = 0;
             let lastSseLineMs = 0;
             let sseOpenMs = 0;
+            let waterfallPresentationQueue = [];
+            let waterfallPresentationTimer = 0;
+            let waterfallPresentationNextMs = 0;
             let waterfallSecondsPerLine = null;
             let redrawFrame = 0;
             let waterfallRenderToken = 0;
@@ -2059,13 +2062,20 @@
                 return mhz.toFixed(decimals) + " MHz";
             }
 
+            /**
+             * Format the visible air-frequency interval for the status line.
+             *
+             * @param {number} freqStart Visible start frequency in hertz.
+             * @param {number} freqEnd Visible end frequency in hertz.
+             * @returns {string} `start - end MHz, Span: range MHz` text.
+             */
             function formatScanRange(freqStart, freqEnd) {
                 const shownSpan = Math.abs(freqEnd - freqStart);
                 const decimals = decimalsForSpan(shownSpan);
                 const start = formatMHzValue(freqStart, decimals);
                 const end = formatMHzValue(freqEnd, decimals);
                 const span = formatMHzValue(shownSpan, decimals);
-                return start + " - " + end + " (" + span + ") MHz";
+                return start + " - " + end + " MHz, Span: " + span + " MHz";
             }
 
             function formatMHzValue(freq, decimals = 3) {
@@ -2418,7 +2428,13 @@
                 return true;
             }
 
-            /** Move the visible viewport to the target frequency and zoom. */
+            /**
+             * Move the visible viewport to the requested Go To target.
+             *
+             * @param {number} freqHz Requested air-frequency centre in hertz.
+             * @param {number} targetZoom Requested zoom factor.
+             * @returns {void}
+             */
             function applyGotoTargetNow(freqHz, targetZoom) {
                 const target = normalizeGotoFrequency(freqHz);
                 const span = gotoSpanForZoom(targetZoom);
@@ -2441,6 +2457,10 @@
              * Each step waits for a matching waterfall row so the animation
              * refines FFT/CIC resolution instead of stretching the previous
              * lower-resolution waterfall image over a narrower span.
+             *
+             * @param {number} freqHz Requested air-frequency centre in hertz.
+             * @param {number} targetZoom Requested zoom factor.
+             * @returns {Promise<void>} Resolves when animation finishes or is cancelled.
              */
             async function runGotoAnimation(freqHz, targetZoom) {
                 cancelGotoAnimation();
@@ -2521,7 +2541,7 @@
                             currentFreq0,
                             currentFreq1,
                             plan,
-                            true,
+                            false,
                         );
                     } else {
                         pendingViewChange = false;
@@ -2569,13 +2589,14 @@
                                 currentFreq0,
                                 currentFreq1,
                                 plan,
-                                true,
+                                false,
                             );
                         }
                     }
                 }
                 if (token === gotoAnimationToken && gotoAnimationActive) {
                     setGotoAnimationActive(false);
+                    scheduleCurrentViewRedraw();
                 }
             }
 
@@ -2739,12 +2760,23 @@
             /**
              * Format one frequency-scale label in MHz.
              *
+             * When sub-kHz precision is needed (>3 fractional digits), insert a
+             * space after the third fractional digit as a visual grouping separator:
+             *   `142.405 751 MHz`  (decimals=6)
+             *   `96.123456 789 MHz` (decimals=9)
+             *
              * @param {number} freq Frequency in hertz.
              * @param {number} decimals Number of MHz fractional digits.
-             * @returns {string} Label such as `96.123 MHz`.
+             * @returns {string} Label such as `96.123 MHz` or `142.405 751 MHz`.
              */
             function formatTickMHz(freq, decimals) {
-                return (freq / 1e6).toFixed(decimals) + " MHz";
+                const mhz = (freq / 1e6).toFixed(decimals);
+                if (decimals > 3) {
+                    const intPart = mhz.slice(0, mhz.length - decimals);
+                    const fracPart = mhz.slice(mhz.length - decimals);
+                    return intPart + fracPart.slice(0, 3) + " " + fracPart.slice(3) + " MHz";
+                }
+                return mhz + " MHz";
             }
 
             /**
@@ -3374,16 +3406,15 @@
                     return mark;
                 });
 
-                if (majorTicks.length >= 3) {
+                if (majorTicks.length >= 2) {
                     const deltaText = formatScaleDelta(
-                        majorTicks[2].freq - majorTicks[1].freq,
+                        majorTicks[1].freq - majorTicks[0].freq,
                     );
                     if (deltaText) {
                         const delta = document.createElement("div");
                         delta.className = "wf-step-delta";
-                        delta.style.left =
-                            (majorTicks[1].pos + majorTicks[2].pos) * 0.5 + "%";
-                        delta.textContent = "<- " + deltaText + " ->";
+                        delta.style.left = "50%";
+                        delta.textContent = "<" + deltaText + ">";
                         nodes.push(delta);
                     }
                 }
@@ -4150,6 +4181,168 @@
                 }, delay);
             }
 
+            /**
+             * Clear cached-preview rows that have not reached the canvas yet.
+             *
+             * @returns {void}
+             */
+            function clearWaterfallPresentationQueue() {
+                if (waterfallPresentationTimer) {
+                    clearTimeout(waterfallPresentationTimer);
+                    waterfallPresentationTimer = 0;
+                }
+                waterfallPresentationQueue = [];
+                waterfallPresentationNextMs = 0;
+            }
+
+            /**
+             * Return the backend-planned cadence for preview playback.
+             *
+             * @param {Object} data Parsed SSE waterfall row.
+             * @returns {number} Delay in milliseconds before the next queued row.
+             */
+            function previewPresentationIntervalMs(data) {
+                const interval = Number(data && data.preview_interval_ms);
+                if (Number.isFinite(interval) && interval > 0)
+                    return Math.max(10, Math.min(60000, interval));
+                return 0;
+            }
+
+            /**
+             * Present queued cached/live rows in chronological order.
+             *
+             * Cached rows are sent by the backend immediately so live Pluto
+             * acquisition can start at once. Rendering them at the planned line
+             * cadence prevents an instant burst followed by an empty CIC fill.
+             *
+             * @returns {void}
+             */
+            function drainWaterfallPresentationQueue() {
+                if (waterfallPresentationTimer || !waterfallPresentationQueue.length)
+                    return;
+                const now = performance.now();
+                const due = Math.max(now, waterfallPresentationNextMs);
+                waterfallPresentationTimer = setTimeout(() => {
+                    const data = waterfallPresentationQueue.shift();
+                    waterfallPresentationTimer = 0;
+                    if (!data) return;
+                    renderWaterfallPayload(data);
+                    const interval = previewPresentationIntervalMs(data);
+                    waterfallPresentationNextMs =
+                        performance.now() + interval;
+                    if (!waterfallPresentationQueue.length)
+                        waterfallPresentationNextMs = 0;
+                    drainWaterfallPresentationQueue();
+                }, Math.max(0, due - now));
+            }
+
+            /**
+             * Queue preview rows, and preserve their order relative to live rows.
+             *
+             * @param {Object} data Parsed SSE waterfall row.
+             * @returns {void}
+             */
+            function enqueueWaterfallPayload(data) {
+                const preview = Number(data && data.preview) !== 0;
+                if (
+                    preview ||
+                    waterfallPresentationQueue.length ||
+                    waterfallPresentationTimer
+                ) {
+                    waterfallPresentationQueue.push(data);
+                    drainWaterfallPresentationQueue();
+                    return;
+                }
+                renderWaterfallPayload(data);
+            }
+
+            /**
+             * Apply one already ordered SSE waterfall row to the live UI.
+             *
+             * @param {Object} data Parsed SSE waterfall row.
+             * @returns {void}
+             */
+            function renderWaterfallPayload(data) {
+                try {
+                    const bins = data.d;
+                    const rowView =
+                        data.view !== undefined
+                            ? Number(data.view)
+                            : currentViewId;
+                    const rowFreq0 =
+                        data.f0 !== undefined
+                            ? Number(data.f0)
+                            : currentFreq0;
+                    const rowFreq1 =
+                        data.f1 !== undefined
+                            ? Number(data.f1)
+                            : currentFreq1;
+                    const rowTimestampMs = waterfallTimestampForPayload(data);
+                    /* `currentViewId` still identifies the old backend view
+                     * until /api/view replies. Drop old rows during that gap;
+                     * otherwise they can undo a just-selected Go To window. */
+                    if (pendingViewChange && rowView === currentViewId) return;
+                    if (
+                        currentViewId &&
+                        rowView &&
+                        rowView !== currentViewId
+                    ) {
+                        if (rowView < currentViewId) return;
+                        currentViewId = rowView;
+                    }
+                    if (!currentViewId && rowView) currentViewId = rowView;
+                    if (data.full_f0 !== undefined)
+                        configuredFreq0 = Number(data.full_f0);
+                    if (data.full_f1 !== undefined)
+                        configuredFreq1 = Number(data.full_f1);
+                    if (!gotoAnimationActive && data.f0 !== undefined)
+                        currentFreq0 = rowFreq0;
+                    if (!gotoAnimationActive && data.f1 !== undefined)
+                        currentFreq1 = rowFreq1;
+                    if (data.b) currentSteps = data.b;
+                    updateFFTInfo(data);
+                    if (
+                        (!gotoAnimationActive && !gotoPreviewRetained) ||
+                        pendingViewChange
+                    ) {
+                        zoomLeft = 0;
+                        zoomRight = 1;
+                    }
+                    if (pendingViewChange) gotoPreviewRetained = false;
+                    pendingViewChange = false;
+                    currentBins = bins;
+                    currentBinsFreq0 = rowFreq0;
+                    currentBinsFreq1 = rowFreq1;
+                    recordWaterfallLineArrival();
+
+                    drawWaterfallLine(
+                        bins,
+                        rowFreq0,
+                        rowFreq1,
+                        currentSteps,
+                        rowTimestampMs,
+                    );
+                    drawScope(
+                        bins,
+                        rowFreq0,
+                        rowFreq1,
+                        currentSteps,
+                    );
+                    notifyGotoLineDrawn(
+                        data,
+                        rowView,
+                        rowFreq0,
+                        rowFreq1,
+                    );
+
+                    document.getElementById("infoRange").textContent =
+                        formatScanRange(currentFreq0, currentFreq1);
+                    saveVisibleView();
+                } catch (e) {
+                    console.warn("Ignored invalid waterfall line", e);
+                }
+            }
+
             function connectSSE() {
                 if (eventSource) eventSource.close();
                 sseOpenMs = performance.now();
@@ -4159,82 +4352,7 @@
                 eventSource.addEventListener("line", function (e) {
                     const data = parseLineEventPayload(e.data);
                     if (!data) return;
-                    try {
-                        const bins = data.d;
-                        const rowView =
-                            data.view !== undefined
-                                ? Number(data.view)
-                                : currentViewId;
-                        const rowFreq0 =
-                            data.f0 !== undefined
-                                ? Number(data.f0)
-                                : currentFreq0;
-                        const rowFreq1 =
-                            data.f1 !== undefined
-                                ? Number(data.f1)
-                                : currentFreq1;
-                        const rowTimestampMs = waterfallTimestampForPayload(data);
-                        if (pendingViewChange && rowView === currentViewId)
-                            return;
-                        if (
-                            currentViewId &&
-                            rowView &&
-                            rowView !== currentViewId
-                        ) {
-                            if (rowView < currentViewId) return;
-                            currentViewId = rowView;
-                        }
-                        if (!currentViewId && rowView) currentViewId = rowView;
-                        if (data.full_f0 !== undefined)
-                            configuredFreq0 = Number(data.full_f0);
-                        if (data.full_f1 !== undefined)
-                            configuredFreq1 = Number(data.full_f1);
-                        if (!gotoAnimationActive && data.f0 !== undefined)
-                            currentFreq0 = rowFreq0;
-                        if (!gotoAnimationActive && data.f1 !== undefined)
-                            currentFreq1 = rowFreq1;
-                        if (data.b) currentSteps = data.b;
-                        updateFFTInfo(data);
-                        if (
-                            (!gotoAnimationActive && !gotoPreviewRetained) ||
-                            pendingViewChange
-                        ) {
-                            zoomLeft = 0;
-                            zoomRight = 1;
-                        }
-                        if (pendingViewChange) gotoPreviewRetained = false;
-                        pendingViewChange = false;
-                        currentBins = bins;
-                        currentBinsFreq0 = rowFreq0;
-                        currentBinsFreq1 = rowFreq1;
-                        recordWaterfallLineArrival();
-
-                        drawWaterfallLine(
-                            bins,
-                            rowFreq0,
-                            rowFreq1,
-                            currentSteps,
-                            rowTimestampMs,
-                        );
-                        drawScope(
-                            bins,
-                            rowFreq0,
-                            rowFreq1,
-                            currentSteps,
-                        );
-                        notifyGotoLineDrawn(
-                            data,
-                            rowView,
-                            rowFreq0,
-                            rowFreq1,
-                        );
-
-                        document.getElementById("infoRange").textContent =
-                            formatScanRange(currentFreq0, currentFreq1);
-                        saveVisibleView();
-                    } catch (e) {
-                        console.warn("Ignored invalid waterfall line", e);
-                    }
+                    enqueueWaterfallPayload(data);
                 });
 
                 eventSource.onopen = function () {
@@ -4257,6 +4375,7 @@
             }
 
             function disconnectSSE() {
+                clearWaterfallPresentationQueue();
                 if (sseReconnectTimer) {
                     clearTimeout(sseReconnectTimer);
                     sseReconnectTimer = 0;
@@ -5027,6 +5146,15 @@
                 );
             }
 
+            /**
+             * Set one animated Go To viewport without rescaling stale waterfall rows.
+             *
+             * @param {number} left Requested visible start frequency in hertz.
+             * @param {number} right Requested visible end frequency in hertz.
+             * @param {boolean} force Apply even when the viewport is unchanged.
+             * @param {boolean} updateBackend Whether to queue an immediate backend view.
+             * @returns {boolean} True when the viewport was accepted.
+             */
             function applyAnimatedGotoWindow(
                 left,
                 right,
@@ -5050,8 +5178,6 @@
                 ) {
                     return false;
                 }
-                const prevFreq0 = currentFreq0;
-                const prevFreq1 = currentFreq1;
                 gotoPreviewRetained = false;
                 zoomLeft = 0;
                 zoomRight = 1;
@@ -5059,13 +5185,9 @@
                 currentFreq1 = clamped.right;
                 pendingViewChange = true;
                 binRangeCache = null;
-                transformVisibleDisplay(
-                    prevFreq0,
-                    prevFreq1,
-                    currentFreq0,
-                    currentFreq1,
-                );
-                scheduleCurrentViewRedraw();
+                /* A Go To step waits for a matching FFT/CIC row. Keeping prior
+                 * pixels temporarily unscaled prevents a false finer-resolution
+                 * waterfall from being shown during the transition. */
                 updateFrequencyLabels(currentFreq0, currentFreq1, currentSteps);
                 document.getElementById("infoRange").textContent =
                     formatScanRange(currentFreq0, currentFreq1);
@@ -6059,6 +6181,7 @@
             }
 
             function clearScanDisplay() {
+                clearWaterfallPresentationQueue();
                 cancelCurrentViewRedraw();
                 freqScaleSignature = "";
                 currentBins = null;
@@ -6482,6 +6605,25 @@
                         invalid_row_black: invalidRow.every(
                             (value, index) => index % 4 === 3 || value === 0,
                         ),
+                    };
+                },
+                scaleFormatting() {
+                    return {
+                        range: formatScanRange(10489500300, 10489500600),
+                        whole_mhz: formatTickMHz(10489000000, 0),
+                        khz: formatTickMHz(10489500000, 3),
+                        hz: formatTickMHz(10489500300, 6),
+                        delta: formatScaleDelta(10),
+                    };
+                },
+                viewState() {
+                    return {
+                        start_hz: currentFreq0,
+                        end_hz: currentFreq1,
+                        center_hz: (currentFreq0 + currentFreq1) * 0.5,
+                        span_hz: currentFreq1 - currentFreq0,
+                        goto_active: gotoAnimationActive,
+                        queued_rows: waterfallPresentationQueue.length,
                     };
                 },
             };

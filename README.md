@@ -329,7 +329,12 @@ http://localhost:8080
   before the first new live row arrives. Preview rows use the same CIC/Hann/FFT
   path and are not mixed with post-restart samples. This is especially useful
   when very fine resolution needs many seconds of samples for the next FFT and
-  the new decimated stream has not filled that window yet.
+  the new decimated stream has not filled that window yet. The browser releases
+  cached rows at the planned line cadence while live capture fills, avoiding an
+  immediate preview burst followed by a blank pause.
+- Coherent FFT magnitude remains Hann/CIC calibrated. The packed waterfall
+  applies a separate Hann-ENBW noise-density and peak-reducer presentation
+  factor, so the background does not become artificially dark at fine zoom.
 - Recovered RX-buffer retries and short reads reset CIC before the first
   post-gap block. The first complete frame after that reset is discarded.
 - Frequency-response compensation and legacy LNA/VGA/direct-sampling controls are not part of the Pluto UI.

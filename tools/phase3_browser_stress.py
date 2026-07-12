@@ -125,12 +125,21 @@ el.dispatchEvent(new WheelEvent('wheel', {
 
 
 def apply_goto(driver, freq_mhz, target_zoom, animate=False, delay="0.2"):
-    button = WebDriverWait(driver, 20).until(
-        lambda d: d.find_element(By.ID, "gotoButton")
-        if d.find_element(By.ID, "gotoButton").is_enabled()
-        else False
+    before = api_status(driver)
+    before_view = int(before.get("view_id", 0) or 0)
+    configured_span = float(
+        before.get("configured_end_hz", before.get("freq_end", 0))
+    ) - float(before.get("configured_start_hz", before.get("freq_start", 0)))
+    expected_span = configured_span / float(target_zoom)
+
+    WebDriverWait(driver, 20).until(
+        lambda d: d.find_element(By.ID, "gotoButton").is_enabled()
     )
-    button.click()
+    # Gecko can wait behind a busy canvas compositor for a native WebDriver
+    # click even though the button is visible and enabled. The ordinary UI test
+    # exercises a physical click; this long stress pass invokes the same DOM
+    # handler directly so it can validate the successive backend view plans.
+    driver.execute_script("document.getElementById('gotoButton').click();")
     WebDriverWait(driver, 5).until(
         lambda d: "open" in d.find_element(By.ID, "gotoDialog").get_attribute("class")
     )
@@ -154,8 +163,17 @@ document.getElementById('gotoOk').click();
             lambda d: "active"
             not in d.find_element(By.ID, "gotoButton").get_attribute("class")
         )
-    WebDriverWait(driver, 20).until(
-        lambda d: d.find_element(By.ID, "statusText").text == "scanning"
+    WebDriverWait(driver, 30).until(
+        lambda d: (
+            (status := api_status(d)).get("scanning")
+            and int(status.get("view_id", 0) or 0) > before_view
+            and abs(
+                (float(status.get("visible_end_hz", 0))
+                 - float(status.get("visible_start_hz", 0)))
+                - expected_span
+            )
+            <= max(5.0, expected_span * 1e-6)
+        )
     )
     try:
         wait_nonblank_waterfall(driver, timeout=20)

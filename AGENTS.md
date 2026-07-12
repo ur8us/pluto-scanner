@@ -91,7 +91,10 @@ Agents must preserve these two Pluto operating modes. Do not port Fobos assumpti
      after a resolution change before a new waterfall line appears. Preview
      processing reuses compatible memory-held samples for the first rows, must
      use the same CIC/Hann/FFT path, must be marked in SSE metadata, and must
-     reset all CIC state before live acquisition resumes.
+     reset all CIC state before live acquisition resumes. The backend may send
+     multiple preview rows immediately, but the frontend must release them at
+     `preview_interval_ms` while the independent live stream fills; never join
+     pre-restart cache samples to post-restart live samples in an FFT.
 
 ## FFT, CIC, and RF Planning Rules
 
@@ -153,8 +156,9 @@ Frontend RF display:
 
 ## Output Level Normalization
 
-The scanner must show the same signal at the same level when FFT size or CIC
-decimation changes.
+The scanner must preserve the same coherent signal calibration when FFT size or
+CIC decimation changes. Waterfall white-noise presentation is separately
+normalized for resolution bandwidth.
 
 - FFT windowing uses a Hann window.
 - Magnitudes are normalized by coherent window gain: `1 / sum(window)`.
@@ -168,6 +172,14 @@ decimation changes.
   (decim * sin(pi * f / raw_sample_rate))) ^ 3`.
 - Clamp the inverse CIC compensation to `8x` and floor the modeled CIC gain at
   `0.05` so edge bins cannot explode if the response approaches a null.
+- Waterfall byte presentation additionally normalizes white-noise density with
+  `sqrt(90000 / hann_enbw_hz)`, where
+  `hann_enbw_hz = fft_samplerate * sum(window^2) / sum(window)^2`. It is
+  display-only: do not feed it into CIC state or coherent FFT amplitude.
+- Peak-per-pixel reduction uses a Rayleigh median correction for the actual
+  raw-bin count in a pixel. Preserve peak signal sensitivity while preventing
+  low-zoom multi-bin reduction from making the noise background artificially
+  brighter. See `SPECTRUM_CALC.MD` for the exact formula and the `1024x` cap.
 - Validate changes with `tools/fft_level_normalization_check.py`.
 
 ## Runtime Stability Expectations
@@ -251,7 +263,7 @@ Preserve:
 - Markers and band overlays.
 - Browser heartbeat showing disconnected/idle/scanning.
 
-The Pluto UI exposes sample rate, RF bandwidth, passband usage, gain mode, and hardware gain. Preserve the visible `Shown: start - end (range) MHz` status-line text. Do not re-add the old separate Range badge, the `FW:` indicator, RSSI/Peak readout, frontend Device/serial indicator, or passive `Pluto Input` group. Backend logs should print Pluto software version and serial once the hardware opens.
+The Pluto UI exposes sample rate, RF bandwidth, passband usage, gain mode, and hardware gain. Preserve the visible `Shown: start - end MHz, Span: range MHz` status-line text. Do not re-add the old separate Range badge, the `FW:` indicator, RSSI/Peak readout, frontend Device/serial indicator, or passive `Pluto Input` group. Backend logs should print Pluto software version and serial once the hardware opens.
 
 ## Documentation Standard
 
