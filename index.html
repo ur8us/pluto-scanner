@@ -196,11 +196,9 @@
             }
             .wf-step-delta {
                 position: absolute;
-                bottom: 1px;
+                bottom: 14px;
                 transform: translateX(-50%);
                 color: rgba(150, 160, 172, 0.82);
-                font-size: 8px;
-                line-height: 1;
                 text-shadow: 0 1px 2px #000;
                 white-space: nowrap;
                 pointer-events: none;
@@ -638,10 +636,6 @@
 
             <div class="info-bar">
                 <span>SW: <span class="val" id="infoSw">---</span></span>
-                <span id="infoDeviceWrap" hidden
-                    >Device:
-                    <span class="val" id="infoDevice">---</span></span
-                >
                 <span
                     >Markers (SHIFT+click):
                     <span class="val" id="infoMarkers">0</span></span
@@ -957,7 +951,6 @@
             let manualStopSerial = 0;
             let userStopped = false;
             let manualStopSuppressUntilMs = 0;
-            let deviceInfoRevealed = false;
             let autoRestartTimer = 0;
             let autoRestartInFlight = false;
             const MANUAL_STOP_RESTART_SUPPRESS_MS = 5000;
@@ -1381,49 +1374,19 @@
             }
 
             /**
-             * Return whether a backend identity string contains real content.
+             * Copy backend software metadata into the compact top bar.
              *
-             * @param {string} value Backend identity field.
-             * @returns {boolean} True when the field should be shown.
-             */
-            function hasDeviceIdentityValue(value) {
-                const text = String(value || "").trim();
-                return !!text && text !== "---" && text !== "unknown";
-            }
-
-            /**
-             * Copy backend identity/range metadata into the compact top bar.
-             *
-             * Hardware and serial details stay hidden until a scan has actually
-             * started, because before device open they are placeholders rather
-             * than useful Pluto information.
+             * Pluto firmware and serial are intentionally logged by the backend
+             * after device connection instead of being repeated in the frontend.
              *
              * @param {Object} status Backend status/start/view payload.
-             * @param {boolean} revealDeviceInfo True after scan start.
              * @returns {void}
              */
-            function syncDeviceInfo(status, revealDeviceInfo = false) {
+            function syncDeviceInfo(status) {
                 if (!status) return;
                 if (status.sw_version !== undefined)
                     document.getElementById("infoSw").textContent =
                         status.sw_version || "---";
-                if (revealDeviceInfo || Number(status.scanning))
-                    deviceInfoRevealed = true;
-                const wrap = document.getElementById("infoDeviceWrap");
-                const value = document.getElementById("infoDevice");
-                if (!wrap || !value) return;
-                const parts = [];
-                if (hasDeviceIdentityValue(status.hardware))
-                    parts.push("rev " + String(status.hardware).trim());
-                if (hasDeviceIdentityValue(status.serial))
-                    parts.push("serial " + String(status.serial).trim());
-                if (deviceInfoRevealed && parts.length > 0) {
-                    value.textContent = parts.join(" · ");
-                    wrap.hidden = false;
-                } else {
-                    value.textContent = "---";
-                    wrap.hidden = true;
-                }
             }
 
             function syncRateRangeFromSliders(changed) {
@@ -4429,7 +4392,7 @@
                     !Number(status.scanning) &&
                     !!Number(status.auto_restart_on_reconnect || 0);
                 updateUI(!!status.scanning, true, reconnecting);
-                syncDeviceInfo(status, Number(status.scanning));
+                syncDeviceInfo(status);
                 if (!gotoAnimationActive && status.view_id !== undefined)
                     currentViewId = Number(status.view_id);
                 if (status.configured_start_hz !== undefined)
@@ -6527,7 +6490,7 @@
                 restoreTimeMarksSetting();
                 const status = await apiGet("/api/status");
                 if (status) {
-                    syncDeviceInfo(status, Number(status.scanning));
+                    syncDeviceInfo(status);
                     currentSteps = status.steps || 0;
                     updateFFTInfo(status);
                     configuredFreq0 =

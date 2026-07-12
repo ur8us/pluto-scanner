@@ -4,6 +4,8 @@ on:
   push:
     tags:
       - "v*"
+  schedule:
+    - cron: "37 2 * * *"
   workflow_dispatch:
 
 permissions:
@@ -12,6 +14,7 @@ permissions:
 env:
   LIBIIO_REF: v0.26
   LIBXML2_VERSION: 2.12.10
+  PACKAGE_VERSION: ${{ startsWith(github.ref, 'refs/tags/') && github.ref_name || 'nightly' }}
 
 jobs:
   linux:
@@ -65,7 +68,7 @@ jobs:
         run: |
           OUT_DIR="$PWD/.release/out" \
           tools/ci/package-release.sh \
-            "${GITHUB_REF_NAME}" \
+            "${PACKAGE_VERSION}" \
             "${{ matrix.target }}" \
             "$PWD/.release/bin/pluto-scanner" \
             tar.gz
@@ -74,7 +77,7 @@ jobs:
         run: |
           OUT_DIR="$PWD/.release/out" \
           tools/ci/package-appimage.sh \
-            "${GITHUB_REF_NAME}" \
+            "${PACKAGE_VERSION}" \
             "${{ matrix.target }}" \
             "$PWD/.release/bin/pluto-scanner" \
             "${{ matrix.appimage_arch }}"
@@ -130,7 +133,7 @@ jobs:
         run: |
           OUT_DIR="$PWD/.release/out" \
           tools/ci/package-release.sh \
-            "${GITHUB_REF_NAME}" \
+            "${PACKAGE_VERSION}" \
             windows-x86_64 \
             "$PWD/.release/bin/pluto-scanner.exe" \
             zip
@@ -187,7 +190,7 @@ jobs:
         run: |
           OUT_DIR="$PWD/.release/out" \
           tools/ci/package-macos-dmg.sh \
-            "${GITHUB_REF_NAME}" \
+            "${PACKAGE_VERSION}" \
             "$PWD/.release/bin/pluto-scanner"
 
       - name: Upload release artifacts
@@ -199,7 +202,7 @@ jobs:
 
   release:
     name: Publish GitHub release
-    if: startsWith(github.ref, 'refs/tags/')
+    if: startsWith(github.ref, 'refs/tags/') || github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
     needs:
       - linux
       - windows
@@ -207,6 +210,11 @@ jobs:
     runs-on: ubuntu-24.04
 
     steps:
+      - name: Check out source for release tag
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
       - name: Download build artifacts
         uses: actions/download-artifact@v4
         with:
@@ -223,9 +231,28 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          tag="${GITHUB_REF_NAME}"
+          tag="${PACKAGE_VERSION}"
+          if [ "$tag" = "nightly" ]; then
+            git config user.name "github-actions[bot]"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            git tag -f "$tag" "$GITHUB_SHA"
+            git push --force origin "refs/tags/$tag"
+          fi
           if gh release view "$tag" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
             gh release upload "$tag" release-assets/* --repo "$GITHUB_REPOSITORY" --clobber
+            if [ "$tag" = "nightly" ]; then
+              gh release edit "$tag" \
+                --repo "$GITHUB_REPOSITORY" \
+                --title "Nightly build" \
+                --notes "Automated nightly build from ${GITHUB_SHA}." \
+                --prerelease
+            fi
+          elif [ "$tag" = "nightly" ]; then
+            gh release create "$tag" release-assets/* \
+              --repo "$GITHUB_REPOSITORY" \
+              --title "Nightly build" \
+              --notes "Automated nightly build from ${GITHUB_SHA}." \
+              --prerelease
           else
             gh release create "$tag" release-assets/* \
               --repo "$GITHUB_REPOSITORY" \

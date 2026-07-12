@@ -60,6 +60,7 @@ static int win32_nanosleep(const struct timespec *req, struct timespec *rem)
 #include <unistd.h>
 #include <sys/socket.h>
 #include <netinet/in.h>
+#include <netdb.h>
 #include <sys/select.h>
 #include <fcntl.h>
 #include <dirent.h>
@@ -76,7 +77,8 @@ static int win32_nanosleep(const struct timespec *req, struct timespec *rem)
 /* ------------------------------------------------------------------ */
 /* Config                                                             */
 /* ------------------------------------------------------------------ */
-#define PORT                8080
+#define DEFAULT_HTTP_PORT   8080
+#define DEFAULT_BIND_ADDRESS "127.0.0.1"
 #define MAX_HEADERS         4096
 #define MAX_REQUEST         65536
 #define MAX_CLIENTS         64
@@ -267,6 +269,8 @@ static uint32_t g_min_rate_lps = 10;
 static uint32_t g_rate_limit_lps = 20;
 static uint32_t g_view_id    = 1;
 static int g_next_preview_max_lines = 0;
+static int g_http_port = DEFAULT_HTTP_PORT;
+static char g_bind_address[128] = DEFAULT_BIND_ADDRESS;
 static double g_hardwaregain_db = PLUTO_DEFAULT_GAIN_DB;
 static char g_gain_mode[32] = "manual";
 static char g_rf_port[32] = "A_BALANCED";
@@ -2366,11 +2370,10 @@ static int open_first_device(int verbose)
     if (ret != PLUTO_ERR_OK && verbose)
         printf("[SDR] Could not read board info: %d\n", ret);
     load_sample_rates(g_dev);
-    if (verbose) {
-        printf("[SDR] Device: %s %s\n", g_manufacturer, g_product);
-        printf("[SDR]   Pluto: %s  FW: %s  S/N: %s\n",
-               g_hw_rev, g_fw_ver, g_serial);
-    }
+    if (verbose)
+        printf("[SDR] Pluto hardware: %s %s\n", g_manufacturer, g_product);
+    printf("[SDR] Pluto connected: software %s, serial %s\n",
+           g_fw_ver, g_serial);
     return PLUTO_ERR_OK;
 #endif
 }
@@ -7819,56 +7822,94 @@ start_bad_json:
 static volatile int g_exit = 0;
 static void sigint_handler(int sig) { (void)sig; g_exit = 1; }
 
+/**
+ * @brief Create the HTTP listening socket for the configured bind endpoint.
+ *
+ * `g_bind_address` may be a concrete IPv4/IPv6 address, `localhost`, or `*`.
+ * `*` means all local interfaces and is intended for trusted LAN use.
+ *
+ * @return Listening socket descriptor, or `-1` on bind/listen failure.
+ */
 static int create_http_server_socket(void)
 {
-    int fd = socket(AF_INET6, SOCK_STREAM, 0);
-    int opt = 1;
-    int v6only = 0;
+    struct addrinfo hints;
+    struct addrinfo *results = NULL;
+    char port[16];
+    const char *node = g_bind_address;
+    int gai;
+    int last_error = 0;
 
-    if (fd >= 0) {
-        struct sockaddr_in6 addr6;
+    snprintf(port, sizeof(port), "%d", g_http_port);
+    memset(&hints, 0, sizeof(hints));
+    hints.ai_family = AF_UNSPEC;
+    hints.ai_socktype = SOCK_STREAM;
+    hints.ai_flags = AI_PASSIVE;
+    if (!node || !*node || strcmp(node, "*") == 0)
+        node = NULL;
+
+    gai = getaddrinfo(node, port, &hints, &results);
+    if (gai != 0) {
+        fprintf(stderr, "Invalid bind address/port %s:%s: %s\n",
+                node ? node : "*", port, gai_strerror(gai));
+        return -1;
+    }
+
+    for (struct addrinfo *rp = results; rp; rp = rp->ai_next) {
+        int fd = (int)socket(rp->ai_family, rp->ai_socktype, rp->ai_protocol);
+        int opt = 1;
+        int v6only = 0;
+
+        if (fd < 0)
+            continue;
 #ifdef _WIN32
-        setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, (const char *)&opt, sizeof(opt));
-        setsockopt(fd, IPPROTO_IPV6, IPV6_V6ONLY, (const char *)&v6only, sizeof(v6only));
+        setsockopt(fd, SOL_SOCKET, SO_REUSEADDR,
+                   (const char *)&opt, sizeof(opt));
+        if (rp->ai_family == AF_INET6)
+            setsockopt(fd, IPPROTO_IPV6, IPV6_V6ONLY,
+                       (const char *)&v6only, sizeof(v6only));
 #else
         setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
-        setsockopt(fd, IPPROTO_IPV6, IPV6_V6ONLY, &v6only, sizeof(v6only));
+        if (rp->ai_family == AF_INET6)
+            setsockopt(fd, IPPROTO_IPV6, IPV6_V6ONLY,
+                       &v6only, sizeof(v6only));
 #endif
 
-        memset(&addr6, 0, sizeof(addr6));
-        addr6.sin6_family = AF_INET6;
-        addr6.sin6_addr = in6addr_any;
-        addr6.sin6_port = htons(PORT);
-
-        if (bind(fd, (struct sockaddr *)&addr6, sizeof(addr6)) == 0 &&
-            listen(fd, MAX_CLIENTS) == 0)
+        if (bind(fd, rp->ai_addr, (socklen_t)rp->ai_addrlen) == 0 &&
+            listen(fd, MAX_CLIENTS) == 0) {
+            freeaddrinfo(results);
             return fd;
-
+        }
+        last_error = errno;
         close(fd);
     }
 
-    fd = socket(AF_INET, SOCK_STREAM, 0);
-    if (fd >= 0) {
-        struct sockaddr_in addr;
-#ifdef _WIN32
-        setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, (const char *)&opt, sizeof(opt));
-#else
-        setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
-#endif
-
-        memset(&addr, 0, sizeof(addr));
-        addr.sin_family = AF_INET;
-        addr.sin_addr.s_addr = INADDR_ANY;
-        addr.sin_port = htons(PORT);
-
-        if (bind(fd, (struct sockaddr *)&addr, sizeof(addr)) == 0 &&
-            listen(fd, MAX_CLIENTS) == 0)
-            return fd;
-
-        close(fd);
-    }
-
+    freeaddrinfo(results);
+    if (last_error)
+        errno = last_error;
     return -1;
+}
+
+/**
+ * @brief Format the browser URL shown in the startup banner.
+ *
+ * @param out Destination buffer.
+ * @param out_len Destination length in bytes.
+ */
+static void format_listen_url(char *out, size_t out_len)
+{
+    const char *host = g_bind_address;
+    if (!out || out_len == 0)
+        return;
+    if (!host || !*host || strcmp(host, "*") == 0 ||
+        strcmp(host, "0.0.0.0") == 0 || strcmp(host, "::") == 0)
+        host = "localhost";
+    else if (strcmp(host, "127.0.0.1") == 0 || strcmp(host, "::1") == 0)
+        host = "localhost";
+
+    if (strchr(host, ':') && host[0] != '[')
+        snprintf(out, out_len, "http://[%s]:%d", host, g_http_port);
+    else
+        snprintf(out, out_len, "http://%s:%d", host, g_http_port);
 }
 
 static long long now_msec(void)
@@ -7896,8 +7937,6 @@ static void poll_device_reconnect(void)
     last_poll = now;
     if (open_first_device(0) == PLUTO_ERR_OK) {
         printf("[SDR] Device reconnected: %s %s\n", g_manufacturer, g_product);
-        printf("[SDR]   Pluto: %s  FW: %s  S/N: %s\n",
-               g_hw_rev, g_fw_ver, g_serial);
         if (g_auto_restart_on_reconnect) {
             int ret;
             printf("[SDR] Auto-restarting scan after reconnect\n");
@@ -7960,6 +7999,47 @@ static const char *uri_option_value(const char *arg)
 }
 
 /**
+ * @brief Parse a TCP port string from the command line.
+ *
+ * @param text Decimal port text.
+ * @param out_port Destination port number.
+ * @return Zero on success, `-1` when invalid or outside `1..65535`.
+ */
+static int parse_http_port(const char *text, int *out_port)
+{
+    char *end = NULL;
+    long value;
+
+    if (!text || !*text || !out_port)
+        return -1;
+    errno = 0;
+    value = strtol(text, &end, 10);
+    if (errno != 0 || !end || *end || value < 1 || value > 65535)
+        return -1;
+    *out_port = (int)value;
+    return 0;
+}
+
+/**
+ * @brief Return the value part of `--name=value`.
+ *
+ * @param arg Command-line argument token.
+ * @param name Long option name including the leading `--`.
+ * @return Pointer after `=`, or `NULL` when `arg` is not that assignment.
+ */
+static const char *long_option_value(const char *arg, const char *name)
+{
+    size_t n;
+
+    if (!arg || !name)
+        return NULL;
+    n = strlen(name);
+    if (strncmp(arg, name, n) != 0 || arg[n] != '=')
+        return NULL;
+    return arg + n + 1;
+}
+
+/**
  * @brief Print the browser URL in an ASCII-only terminal banner.
  *
  * Windows consoles do not reliably render UTF-8 box-drawing characters unless
@@ -7982,10 +8062,15 @@ int main(int argc, char **argv)
 {
     char cli_uri[128] = {0};
     char normalized_uri[128];
+    char url[192];
     chdir_to_executable_dir(argv ? argv[0] : NULL);
 
     for (int i = 1; i < argc; i++) {
         const char *uri_value = uri_option_value(argv[i]);
+        const char *port_value = long_option_value(argv[i], "--port");
+        const char *bind_value = long_option_value(argv[i], "--bind");
+        if (!bind_value)
+            bind_value = long_option_value(argv[i], "--listen");
         if (is_uri_option(argv[i])) {
             if (i + 1 >= argc) {
                 fprintf(stderr, "Missing value for --uri\n");
@@ -7998,10 +8083,40 @@ int main(int argc, char **argv)
                 return 2;
             }
             copy_cstr(cli_uri, sizeof(cli_uri), uri_value);
+        } else if (strcmp(argv[i], "--port") == 0) {
+            int port;
+            if (i + 1 >= argc || parse_http_port(argv[i + 1], &port) != 0) {
+                fprintf(stderr, "Invalid or missing value for --port\n");
+                return 2;
+            }
+            g_http_port = port;
+            i++;
+        } else if (port_value) {
+            int port;
+            if (parse_http_port(port_value, &port) != 0) {
+                fprintf(stderr, "Invalid value for --port: %s\n", port_value);
+                return 2;
+            }
+            g_http_port = port;
+        } else if (strcmp(argv[i], "--bind") == 0 ||
+                   strcmp(argv[i], "--listen") == 0) {
+            if (i + 1 >= argc || !argv[i + 1][0]) {
+                fprintf(stderr, "Missing value for %s\n", argv[i]);
+                return 2;
+            }
+            copy_cstr(g_bind_address, sizeof(g_bind_address), argv[++i]);
+        } else if (bind_value) {
+            if (!*bind_value) {
+                fprintf(stderr, "Missing value for --bind\n");
+                return 2;
+            }
+            copy_cstr(g_bind_address, sizeof(g_bind_address), bind_value);
         } else if (strcmp(argv[i], "--help") == 0 || strcmp(argv[i], "-h") == 0) {
-            printf("Usage: %s [--uri ip:192.168.2.1]\n", argv[0]);
+            printf("Usage: %s [--uri ip:192.168.2.1] [--bind 127.0.0.1] [--port 8080]\n", argv[0]);
             printf("       %s [--uri 192.168.2.1]\n", argv[0]);
             printf("       %s [--uri pluto.local]\n", argv[0]);
+            printf("       %s [--listen 0.0.0.0] [--port 8080]\n", argv[0]);
+            printf("       %s --bind 0.0.0.0 --port 8080   # trusted LAN access\n", argv[0]);
             return 0;
         } else {
             fprintf(stderr, "Unknown option: %s\n", argv[i]);
@@ -8054,11 +8169,9 @@ int main(int argc, char **argv)
         return 1;
     }
 
-    {
-        char url[64];
-        snprintf(url, sizeof(url), "http://localhost:%d", PORT);
-        print_startup_banner(url);
-    }
+    format_listen_url(url, sizeof(url));
+    print_startup_banner(url);
+    printf("[SDR] HTTP listening on %s:%d\n", g_bind_address, g_http_port);
 
     printf("[SDR] Waiting for scan start from web UI\n");
 

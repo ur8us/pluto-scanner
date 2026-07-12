@@ -2,7 +2,10 @@
 
 Browser-based spectrum and waterfall scanner for ADALM-Pluto using `libiio`.
 
-The app keeps the original scanner UI model: a small C HTTP server on `localhost:8080`, a single-page `index.html` frontend, and live spectrum/waterfall rows streamed over Server-Sent Events. Hardware scan behavior is implemented as a host-side Pluto hop loop:
+The app keeps the original scanner UI model: a small C HTTP server on
+`localhost:8080` by default, a single-page `index.html` frontend, and live
+spectrum/waterfall rows streamed over Server-Sent Events. Hardware scan
+behavior is implemented as a host-side Pluto hop loop:
 
 ```text
 set RX LO -> discard stale buffers -> refill useful buffer -> FFT -> publish row
@@ -20,6 +23,14 @@ Demodulators and decoders are also out of scope for now. This includes SSB, FM,
 AM, and digital-mode decoding. The program is intended as a spectrum/waterfall
 scanner and high-zoom inspection tool, not as a general audio or data receiver.
 
+The scanner can still be used to detect and study many signal types by their
+spectrum and waterfall behavior: broadcast radio carriers, amateur and satellite
+signals, Wi-Fi and other ISM-band activity, telemetry bursts, local oscillators,
+spurious emissions, harmonics, and intermittent RF noise. It is also useful for
+searching for sources of RF interference by watching where signals appear,
+drift, repeat, or disappear while antennas, cables, devices, or locations are
+changed.
+
 ## Releases
 
 Release builds are published on GitHub:
@@ -30,6 +41,10 @@ Pushing a tag named `v*` starts the GitHub Actions release workflow. The workflo
 builds static release binaries with static `libiio` and `libxml2` linked in,
 packages the runtime assets next to the executable, and uploads the files to the
 GitHub release.
+
+Nightly builds are published as a prerelease named `nightly` and are refreshed
+by the scheduled GitHub Actions workflow. Use them for testing recent changes;
+use tagged releases when you need stable, reproducible files.
 
 Expected release assets:
 
@@ -236,6 +251,19 @@ You can also pass a URI or bare host/IP explicitly:
 ./pluto-scanner --uri pluto.local
 PLUTO_URI=pluto.local ./pluto-scanner
 ```
+
+The web server binds to local loopback by default. Override the incoming HTTP
+port with `--port`, and bind to another address only on a trusted network:
+
+```sh
+./pluto-scanner --port 8081
+./pluto-scanner --bind 0.0.0.0 --port 8080
+./pluto-scanner --bind :: --port 8080
+```
+
+When using a custom port, open that port in the browser. When binding to
+`0.0.0.0` or `::` for LAN access, open `http://<scanner-computer-ip>:<port>`
+from the other machine.
 
 Open:
 

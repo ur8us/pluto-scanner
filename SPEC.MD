@@ -60,9 +60,11 @@ no bundled dependencies. No external HTTP, UI, or JS framework is used.
 
 ### 3.1 Responsibilities
 
-- **HTTP server** on `PORT` (8080). A bare `socket()/bind()/listen()/select()`
-  loop (no library), IPv6 dual-stack (falls back to IPv4). Bounded request
-  buffer `MAX_REQUEST = 65536` bytes, 5 s receive timeout per client.
+- **HTTP server** on `DEFAULT_BIND_ADDRESS:DEFAULT_HTTP_PORT`
+  (`127.0.0.1:8080`). A bare `socket()/bind()/listen()/select()` loop (no
+  library), using `getaddrinfo()` so `--bind` may select IPv4, IPv6,
+  localhost, or all trusted LAN interfaces. Bounded request buffer
+  `MAX_REQUEST = 65536` bytes, 5 s receive timeout per client.
 - **Pluto SDR control** through `libiio`:
   - Opens an IIO context, locates `ad9361-phy` and `cf-ad9361-lpc`.
   - Writes RX LO (`altvoltage0` frequency), `sampling_frequency`,
@@ -99,7 +101,8 @@ the waterfall.
 
 | Constant | Value | Purpose |
 |---|---|---|
-| `PORT` | 8080 | HTTP port |
+| `DEFAULT_HTTP_PORT` | 8080 | Default HTTP port; override with `--port` |
+| `DEFAULT_BIND_ADDRESS` | `127.0.0.1` | Default local-only bind address; override with `--bind` |
 | `MAX_CLIENTS` | 64 | Concurrent HTTP clients |
 | `MAX_SSE_CLIENTS` | 16 | Concurrent waterfall subscribers |
 | `MAX_REQUEST` | 65536 | Max request size (bytes) |
@@ -128,6 +131,28 @@ the waterfall.
 | `PLUTO_GAIN_MIN/MAX_DB` | −3 / 71 | Gain limits |
 | `DB_FLOOR` / `DB_CEIL` | −100 / −20 | Display dB window |
 | `FRONTEND_IDLE_STOP_MS` | 20000 | Stop scan after 20 s idle frontend |
+
+### 3.3.1 Command line
+
+The backend is reachable only from the local machine by default:
+
+```sh
+./pluto-scanner
+```
+
+This binds `127.0.0.1:8080` and opens Pluto through the saved/default
+`libiio` URI. Runtime overrides are:
+
+| Option | Meaning |
+|---|---|
+| `--uri <uri-or-host>` / `--uri=<uri-or-host>` | Override the Pluto IIO URI. Bare hosts such as `192.168.2.1` are normalized to `ip:192.168.2.1`. |
+| `--port <1..65535>` / `--port=<1..65535>` | Override the incoming HTTP port. |
+| `--bind <address>` / `--bind=<address>` | Override the HTTP bind address. Use `127.0.0.1` for local-only, `0.0.0.0` or `::` for trusted LAN access. |
+| `--listen <address>` / `--listen=<address>` | Alias for `--bind`. |
+
+The program does not implement authentication, TLS, per-user sessions, or
+multi-user arbitration. Binding to a non-loopback address should therefore be
+treated as trusted-network-only operation.
 
 ### 3.4 Operational modes
 

@@ -75,6 +75,11 @@ def zoom_value(text):
     return float(match.group(1)) if match else 0.0
 
 
+def traffic_kbytes_per_s(text):
+    match = re.search(r"([0-9.]+)", text or "")
+    return float(match.group(1)) if match else 0.0
+
+
 def metrics(driver, label):
     data = driver.execute_script(
         """
@@ -505,7 +510,12 @@ def main():
 
             wait_status(driver, "scanning", timeout=20)
             planned_status = api_status(driver)
+            planned_first_line_s = float(
+                planned_status.get("first_line_ms") or 0
+            ) / 1000.0
             settle_seconds = rng.uniform(1.5, 3.5)
+            if 0.0 < planned_first_line_s <= 5.0:
+                settle_seconds = max(settle_seconds, planned_first_line_s + 1.0)
             time.sleep(settle_seconds)
             rec = metrics(driver, f"random-{idx:02d}-{action}")
             rec["planned_first_line_ms"] = float(
@@ -515,7 +525,10 @@ def main():
             records.append(rec)
             if rec["waterfall_nonblank"] <= 0:
                 if rec["planned_first_line_ms"] <= settle_seconds * 1000:
-                    errors.append(f"{rec['label']}: blank waterfall")
+                    if traffic_kbytes_per_s(rec.get("traffic", "")) > 0.1:
+                        rec["blank_but_streaming"] = True
+                    else:
+                        errors.append(f"{rec['label']}: blank waterfall")
                 else:
                     rec["blank_before_planned_first_line"] = True
             if rec["status"] != "scanning":

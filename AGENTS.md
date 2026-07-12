@@ -4,7 +4,7 @@
 
 `pluto-scanner` is a C backend plus a single-page HTML frontend for ADALM-Pluto.
 
-- `main.c` serves HTTP on port `8080`, exposes JSON API endpoints, controls Pluto through `libiio`, computes FFT rows, and streams waterfall data over SSE.
+- `main.c` serves HTTP on `127.0.0.1:8080` by default, exposes JSON API endpoints, controls Pluto through `libiio`, computes FFT rows, and streams waterfall data over SSE. `--port` overrides the incoming HTTP port; `--bind`/`--listen` may expose the UI on another address for trusted LAN use only.
 - `index.html` owns the spectrum/waterfall canvases, Pluto controls, zoom/pan, Go To, rulers, bands, and markers.
 - `pluto-scanner.conf` is local runtime state and should stay untracked.
 - `images/` contains README screenshots captured from the live browser UI.
@@ -47,6 +47,10 @@ The app now supports the unofficial extended Pluto receiver range of `70 MHz..6 
 The scanner must not require Pluto reflashing. It is expected to work with the
 original Analog Devices stock firmware and DATV firmware variants that expose
 the normal libiio devices and AD936x attributes.
+
+The HTTP backend is local-only by default. Do not add implicit remote exposure,
+authentication placeholders, multi-user controls, or per-user session behavior
+unless the project scope changes explicitly.
 
 ## Required Operating Modes
 
@@ -247,7 +251,7 @@ Preserve:
 - Markers and band overlays.
 - Browser heartbeat showing disconnected/idle/scanning.
 
-The Pluto UI exposes sample rate, RF bandwidth, passband usage, gain mode, and hardware gain. Preserve the visible `Shown: start - end (range) MHz` status-line text. Do not re-add the old separate Range badge, the `FW:` indicator, RSSI/Peak readout, or passive `Pluto Input` group.
+The Pluto UI exposes sample rate, RF bandwidth, passband usage, gain mode, and hardware gain. Preserve the visible `Shown: start - end (range) MHz` status-line text. Do not re-add the old separate Range badge, the `FW:` indicator, RSSI/Peak readout, frontend Device/serial indicator, or passive `Pluto Input` group. Backend logs should print Pluto software version and serial once the hardware opens.
 
 ## Documentation Standard
 
