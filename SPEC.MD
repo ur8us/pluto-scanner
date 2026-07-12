@@ -124,6 +124,8 @@ the waterfall.
 | `SINGLE_DECIM_ASYNC_MIN_LEN` | 8192 | Smallest raw line advance targeted for CIC refills |
 | `SINGLE_DECIM_ASYNC_MAX_LEN` | 262144 | Largest CIC async refill before capping queue memory |
 | `SINGLE_ZERO_IF_GUARD_HZ` | 50000 | Zero-IF clearance |
+| `PLUTO_RFPLL_REFERENCE_HZ` | 40 MHz | Reference used by coordinate correction model |
+| `PLUTO_RFPLL_FRACTIONAL_MODULUS` | 8388593 | AD936x fractional-N model modulus |
 | `PLUTO_EST_SINGLE_STREAM_SPS` | 2.1e6 | Empirical host throughput (raw) |
 | `PLUTO_EST_CIC_STREAM_SPS` | 1.85e6 | CIC-path throughput |
 | `PLUTO_RATE_LIMIT_GUARD` | 0.85 | Max-rate throttle guard |
@@ -218,6 +220,23 @@ configured band that is not wholly inside one valid converted receiver interval
 with HTTP `400`, and it must do so before mutating `g_freq_start`/`g_freq_end`.
 It must not silently move the user's configured air band to a nearby valid
 receiver interval.
+
+### 3.4.2 RFPLL coordinate correction
+
+`fq_err_correction = 1` is a local configuration flag enabled by default. In
+single-frequency mode, the backend models fractional-N RX RFPLL rounding from
+a 40 MHz reference and the power-of-two divider that places the RF VCO in the
+6–12 GHz range. It converts the signed receiver-LO rounding error through the
+active converter branch and shifts the *source-bin coordinate* by that amount.
+The user-visible air range and IIO `altvoltage0/frequency` request do not
+change. This keeps FFT bins, scale labels, markers, and rulers on the same
+coordinate model without claiming to correct an external reference-clock or
+converter error.
+
+`GET /api/status` exposes `fq_err_correction`, `fq_err_model_hz`, and
+`fq_err_effective_hz`; SSE row metadata exposes `fq_err_correction_hz` for the
+active row. The model is a diagnostic estimate; validate hardware alignment
+against a known reference before treating a remaining offset as software error.
 
 ### 3.5 Acquisition loop details
 

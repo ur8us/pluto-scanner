@@ -86,7 +86,7 @@ I want this project to explore new principles for SDR tools:
 2. A web interface that minimizes traffic.
 3. A spectrum view with very large zoom: from gigahertz-wide full-screen spans down to hertz-per-pixel detail, one million times zoom.
 4. Seamless merging of scan/hop mode and single-frequency reception, hidden from the user.
-5. Waterfall speed limits expressed as a range from and to lines per second instead of tying behavior directly to FFT size.
+5. Waterfall speed limits expressed as a range from and to lines per second instead of tying behavior directly to FFT size. The program should do its best to satisfy the user's desired behavior.
 6. Persistent waterfall history: when zooming or moving through frequencies, the waterfall is not cleared. It shows all recorded data that still applies, even when stretched. This is a known SDR UI principle, but it still needs better implementation so history remains useful across large zoom and frequency changes.
 7. Low-latency resolution changes: very fine frequency resolution needs FFTs built from many seconds of samples. Traditional SDR programs can make the user wait several seconds after switching resolution before the first new waterfall line appears. This scanner reuses compatible samples already held in memory for the first preview lines, so the display responds quickly while live acquisition catches up.
 
@@ -306,7 +306,7 @@ http://localhost:8080
 - Waterfall row samples are transported over SSE as packed `uint8` base64
   (`encoding:"u8b64"`) instead of JSON number arrays. This keeps the simple
   EventSource stream but removes most of the avoidable per-bin text overhead.
-- The frontend sends `display_bins` with view/start requests so backend rows match the current canvas width.
+- The frontend sends `display_bins` with deliberate view/start requests so backend rows match the selected canvas width. Browser page zoom and responsive layout resample already received rows locally; they do not restart the Pluto stream.
 - Passband usage still defines hop spacing internally as `rf_bandwidth * ratio`.
 - Gain mode and hardware gain map to AD936x `gain_control_mode` and `hardwaregain`.
 - FFT/CIC status shows the active backend plan used for the current zoom.
@@ -332,6 +332,16 @@ http://localhost:8080
   the new decimated stream has not filled that window yet. The browser releases
   cached rows at the planned line cadence while live capture fills, avoiding an
   immediate preview burst followed by a blank pause.
+- The `Shown` status reports the visible interval in MHz and selects MHz, kHz,
+  or Hz for `Span`; this is presentation-only and never feeds back into tuning
+  or coordinate calculations. The light-blue `<gap>` label on the frequency
+  scale is the spacing between its central adjacent ticks, not a receiver gap.
+- `fq_err_correction = 1` is the default local configuration. It applies a
+  conservative 40 MHz-reference Pluto RFPLL rounding model to the source-bin
+  coordinate in single-frequency mode, keeping scale and FFT coordinates
+  aligned without changing the requested IIO LO. `/api/status` exposes the
+  modeled and effective values for diagnosis; a known external reference or
+  converter error still requires real measurement.
 - Coherent FFT magnitude remains Hann/CIC calibrated. The packed waterfall
   applies a separate Hann-ENBW noise-density and peak-reducer presentation
   factor, so the background does not become artificially dark at fine zoom.
@@ -352,6 +362,7 @@ tools/cic_continuity_check.py
 tools/cic_synthetic_signal_check.py
 tools/min_rate_overlap_check.py
 tools/cached_preview_check.py
+tools/frequency_coordinate_check.py
 tools/fft_level_normalization_check.py
 ```
 

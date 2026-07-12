@@ -15,7 +15,7 @@ import time
 import urllib.request
 
 
-BASE = "http://127.0.0.1:8080"
+BASE = ""
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 
@@ -143,11 +143,12 @@ class SSEReader:
         self.thread.join(timeout=1)
 
 
-def port_is_free():
-    """Return whether the scanner's fixed HTTP port is currently unused."""
+def allocate_loopback_port():
+    """Reserve a currently free loopback port for one private test process."""
     sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     try:
-        return sock.connect_ex(("127.0.0.1", 8080)) != 0
+        sock.bind(("127.0.0.1", 0))
+        return sock.getsockname()[1]
     finally:
         sock.close()
 
@@ -193,12 +194,13 @@ def int_field(payload, name):
 
 def run_check():
     """Run the cache preview validation against a private synthetic backend."""
+    global BASE
     if not os.path.isfile(TEST_BINARY):
         raise RuntimeError(
             f"missing {TEST_BINARY}; run make cic-synthetic-test or make check"
         )
-    if not port_is_free():
-        raise RuntimeError("TCP port 8080 is already in use")
+    port = allocate_loopback_port()
+    BASE = f"http://127.0.0.1:{port}"
 
     center = 435_000_000.0
     span_hz = 4096.0e6 / 3_000_000.0
@@ -208,7 +210,7 @@ def run_check():
         binary = os.path.join(temp_dir, os.path.basename(TEST_BINARY))
         shutil.copy2(TEST_BINARY, binary)
         process = subprocess.Popen(
-            [binary],
+            [binary, "--port", str(port)],
             cwd=temp_dir,
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,

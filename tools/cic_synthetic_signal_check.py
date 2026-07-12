@@ -15,7 +15,7 @@ import time
 import urllib.request
 
 
-BASE = "http://127.0.0.1:8080"
+BASE = ""
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 
@@ -117,11 +117,12 @@ def read_sse_rows(
     return rows
 
 
-def port_is_free():
-    """Return whether the scanner's fixed HTTP port is currently unused."""
+def allocate_loopback_port():
+    """Reserve a currently free loopback port for one private test process."""
     sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     try:
-        return sock.connect_ex(("127.0.0.1", 8080)) != 0
+        sock.bind(("127.0.0.1", 0))
+        return sock.getsockname()[1]
     finally:
         sock.close()
 
@@ -166,8 +167,9 @@ def run_case(
     rows=3,
 ):
     """Run one clean or deliberately corrupted synthetic CIC case."""
-    if not port_is_free():
-        raise RuntimeError("TCP port 8080 is already in use")
+    global BASE
+    port = allocate_loopback_port()
+    BASE = f"http://127.0.0.1:{port}"
 
     with tempfile.TemporaryDirectory(prefix="pluto-cic-tone-") as temp_dir:
         binary = os.path.join(temp_dir, os.path.basename(TEST_BINARY))
@@ -177,7 +179,7 @@ def run_case(
             env["PLUTO_SYNTHETIC_FAULT"] = fault
             env["PLUTO_SYNTHETIC_FAULT_PERIOD"] = str(period)
         process = subprocess.Popen(
-            [binary],
+            [binary, "--port", str(port)],
             cwd=temp_dir,
             env=env,
             stdout=subprocess.PIPE,

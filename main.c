@@ -118,6 +118,10 @@ static int win32_nanosleep(const struct timespec *req, struct timespec *rem)
 #define CACHED_PREVIEW_MAX_LINES 128U
 #define CACHED_PREVIEW_MAX_AGE_MS 5000LL
 #define SINGLE_ZERO_IF_GUARD_HZ 50000.0
+#define PLUTO_RFPLL_REFERENCE_HZ 40000000.0
+#define PLUTO_RFPLL_FRACTIONAL_MODULUS 8388593.0
+#define PLUTO_RFPLL_VCO_MIN_HZ 6000000000.0
+#define PLUTO_RFPLL_VCO_MAX_HZ 12000000000.0
 #define CIC_STAGES          3
 /* The minimum scan FFT has a Hann ENBW close to 90 kHz at 61.44 MSPS.
  * Waterfall presentation uses this as the common white-noise reference. */
@@ -269,6 +273,8 @@ static double g_bw_ratio     = DEFAULT_BW_RATIO;
 static int g_display_bins    = 1024;
 static uint32_t g_min_rate_lps = 10;
 static uint32_t g_rate_limit_lps = 20;
+/* Enable the conservative 40 MHz-reference RFPLL rounding model below. */
+static uint32_t g_fq_err_correction = 1;
 static uint32_t g_view_id    = 1;
 static int g_http_port = DEFAULT_HTTP_PORT;
 static char g_bind_address[128] = DEFAULT_BIND_ADDRESS;
@@ -798,6 +804,7 @@ static void save_config(void)
     fprintf(f, "fft_size = %d\n", g_fft_size);
     fprintf(f, "min_rate_lps = %u\n", g_min_rate_lps);
     fprintf(f, "rate_limit_lps = %u\n", g_rate_limit_lps);
+    fprintf(f, "fq_err_correction = %u\n", g_fq_err_correction);
     fprintf(f, "goto_freq = %.0f\n", g_goto_freq);
     fprintf(f, "goto_target_zoom = %.6g\n", g_goto_target_zoom);
     fprintf(f, "goto_animate = %u\n", g_goto_animate);
@@ -853,6 +860,10 @@ static void load_config(void)
         else if (strcmp(key, "fft_size") == 0) { update_fft_size((int)val); }
         else if (strcmp(key, "min_rate_lps") == 0) { uval = (unsigned int)val; g_min_rate_lps = normalize_min_rate_lps(uval); }
         else if (strcmp(key, "rate_limit_lps") == 0) { uval = (unsigned int)val; g_rate_limit_lps = normalize_rate_limit_lps(uval); }
+        else if (strcmp(key, "fq_err_correction") == 0) {
+            if (isfinite(val))
+                g_fq_err_correction = val != 0.0 ? 1U : 0U;
+        }
         else if (strcmp(key, "goto_freq") == 0)      { if (val > 0.0) g_goto_freq = val; }
         else if (strcmp(key, "goto_target_zoom") == 0) { g_goto_target_zoom = normalize_goto_target_zoom(val); }
         else if (strcmp(key, "goto_animate") == 0)   { uval = (unsigned int)val; g_goto_animate = uval ? 1 : 0; }
@@ -2464,6 +2475,8 @@ typedef struct {
     double bw_ratio;
     double step_width;
     double last_width;
+    /* Modeled actual-minus-requested source-center offset, in hertz. */
+    double frequency_correction_hz;
     double center_freq;
     double second_if_hz;
     double zero_if_guard_hz;
@@ -2636,6 +2649,7 @@ static float *recent_sample_cache_snapshot(const scan_ctx_t *ctx,
     double coverage_guard_hz;
     double phase = 0.0;
     double phase_inc;
+    const char *reject_reason = NULL;
 
     if (out_age_ms)
         *out_age_ms = 0;
@@ -2648,16 +2662,23 @@ static float *recent_sample_cache_snapshot(const scan_ctx_t *ctx,
     coverage_guard_hz = fmax(
         (ctx->visible_end - ctx->visible_start) * 0.05,
         ctx->raw_samplerate / (double)(ctx->fft_size > 0 ? ctx->fft_size : 1) * 2.0);
-    if (!g_recent_samples.valid || !g_recent_samples.samples ||
-        g_recent_samples.count < (size_t)needed_samples ||
-        g_recent_samples.updated_msec <= 0 || age_ms < 0 ||
-        age_ms > CACHED_PREVIEW_MAX_AGE_MS ||
-        fabs(g_recent_samples.samplerate_hz - ctx->raw_samplerate) > 1.0 ||
-        fabs(g_recent_samples.rf_bandwidth_hz - rf_bandwidth_hz) > 1.0 ||
-        ctx->visible_start - coverage_guard_hz <
-            g_recent_samples.source_start_hz - 1.0 ||
-        ctx->visible_end + coverage_guard_hz >
-            g_recent_samples.source_end_hz + 1.0) {
+    if (!g_recent_samples.valid || !g_recent_samples.samples)
+        reject_reason = "no contiguous raw cache";
+    else if (g_recent_samples.count < (size_t)needed_samples)
+        reject_reason = "insufficient raw samples";
+    else if (g_recent_samples.updated_msec <= 0 || age_ms < 0 ||
+             age_ms > CACHED_PREVIEW_MAX_AGE_MS)
+        reject_reason = "raw cache is stale";
+    else if (fabs(g_recent_samples.samplerate_hz - ctx->raw_samplerate) > 1.0)
+        reject_reason = "raw sample rate changed";
+    else if (fabs(g_recent_samples.rf_bandwidth_hz - rf_bandwidth_hz) > 1.0)
+        reject_reason = "RF bandwidth changed";
+    else if (ctx->visible_start - coverage_guard_hz <
+             g_recent_samples.source_start_hz - 1.0 ||
+             ctx->visible_end + coverage_guard_hz >
+             g_recent_samples.source_end_hz + 1.0)
+        reject_reason = "target view exceeds raw RF coverage";
+    if (reject_reason) {
         pthread_mutex_unlock(&g_recent_samples_mutex);
         return NULL;
     }
@@ -2692,6 +2713,9 @@ static float *recent_sample_cache_snapshot(const scan_ctx_t *ctx,
     }
     if (out_age_ms)
         *out_age_ms = age_ms;
+    fprintf(stderr,
+            "[SDR] Cached preview accepted: %u raw samples, age %lld ms, shift %.6f Hz\n",
+            needed_samples, age_ms, shift_hz);
     return snapshot;
 }
 
@@ -2838,6 +2862,95 @@ static double receiver_frequency_from_radio(double air_freq)
 static int receiver_frequency_valid(double rx_freq)
 {
     return rx_freq >= RF_RECEIVER_MIN_HZ && rx_freq <= RF_RECEIVER_MAX_HZ;
+}
+
+/**
+ * @brief Model the quantization error of Pluto's fractional-N RX RFPLL.
+ *
+ * The supported IIO frequency attribute accepts an integer-Hz RX LO request.
+ * Stock Pluto hardware normally derives the RX LO from a 40 MHz reference,
+ * selects a power-of-two VCO divider for the 6..12 GHz RFPLL range, and rounds
+ * the fractional numerator to the AD936x `8,388,593` modulus. The driver owns
+ * the actual divider and calibration; this is intentionally a display/bin
+ * coordinate model, never a replacement for IIO LO control.
+ *
+ * @param requested_rx_hz Requested Pluto receive LO in hertz.
+ * @return Modeled actual-minus-requested receive-LO error in hertz, or zero
+ *         when the requested LO cannot be represented by this model.
+ */
+static double pluto_rfpll_modeled_error_hz(double requested_rx_hz)
+{
+    double divider = 1.0;
+    double vco_hz;
+    double ratio;
+    double integer_part;
+    double fractional_part;
+    double actual_vco_hz;
+
+    if (!isfinite(requested_rx_hz) || requested_rx_hz <= 0.0)
+        return 0.0;
+    while (requested_rx_hz * divider < PLUTO_RFPLL_VCO_MIN_HZ &&
+           divider < 64.0)
+        divider *= 2.0;
+    vco_hz = requested_rx_hz * divider;
+    if (vco_hz < PLUTO_RFPLL_VCO_MIN_HZ ||
+        vco_hz > PLUTO_RFPLL_VCO_MAX_HZ)
+        return 0.0;
+
+    ratio = vco_hz / PLUTO_RFPLL_REFERENCE_HZ;
+    integer_part = floor(ratio);
+    fractional_part = round((ratio - integer_part) *
+                            PLUTO_RFPLL_FRACTIONAL_MODULUS);
+    if (fractional_part >= PLUTO_RFPLL_FRACTIONAL_MODULUS) {
+        integer_part += 1.0;
+        fractional_part = 0.0;
+    }
+    actual_vco_hz = PLUTO_RFPLL_REFERENCE_HZ *
+        (integer_part + fractional_part / PLUTO_RFPLL_FRACTIONAL_MODULUS);
+    return actual_vco_hz / divider - requested_rx_hz;
+}
+
+/**
+ * @brief Convert a receive-LO error into the corresponding air-frequency sign.
+ *
+ * A positive converter preserves the air-to-receiver slope. A negative
+ * converter may invert it on the lower side of its absolute-value mapping.
+ *
+ * @param air_hz Air/source frequency at the planned receiver center in hertz.
+ * @param receiver_error_hz Actual-minus-requested RX LO error in hertz.
+ * @return Actual-minus-requested air-frequency source-center error in hertz.
+ */
+static double air_error_from_receiver_error(double air_hz,
+                                            double receiver_error_hz)
+{
+    if (!isfinite(air_hz) || !isfinite(receiver_error_hz))
+        return 0.0;
+    if (g_converter_freq >= 0.0)
+        return receiver_error_hz;
+    return air_hz >= -g_converter_freq ? receiver_error_hz : -receiver_error_hz;
+}
+
+/**
+ * @brief Return the configured display/bin correction for one air-frequency LO.
+ *
+ * The correction moves the assumed source interval onto the modeled RFPLL LO.
+ * It does not change the IIO write request, configured air range, converter
+ * math, or RFPLL/DDS hardware state. Keeping the source interval corrected is
+ * preferable to visibly shifting only scale text because FFT bins, markers,
+ * rulers, and tick labels then share the same coordinate model.
+ *
+ * @param air_hz Requested air/source center frequency in hertz.
+ * @return Signed source-center correction in hertz; zero when disabled.
+ */
+static double configured_frequency_correction_hz(double air_hz)
+{
+    double receiver_hz;
+
+    if (!g_fq_err_correction)
+        return 0.0;
+    receiver_hz = receiver_frequency_from_radio(air_hz);
+    return air_error_from_receiver_error(
+        air_hz, pluto_rfpll_modeled_error_hz(receiver_hz));
 }
 
 static int append_air_interval(freq_interval_t *intervals, int count,
@@ -3130,7 +3243,55 @@ static double current_second_if_hz(void)
     center = direct_sampling_enabled() ?
         direct_source_center_for_visible(start, end, plan.source_span) :
         single_source_center_for_visible(start, end, plan.source_span);
+    center += configured_frequency_correction_hz(center);
     return second_if_for_center(start, end, center);
+}
+
+/**
+ * @brief Return the current modeled source-center correction for diagnostics.
+ *
+ * @return Effective signed correction in hertz, or zero outside single mode.
+ */
+static double current_frequency_correction_hz(void)
+{
+    double start;
+    double end;
+    single_fft_plan_t plan;
+    double center;
+
+    if (planned_run_mode() != RUN_MODE_SINGLE || direct_sampling_enabled())
+        return 0.0;
+    raw_visible_band(&start, &end);
+    if (end <= start)
+        return 0.0;
+    plan = single_fft_plan_for_span(end - start);
+    center = single_source_center_for_visible(start, end, plan.source_span);
+    return configured_frequency_correction_hz(center);
+}
+
+/**
+ * @brief Return the RFPLL air-coordinate model even when correction is disabled.
+ *
+ * @return Signed modeled actual-minus-requested source-center error in hertz.
+ */
+static double current_frequency_model_error_hz(void)
+{
+    double start;
+    double end;
+    single_fft_plan_t plan;
+    double center;
+    double receiver_hz;
+
+    if (planned_run_mode() != RUN_MODE_SINGLE || direct_sampling_enabled())
+        return 0.0;
+    raw_visible_band(&start, &end);
+    if (end <= start)
+        return 0.0;
+    plan = single_fft_plan_for_span(end - start);
+    center = single_source_center_for_visible(start, end, plan.source_span);
+    receiver_hz = receiver_frequency_from_radio(center);
+    return air_error_from_receiver_error(
+        center, pluto_rfpll_modeled_error_hz(receiver_hz));
 }
 
 static int required_points_for_band(double start, double end)
@@ -4827,6 +4988,7 @@ static void publish_scan_line(scan_ctx_t *ctx)
         "\"full_f0\":%.0f,\"full_f1\":%.0f,"
         "\"visible_start_hz\":%.0f,\"visible_end_hz\":%.0f,"
         "\"second_if_hz\":%.0f,\"zero_if_guard_hz\":%.0f,"
+        "\"fq_err_correction_hz\":%.9f,"
         "\"display_bins\":%d,\"source_bins\":%d,\"published_bins\":%d,"
         "\"raw_source_bins\":%d,"
         "\"effective_fft_size\":%d,"
@@ -4876,6 +5038,7 @@ static void publish_scan_line(scan_ctx_t *ctx)
         ctx->configured_start, ctx->configured_end,
         ctx->visible_start, ctx->visible_end,
         ctx->second_if_hz, ctx->zero_if_guard_hz,
+        ctx->frequency_correction_hz,
         display_bins, display_bins, display_bins, source_bins, ctx->fft_size,
         ctx->decim_factor, ctx->decim_hop, ctx->overlap_factor,
         ctx->minimum_rate_limited, ctx->minimum_rate_limited,
@@ -4905,6 +5068,7 @@ static void publish_scan_line(scan_ctx_t *ctx)
         ctx->configured_start, ctx->configured_end,
         ctx->visible_start, ctx->visible_end,
         ctx->second_if_hz, ctx->zero_if_guard_hz,
+        ctx->frequency_correction_hz,
         display_bins, display_bins, display_bins, source_bins, ctx->fft_size,
         ctx->decim_factor, ctx->decim_hop, ctx->overlap_factor,
         ctx->minimum_rate_limited, ctx->minimum_rate_limited,
@@ -5691,6 +5855,7 @@ static void *scan_thread_func(void *arg)
     float *preview_samples = NULL;
     long long preview_age_ms = 0;
     double preview_first_line_ms = 0.0;
+    double frequency_correction_hz = 0.0;
 
     mode = planned_run_mode();
     g_active_mode = mode;
@@ -5713,10 +5878,14 @@ static void *scan_thread_func(void *arg)
                                              single_plan.source_span) :
             single_source_center_for_visible(visible_start, visible_end,
                                              single_plan.source_span);
+        frequency_correction_hz = direct_sampling_enabled() ? 0.0 :
+            configured_frequency_correction_hz(center);
         total_steps = 1;
         step = single_plan.source_span;
-        scan_start = center - single_plan.source_span * 0.5;
-        scan_end = center + single_plan.source_span * 0.5;
+        scan_start = center + frequency_correction_hz -
+            single_plan.source_span * 0.5;
+        scan_end = center + frequency_correction_hz +
+            single_plan.source_span * 0.5;
         device_center = direct_sampling_enabled() ? 0.0 : receiver_frequency_from_radio(center);
         if (!direct_sampling_enabled() && !receiver_frequency_valid(device_center)) {
             fprintf(stderr, "[SDR] Converter frequency puts receiver center outside %.0f - %.0f Hz\n",
@@ -5759,6 +5928,7 @@ static void *scan_thread_func(void *arg)
     ctx.scan_end = ctx.single_mode ? scan_end :
         build_scan_effective_end_for_band(scan_start, scan_end, total_steps, step);
     ctx.center_freq = (scan_start + scan_end) * 0.5;
+    ctx.frequency_correction_hz = frequency_correction_hz;
     ctx.zero_if_guard_hz = ctx.single_mode ? single_plan.zero_if_guard_hz : 0.0;
     ctx.second_if_hz = ctx.single_mode ?
         second_if_for_center(ctx.visible_start, ctx.visible_end, ctx.center_freq) : 0.0;
@@ -5836,6 +6006,11 @@ static void *scan_thread_func(void *arg)
                 preview_line_count = lines;
                 break;
             }
+        }
+        if (!preview_samples && ctx.decim_factor > 1) {
+            fprintf(stderr,
+                    "[SDR] Cached preview unavailable for view %u; live CIC fill will be used\n",
+                    ctx.view_id);
         }
         recent_sample_cache_begin(
             ctx.center_freq,
@@ -7009,6 +7184,7 @@ static void handle_request(int client_fd, const char *req, size_t req_len,
                                                  plan.source_span) :
                 single_source_center_for_visible(scan_start, scan_end,
                                                  plan.source_span);
+            center += current_frequency_correction_hz();
             step = plan.source_span;
             scan_start = center - plan.source_span * 0.5;
             scan_end = center + plan.source_span * 0.5;
@@ -7047,6 +7223,8 @@ static void handle_request(int client_fd, const char *req, size_t req_len,
         double active_bw_ratio = current_active_bw_ratio();
         double second_if_hz = current_second_if_hz();
         double zero_if_guard_hz = current_zero_if_guard_hz();
+        double fq_err_model_hz = current_frequency_model_error_hz();
+        double fq_err_effective_hz = current_frequency_correction_hz();
         format_sample_rates_json(sample_rates, sizeof(sample_rates));
 
         int n = snprintf(body, sizeof(body),
@@ -7063,6 +7241,8 @@ static void handle_request(int client_fd, const char *req, size_t req_len,
             "\"visible_start_hz\":%.0f,\"visible_end_hz\":%.0f,"
             "\"scan_start_hz\":%.0f,\"scan_end_hz\":%.0f,"
             "\"second_if_hz\":%.0f,\"zero_if_guard_hz\":%.0f,"
+            "\"fq_err_correction\":%u,\"fq_err_model_hz\":%.9f,"
+            "\"fq_err_effective_hz\":%.9f,"
             "\"samplerate\":%.0f,\"rf_bandwidth\":%.0f,\"bw_ratio\":%.2f,"
             "\"hardware_samplerate\":%.0f,\"hardware_rf_bandwidth\":%.0f,"
             "\"hardware_bw_ratio\":%.2f,"
@@ -7102,6 +7282,7 @@ static void handle_request(int client_fd, const char *req, size_t req_len,
             scan_start,
             scan_end,
             second_if_hz, zero_if_guard_hz,
+            g_fq_err_correction, fq_err_model_hz, fq_err_effective_hz,
             active_samplerate, active_rf_bandwidth, active_bw_ratio,
             active_samplerate, active_rf_bandwidth, active_bw_ratio,
             active_samplerate, active_rf_bandwidth, active_bw_ratio,

@@ -170,6 +170,7 @@ check: all $(TEST_TARGET)
 	tools/cic_stability_check.py --quiet
 	tools/cic_continuity_check.py --quiet
 	PLUTO_CIC_TEST_BINARY="$(TEST_TARGET)" tools/cic_synthetic_signal_check.py --quiet
+	PLUTO_CIC_TEST_BINARY="$(TEST_TARGET)" tools/frequency_coordinate_check.py >/dev/null
 	@echo "Build checks passed."
 
 cic-synthetic-test: $(TEST_TARGET)

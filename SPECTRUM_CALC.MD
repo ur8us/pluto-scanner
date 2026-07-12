@@ -72,6 +72,43 @@ Sources consulted:
 - libad9361 automatic filter notes:
   https://github.com/analogdevicesinc/libad9361-iio/blob/main/ad9361.h
 
+## Frequency Coordinate Correction
+
+The frequency scale, markers, rulers, and the backend reducer use binary64
+hertz coordinates. Formatting a value in MHz/kHz/Hz never feeds a rounded value
+back into the coordinate calculation.
+
+`fq_err_correction = 1` is the default local configuration. In single-frequency
+Pluto mode it applies a conservative model of RFPLL rounding to the *assumed
+source interval*, not to the IIO tuning request:
+
+```text
+requested_rx_hz = receiver_frequency_from_air(requested_source_center_hz)
+divider = smallest power of two where
+  6e9 <= requested_rx_hz * divider <= 12e9
+rfpll_ratio = requested_rx_hz * divider / 40e6
+fractional_word = round(frac(rfpll_ratio) * 8388593)
+modeled_actual_rx_hz = 40e6 *
+  (floor(rfpll_ratio) + fractional_word / 8388593) / divider
+receiver_error_hz = modeled_actual_rx_hz - requested_rx_hz
+air_error_hz = receiver_error_hz for a positive converter
+air_error_hz = +/- receiver_error_hz for a negative converter branch
+effective_error_hz = air_error_hz when fq_err_correction = 1, else 0
+```
+
+The reducer uses `actual_source_start_hz = requested_source_start_hz +
+effective_error_hz`. The displayed `visible_start_hz`/`visible_end_hz` remain
+the user's requested air interval. Thus a spectrum bin caused by the modeled
+actual LO maps to the same pixel as the unchanged scale label. The correction
+does not alter the IIO `altvoltage0/frequency` write, converter math, or
+hardware RFPLL/DDS setup.
+
+The AD936x driver owns final divider selection and calibration, so this model
+is diagnostic compensation, not a substitute for a measurement against a known
+reference. `/api/status` reports `fq_err_correction`, `fq_err_model_hz`, and
+`fq_err_effective_hz`; `tools/frequency_coordinate_check.py` verifies the
+same binary64 coordinate equations with correction enabled and disabled.
+
 ## RF Profiles
 
 Scan/hop mode keeps the fast transport profile because each hop captures a

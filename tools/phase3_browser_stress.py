@@ -25,6 +25,16 @@ fetch('/api/stop', {method: 'POST', headers: {'Content-Type': 'application/json'
     return driver.execute_async_script(script)
 
 
+def api_status(driver):
+    """Return the current scanner status through the browser origin."""
+    script = """
+const done = arguments[arguments.length - 1];
+fetch('/api/status').then(r => r.json()).then(done)
+  .catch(e => done({status: 'error', message: String(e)}));
+"""
+    return driver.execute_async_script(script)
+
+
 def wait_nonblank_waterfall(driver, timeout=90):
     WebDriverWait(driver, timeout).until(
         lambda d: d.execute_script(
@@ -131,10 +141,26 @@ def apply_goto(driver, freq_mhz, target_zoom, animate=False, delay="0.2"):
         before.get("configured_end_hz", before.get("freq_end", 0))
     ) - float(before.get("configured_start_hz", before.get("freq_start", 0)))
     expected_span = configured_span / float(target_zoom)
+    changes_view = expected_span < configured_span - max(5.0, configured_span * 1e-9)
 
-    WebDriverWait(driver, 20).until(
-        lambda d: d.find_element(By.ID, "gotoButton").is_enabled()
-    )
+    try:
+        WebDriverWait(driver, 20).until(
+            lambda d: d.find_element(By.ID, "gotoButton").is_enabled()
+        )
+    except TimeoutException as exc:
+        state = driver.execute_script(
+            """
+const button = document.getElementById('gotoButton');
+return {
+  button_disabled: button.disabled,
+  status: document.getElementById('statusText').textContent,
+  scan: document.getElementById('infoScan').textContent,
+  range: document.getElementById('infoRange').textContent,
+  view: window.__plutoTestHooks.viewState()
+};
+"""
+        )
+        raise RuntimeError(f"Go To remained unavailable: {state}") from exc
     # Gecko can wait behind a busy canvas compositor for a native WebDriver
     # click even though the button is visible and enabled. The ordinary UI test
     # exercises a physical click; this long stress pass invokes the same DOM
@@ -166,7 +192,10 @@ document.getElementById('gotoOk').click();
     WebDriverWait(driver, 30).until(
         lambda d: (
             (status := api_status(d)).get("scanning")
-            and int(status.get("view_id", 0) or 0) > before_view
+            and (
+                not changes_view
+                or int(status.get("view_id", 0) or 0) > before_view
+            )
             and abs(
                 (float(status.get("visible_end_hz", 0))
                  - float(status.get("visible_start_hz", 0)))

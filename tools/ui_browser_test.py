@@ -108,11 +108,17 @@ def main():
             "return window.__plutoTestHooks.scaleFormatting();"
         )
         if scale_format != {
-            "range": "10489.5003 - 10489.5006 MHz, Span: 0.0003 MHz",
+            "range": "10489.5003 - 10489.5006 MHz, Span: 300 Hz",
+            "span_khz": "12.5 kHz",
+            "span_hz": "300 Hz",
             "whole_mhz": "10489 MHz",
             "khz": "10489.500 MHz",
             "hz": "10489.500 300 MHz",
             "delta": "10Hz",
+            "central_delta_left": 10489500100,
+            "central_delta_right": 10489500200,
+            "coordinate_fraction": 0.75,
+            "coordinate_hz": 10489500300,
         }:
             raise RuntimeError(f"unexpected scale formatting: {scale_format}")
 
@@ -140,6 +146,45 @@ def main():
             in d.find_element(By.ID, "infoRange").text
         )
         wait_nonblank_waterfall(driver)
+
+        # CSS layout zoom exercises the same resize path as browser Ctrl+/-
+        # without relying on host-specific browser zoom automation. It must not
+        # send a display-bin-only backend view request or break scanner zoom.
+        before_layout_status = api_status(driver)
+        before_layout_view = int(before_layout_status.get("view_id", 0))
+        before_layout_state = driver.execute_script(
+            "return window.__plutoTestHooks.viewState();"
+        )
+        driver.execute_script(
+            "document.documentElement.style.zoom='125%';"
+            "window.dispatchEvent(new Event('resize'));"
+        )
+        time.sleep(0.8)
+        after_layout_status = api_status(driver)
+        after_layout_state = driver.execute_script(
+            "return window.__plutoTestHooks.viewState();"
+        )
+        driver.execute_script(
+            "document.documentElement.style.zoom='';"
+            "window.dispatchEvent(new Event('resize'));"
+        )
+        if int(after_layout_status.get("view_id", 0)) != before_layout_view:
+            raise RuntimeError("layout-only zoom restarted the scanner backend")
+        if not after_layout_status.get("scanning"):
+            raise RuntimeError("layout-only zoom stopped scanning")
+        if int(after_layout_state.get("stream_display_bins", 0)) != int(
+            before_layout_state.get("stream_display_bins", 0)
+        ):
+            raise RuntimeError("layout-only zoom changed the active stream width")
+        zoom_before_keyboard = driver.find_element(By.ID, "infoZoom").text
+        driver.execute_script(
+            "window.dispatchEvent(new KeyboardEvent('keydown',"
+            "{key:'+',bubbles:true,cancelable:true}));"
+        )
+        WebDriverWait(driver, 10).until(
+            lambda d: d.find_element(By.ID, "infoZoom").text
+            != zoom_before_keyboard
+        )
 
         driver.find_element(By.ID, "btnStop").click()
         WebDriverWait(driver, 15).until(
@@ -221,6 +266,11 @@ fetch('/api/status')
             "animate.checked=true; animate.dispatchEvent(new Event('change',{bubbles:true}));"
             "document.getElementById('gotoDelay').value='0.2';"
             "document.getElementById('gotoOk').click();"
+        )
+        WebDriverWait(driver, 10).until(
+            lambda d: d.execute_script(
+                "return window.__plutoTestHooks.viewState().goto_active;"
+            )
         )
         WebDriverWait(driver, 30).until(
             lambda d: not d.execute_script(

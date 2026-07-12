@@ -199,6 +199,7 @@
                 bottom: 14px;
                 transform: translateX(-50%);
                 color: #6cb4ee;
+                font-size: inherit;
                 text-shadow: 0 1px 2px #000;
                 white-space: nowrap;
                 pointer-events: none;
@@ -990,6 +991,7 @@
             let waterfallPresentationQueue = [];
             let waterfallPresentationTimer = 0;
             let waterfallPresentationNextMs = 0;
+            let waterfallPresentationHistory = [];
             let waterfallSecondsPerLine = null;
             let redrawFrame = 0;
             let waterfallRenderToken = 0;
@@ -1046,6 +1048,9 @@
             let autoWfPlanSignature = "";
             let rateMinDirty = false;
             let rateMaxDirty = false;
+            let canvasResizeFrame = 0;
+            let streamDisplayBins = 0;
+            let canvasResizeObserver = null;
             const RATE_VALUES = [0, 1, 2, 5, 10, 20, 50, 100];
             const RATE_MIN_MIN_INDEX = 0;
             const RATE_MIN_MAX_INDEX = 5;
@@ -1082,9 +1087,39 @@
                 };
             }
 
+            /**
+             * Return the device-pixel ratio used for the canvas backing stores.
+             *
+             * Browser page zoom can change this value without changing the SDR
+             * view. Frequency coordinates remain CSS-pixel based; the backing
+             * store simply gains enough physical pixels for a sharp redraw.
+             *
+             * @returns {number} Finite device-pixel ratio in the range 1..4.
+             */
+            function canvasDevicePixelRatio() {
+                const ratio = Number(window.devicePixelRatio);
+                return Number.isFinite(ratio)
+                    ? clampNumber(ratio, 1, 4)
+                    : 1;
+            }
+
+            /**
+             * Resize local canvas backing stores after a settled layout change.
+             *
+             * This function must not request a backend view update. A browser
+             * page zoom or responsive layout change changes only presentation;
+             * already received rows are resampled locally until a deliberate
+             * scanner zoom, pan, or Start request selects a new stream width.
+             *
+             * @returns {void}
+             */
             function resizeCanvases() {
                 const rect = wfCanvas.parentElement.getBoundingClientRect();
-                const w = Math.floor(rect.width);
+                const cssWidth = Math.max(1, Math.floor(rect.width));
+                const w = Math.max(
+                    1,
+                    Math.round(cssWidth * canvasDevicePixelRatio()),
+                );
 
                 wfCanvas.width = w;
                 wfCanvas.height = 600;
@@ -1108,10 +1143,39 @@
                 if (rulerCanvasKind === "waterfall") drawRulerOverlay();
                 if (rulerCanvasKind === "scope") drawScopeRulerOverlay();
                 binRangeCache = null;
-                scheduleViewUpdate(currentFreq0, currentFreq1, false);
+                freqScaleSignature = "";
+                if (hasFrequencyWindow())
+                    updateFrequencyLabels(
+                        currentFreq0,
+                        currentFreq1,
+                        currentSteps,
+                    );
             }
 
-            window.addEventListener("resize", resizeCanvases);
+            /**
+             * Coalesce layout notifications until CSS geometry is stable.
+             *
+             * @returns {void}
+             */
+            function scheduleCanvasResize() {
+                if (canvasResizeFrame) return;
+                canvasResizeFrame = requestAnimationFrame(() => {
+                    canvasResizeFrame = 0;
+                    resizeCanvases();
+                });
+            }
+
+            window.addEventListener("resize", scheduleCanvasResize);
+            if (window.visualViewport)
+                window.visualViewport.addEventListener(
+                    "resize",
+                    scheduleCanvasResize,
+                );
+            if (typeof ResizeObserver === "function") {
+                canvasResizeObserver = new ResizeObserver(scheduleCanvasResize);
+                canvasResizeObserver.observe(wfCanvas.parentElement);
+                canvasResizeObserver.observe(document.getElementById("freqScale"));
+            }
             resizeCanvases();
 
             function displayBins() {
@@ -2074,8 +2138,8 @@
                 const decimals = decimalsForSpan(shownSpan);
                 const start = formatMHzValue(freqStart, decimals);
                 const end = formatMHzValue(freqEnd, decimals);
-                const span = formatMHzValue(shownSpan, decimals);
-                return start + " - " + end + " MHz, Span: " + span + " MHz";
+                const span = formatVisibleSpan(shownSpan);
+                return start + " - " + end + " MHz, Span: " + span;
             }
 
             function formatMHzValue(freq, decimals = 3) {
@@ -2083,6 +2147,30 @@
                     .toFixed(decimals)
                     .replace(/0+$/, "")
                     .replace(/\.$/, "");
+            }
+
+            /**
+             * Format an interval with the smallest requested status-line unit.
+             *
+             * The value remains a binary64 hertz coordinate everywhere else.
+             * This formatter is presentation-only and its output is never parsed
+             * back into a pan, zoom, marker, ruler, Go To, or API value.
+             *
+             * @param {number} spanHz Non-negative interval in hertz.
+             * @returns {string} Compact MHz, kHz, or Hz interval label.
+             */
+            function formatVisibleSpan(spanHz) {
+                const hz = Math.abs(Number(spanHz));
+                if (!Number.isFinite(hz)) return "---";
+                if (hz >= 1e6)
+                    return formatMHzValue(hz, decimalsForSpan(hz)) + " MHz";
+                if (hz >= 1e3) {
+                    const khz = hz / 1e3;
+                    const decimals = khz < 10 ? 3 : khz < 100 ? 2 : 1;
+                    return formatCompactNumber(khz, decimals) + " kHz";
+                }
+                const decimals = hz < 10 ? 3 : hz < 100 ? 2 : 1;
+                return formatCompactNumber(hz, decimals) + " Hz";
             }
 
             function normalizeGotoFrequency(freqHz) {
@@ -2758,6 +2846,52 @@
             }
 
             /**
+             * Convert one air-frequency coordinate to an axis fraction.
+             *
+             * Tick labels, pointer hit testing, rulers, markers, and plotted
+             * spectrum rows all use this binary64 relationship. The axis is a
+             * uniformly resampled air-frequency interval in both scan/hop and
+             * single-frequency modes.
+             *
+             * @param {number} freqHz Air frequency in hertz.
+             * @param {{left:number,right:number}} axis Visible axis in hertz.
+             * @returns {number|null} Unclamped fraction, or null for bad input.
+             */
+            function frequencyAxisFraction(freqHz, axis) {
+                if (
+                    !axis ||
+                    !Number.isFinite(freqHz) ||
+                    !Number.isFinite(axis.left) ||
+                    !Number.isFinite(axis.right) ||
+                    axis.right <= axis.left
+                ) {
+                    return null;
+                }
+                return (freqHz - axis.left) / (axis.right - axis.left);
+            }
+
+            /**
+             * Convert a normalized axis fraction to an air-frequency coordinate.
+             *
+             * @param {{left:number,right:number}} axis Visible axis in hertz.
+             * @param {number} fraction Normalized horizontal position.
+             * @returns {number|null} Air frequency in hertz, or null for bad input.
+             */
+            function frequencyAtAxisFraction(axis, fraction) {
+                if (
+                    !axis ||
+                    !Number.isFinite(axis.left) ||
+                    !Number.isFinite(axis.right) ||
+                    axis.right <= axis.left ||
+                    !Number.isFinite(fraction)
+                ) {
+                    return null;
+                }
+                const clamped = clampNumber(fraction, 0, 1);
+                return axis.left + clamped * (axis.right - axis.left);
+            }
+
+            /**
              * Format one frequency-scale label in MHz.
              *
              * When sub-kHz precision is needed (>3 fractional digits), insert a
@@ -2795,6 +2929,36 @@
                         .replace(/\.$/, "");
                 if (hz < 1000) return trim(hz, hz < 10 ? 2 : 1) + "Hz";
                 return trim(hz / 1000, hz < 10000 ? 2 : 1) + "kHz";
+            }
+
+            /**
+             * Select adjacent major ticks whose midpoint is nearest the view centre.
+             *
+             * The returned pair only controls the blue numerical tick-spacing
+             * label. It does not describe an RF gap, zero-IF guard, or hop seam.
+             *
+             * @param {Array<{pos:number,freq:number}>} majorTicks Ordered major ticks.
+             * @returns {?{left:Object,right:Object,midpoint:number}} Central pair.
+             */
+            function centralMajorTickPair(majorTicks) {
+                if (!Array.isArray(majorTicks) || majorTicks.length < 2)
+                    return null;
+                let best = null;
+                for (let index = 0; index < majorTicks.length - 1; index++) {
+                    const left = majorTicks[index];
+                    const right = majorTicks[index + 1];
+                    const midpoint = (Number(left.pos) + Number(right.pos)) * 0.5;
+                    if (!Number.isFinite(midpoint)) continue;
+                    const candidate = {
+                        left,
+                        right,
+                        midpoint,
+                        distance: Math.abs(midpoint - 50),
+                    };
+                    if (!best || candidate.distance < best.distance)
+                        best = candidate;
+                }
+                return best;
             }
 
             function parseBandsIni(text) {
@@ -3291,7 +3455,7 @@
                 let freq = Math.ceil((left - eps) / step) * step;
                 const end = Math.floor((right + eps) / step) * step;
                 while (freq <= end + eps && marks.length < TICK_MAX_COUNT) {
-                    const pos = ((freq - left) / (right - left)) * 100;
+                    const pos = frequencyAxisFraction(freq, { left, right }) * 100;
                     marks.push({
                         pos: Math.max(0, Math.min(100, pos)),
                         freq,
@@ -3317,7 +3481,11 @@
                         if (seen.has(key)) continue;
                         seen.add(key);
                         marks.push({
-                            pos: ((minorFreq - left) / (right - left)) * 100,
+                            pos:
+                                frequencyAxisFraction(minorFreq, {
+                                    left,
+                                    right,
+                                }) * 100,
                             freq: minorFreq,
                             step,
                             kind:
@@ -3406,14 +3574,15 @@
                     return mark;
                 });
 
-                if (majorTicks.length >= 2) {
+                const centralPair = centralMajorTickPair(majorTicks);
+                if (centralPair) {
                     const deltaText = formatScaleDelta(
-                        majorTicks[1].freq - majorTicks[0].freq,
+                        centralPair.right.freq - centralPair.left.freq,
                     );
                     if (deltaText) {
                         const delta = document.createElement("div");
                         delta.className = "wf-step-delta";
-                        delta.style.left = "50%";
+                        delta.style.left = centralPair.midpoint + "%";
                         delta.textContent = "<" + deltaText + ">";
                         nodes.push(delta);
                     }
@@ -3435,8 +3604,8 @@
                     currentSteps,
                     currentBins ? currentBins.length : 0,
                 );
-                if (axis.right <= axis.left || rect.width <= 0) return null;
-                return axis.left + (x / rect.width) * (axis.right - axis.left);
+                if (rect.width <= 0) return null;
+                return frequencyAtAxisFraction(axis, x / rect.width);
             }
 
             function receiverFrequencyFromRadio(freq) {
@@ -4143,10 +4312,12 @@
                 } else {
                     return null;
                 }
-                if (expectedBins !== displayBins()) {
-                    scheduleViewUpdate(currentFreq0, currentFreq1, false);
-                    return null;
-                }
+                /* A browser page zoom can resize the local canvas while the
+                 * backend correctly continues sending the previous row width.
+                 * Rows are frequency-resampled onto the current canvas below,
+                 * so accepting that stable stream avoids a layout-only SDR
+                 * restart and the stale-row loop it previously triggered. */
+                streamDisplayBins = expectedBins;
                 data.d = values;
                 if (
                     data.f0 !== undefined &&
@@ -4257,6 +4428,30 @@
             }
 
             /**
+             * Record rendered waterfall timing for bounded browser diagnostics.
+             *
+             * The trace is intentionally local-only. It verifies that paced
+             * preview rows bridge the first live row after high-zoom restarts
+             * without becoming a frontend telemetry stream.
+             *
+             * @param {Object} data Rendered SSE waterfall row.
+             * @returns {void}
+             */
+            function recordWaterfallPresentation(data) {
+                waterfallPresentationHistory.push({
+                    view: Number(data && data.view),
+                    preview: Number(data && data.preview) !== 0 ? 1 : 0,
+                    at_ms: performance.now(),
+                    interval_ms: previewPresentationIntervalMs(data),
+                });
+                if (waterfallPresentationHistory.length > 512)
+                    waterfallPresentationHistory.splice(
+                        0,
+                        waterfallPresentationHistory.length - 512,
+                    );
+            }
+
+            /**
              * Apply one already ordered SSE waterfall row to the live UI.
              *
              * @param {Object} data Parsed SSE waterfall row.
@@ -4291,6 +4486,7 @@
                         currentViewId = rowView;
                     }
                     if (!currentViewId && rowView) currentViewId = rowView;
+                    recordWaterfallPresentation(data);
                     if (data.full_f0 !== undefined)
                         configuredFreq0 = Number(data.full_f0);
                     if (data.full_f1 !== undefined)
@@ -4543,11 +4739,11 @@
                     gotoAnimate = !!Number(status.goto_animate);
                 if (status.goto_delay_s !== undefined)
                     gotoDelayS = normalizeGotoDelay(status.goto_delay_s);
+                if (Number.isFinite(Number(status.display_bins)))
+                    streamDisplayBins = Number(status.display_bins);
                 updateFFTInfo(status);
                 if (status.scanning) {
                     clearAutoRestartTimer();
-                    if (Number(status.display_bins) !== displayBins())
-                        scheduleViewUpdate(currentFreq0, currentFreq1, false);
                     ensureSSEReceiving();
                 } else {
                     disconnectSSE();
@@ -4684,9 +4880,8 @@
                     currentSteps,
                     currentBins ? currentBins.length : displayBins(),
                 );
-                if (axis.right <= axis.left || wfCanvas.width <= 0) return null;
-                const frac = clampNumber(x / wfCanvas.width, 0, 1);
-                return axis.left + frac * (axis.right - axis.left);
+                if (wfCanvas.width <= 0) return null;
+                return frequencyAtAxisFraction(axis, x / wfCanvas.width);
             }
 
             function rulerText() {
@@ -4716,9 +4911,8 @@
                     currentSteps,
                     currentBins ? currentBins.length : displayBins(),
                 );
-                if (axis.right <= axis.left || scCanvas.width <= 0) return null;
-                const frac = clampNumber(x / scCanvas.width, 0, 1);
-                return axis.left + frac * (axis.right - axis.left);
+                if (scCanvas.width <= 0) return null;
+                return frequencyAtAxisFraction(axis, x / scCanvas.width);
             }
 
             function packedLevelToDb(value) {
@@ -5637,6 +5831,8 @@
                 if (plan.steps !== undefined) {
                     currentSteps = Number(plan.steps);
                 }
+                if (Number.isFinite(Number(plan.display_bins)))
+                    streamDisplayBins = Number(plan.display_bins);
                 if (plan.samplerate !== undefined)
                     configuredSampleRate = Number(plan.samplerate);
                 if (plan.bw_ratio !== undefined)
@@ -5697,6 +5893,12 @@
                 if (!backendOnline || !scanRunning) return;
                 if (gotoAnimationActive) return;
                 if (!hasFrequencyWindow(visibleStart, visibleEnd)) return;
+
+                /* A retuned view owns a new preview/live timing sequence. Keep
+                 * pixels already drawn as history, but discard queued rows from
+                 * the superseded sequence so they cannot burst ahead of the
+                 * new cached previews. */
+                if (visibleChanged) clearWaterfallPresentationQueue();
 
                 pendingView = {
                     visible_start_hz: visibleStart,
@@ -6187,6 +6389,7 @@
                 currentBins = null;
                 currentBinsFreq0 = 0;
                 currentBinsFreq1 = 0;
+                streamDisplayBins = 0;
                 wfRows = [];
                 clearWaterfallPixels();
                 if (wfImageData) presentWaterfallImage();
@@ -6297,6 +6500,12 @@
             }
 
             async function updateBackendWaterfallRate() {
+                /* Rate changes restart single CIC capture when overlap or the
+                 * final limiter plan changes. The queued presentation rows use
+                 * the preceding interval, so retaining them causes the first
+                 * new previews to render as an immediate burst. */
+                clearWaterfallPresentationQueue();
+                if (scanRunning) pendingViewChange = true;
                 const result = await apiPost("/api/rate", {
                     min_rate_lps: parseInt(
                         document.getElementById("minRate").value,
@@ -6608,13 +6817,37 @@
                     };
                 },
                 scaleFormatting() {
+                    const centralPair = centralMajorTickPair([
+                        { freq: 10489500000, pos: 25 },
+                        { freq: 10489500100, pos: 48 },
+                        { freq: 10489500200, pos: 71 },
+                    ]);
+                    const axis = { left: 10489500000, right: 10489500400 };
+                    const testFrequency = 10489500300;
                     return {
                         range: formatScanRange(10489500300, 10489500600),
+                        span_khz: formatVisibleSpan(12500),
+                        span_hz: formatVisibleSpan(300),
                         whole_mhz: formatTickMHz(10489000000, 0),
                         khz: formatTickMHz(10489500000, 3),
                         hz: formatTickMHz(10489500300, 6),
                         delta: formatScaleDelta(10),
+                        central_delta_left: centralPair && centralPair.left.freq,
+                        central_delta_right: centralPair && centralPair.right.freq,
+                        coordinate_fraction: frequencyAxisFraction(
+                            testFrequency,
+                            axis,
+                        ),
+                        coordinate_hz: frequencyAtAxisFraction(axis, 0.75),
                     };
+                },
+                clearPresentationHistory() {
+                    waterfallPresentationHistory = [];
+                },
+                presentationHistory() {
+                    return waterfallPresentationHistory.map((item) => ({
+                        ...item,
+                    }));
                 },
                 viewState() {
                     return {
@@ -6624,6 +6857,8 @@
                         span_hz: currentFreq1 - currentFreq0,
                         goto_active: gotoAnimationActive,
                         queued_rows: waterfallPresentationQueue.length,
+                        stream_display_bins: streamDisplayBins,
+                        canvas_display_bins: displayBins(),
                     };
                 },
             };

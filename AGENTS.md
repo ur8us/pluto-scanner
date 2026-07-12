@@ -106,6 +106,15 @@ frontend data model. Current SSE rows compress the display bytes as
 `encoding:"u8b64"` with `db` containing base64 packed `uint8` values; keep
 frontend compatibility with legacy `d:[...]` rows when editing this path.
 
+Browser page zoom and responsive layout are presentation changes, not backend
+view changes. Resize local canvas backing stores through `ResizeObserver` and
+an animation-frame coalescer; keep the active SSE row width valid and resample
+it locally. Do not restart the SDR only because CSS geometry or device-pixel
+ratio changed. The frequency scale, markers, rulers, and reducer use the same
+binary64 hertz coordinate transform. Status formatting is display-only. The
+blue `<gap>` label is the difference between the central adjacent scale ticks,
+not a zero-IF, hop, or physical passband gap.
+
 RF bandwidth must be strictly lower than sample rate for all Pluto profiles:
 
 ```text
@@ -300,6 +309,18 @@ opening `SPECTRUM_CALC.MD`.
 
 Agents changing scan/hop or single-frequency behavior must preserve these coefficient rules.
 
+### RFPLL Coordinate Model
+
+`fq_err_correction=1` is a local configuration enable flag for the conservative
+40 MHz-reference AD936x RFPLL rounding model. In single-frequency mode,
+calculate the nearest fractional-N LO using modulus `8388593` and a power-of-two
+VCO divider placing the VCO in `6..12 GHz`. Convert the signed receive-LO
+error through the active converter branch and add it to the *source-bin
+coordinate* only. Do not change the IIO LO write, requested air frequencies,
+or converter setting. Keep `fq_err_model_hz` and `fq_err_effective_hz` in
+`/api/status` and row diagnostic metadata. This is a model, not an external
+reference calibration; it does not correct sample-clock or converter error.
+
 Scan/hop mode is used when the visible span needs more than one Pluto passband:
 
 ```text
@@ -397,6 +418,7 @@ tools/http_smoke_test.sh
 tools/cic_stability_check.py
 tools/cic_continuity_check.py
 tools/cic_synthetic_signal_check.py
+tools/frequency_coordinate_check.py
 tools/headless_tester.py
 tools/ui_browser_test.py
 tools/phase3_browser_stress.py
