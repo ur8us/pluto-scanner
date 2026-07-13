@@ -419,6 +419,10 @@ Do not auto-start a saved scan when the backend is idle. The page may restore sa
 
 ## Tests
 
+GitHub Actions must use `make ci-check` for routine CI. `pluto-scanner-cic-test`
+is a developer-only executable and must not be built or run by GitHub CI unless
+that policy is explicitly changed.
+
 Before handing changes back:
 
 ```sh

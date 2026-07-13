@@ -137,7 +137,8 @@ for common systems.
 
 `make check` may build an internal synthetic CIC test executable, but it is kept
 under `.build/tests/` and is not part of the normal source tree, release
-packages, or user-facing scanner program.
+packages, GitHub CI checks, or user-facing scanner program. GitHub CI uses
+`make ci-check`, which deliberately skips developer-only test applications.
 
 Local release packaging is also exposed through Makefile targets:
 
@@ -364,6 +365,7 @@ Without starting the backend:
 
 ```sh
 make check
+make ci-check
 tools/cic_stability_check.py
 tools/cic_continuity_check.py
 tools/cic_synthetic_signal_check.py
