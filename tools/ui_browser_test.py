@@ -126,6 +126,16 @@ def main():
             "coordinate_hz": 10489500300,
         }:
             raise RuntimeError(f"unexpected scale formatting: {scale_format}")
+        rate_format = driver.execute_script(
+            "return window.__plutoTestHooks.trueRateFormatting();"
+        )
+        if rate_format != {
+            "high": " (12 lines/s)",
+            "normal": " (2.3 lines/s)",
+            "sub_one": " (0.34 lines/s)",
+            "sub_tenth": " (0.014 lines/s)",
+        }:
+            raise RuntimeError(f"unexpected FFT rate formatting: {rate_format}")
 
         api_stop(driver)
         time.sleep(1.0)
