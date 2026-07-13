@@ -13,7 +13,7 @@ import time
 import urllib.request
 
 
-BASE = "http://127.0.0.1:8080"
+BASE = ""
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 
@@ -81,11 +81,12 @@ def read_one_sse_row(timeout=20):
     raise RuntimeError("timed out waiting for one SSE row")
 
 
-def port_is_free():
-    """Return whether the scanner's fixed HTTP port is currently unused."""
+def allocate_loopback_port():
+    """Reserve a currently free loopback port for one private test process."""
     sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     try:
-        return sock.connect_ex(("127.0.0.1", 8080)) != 0
+        sock.bind(("127.0.0.1", 0))
+        return sock.getsockname()[1]
     finally:
         sock.close()
 
@@ -153,18 +154,19 @@ def assert_plan(label, payload, baseline, expected_min, expected_overlap):
 
 def run_check():
     """Run the overlap API/SSE validation against a private synthetic backend."""
+    global BASE
     if not os.path.isfile(TEST_BINARY):
         raise RuntimeError(
             f"missing {TEST_BINARY}; run make cic-synthetic-test or make check"
         )
-    if not port_is_free():
-        raise RuntimeError("TCP port 8080 is already in use")
+    port = allocate_loopback_port()
+    BASE = f"http://127.0.0.1:{port}"
 
     with tempfile.TemporaryDirectory(prefix="pluto-min-rate-") as temp_dir:
         binary = os.path.join(temp_dir, os.path.basename(TEST_BINARY))
         shutil.copy2(TEST_BINARY, binary)
         process = subprocess.Popen(
-            [binary],
+            [binary, "--port", str(port)],
             cwd=temp_dir,
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,

@@ -42,7 +42,7 @@ jobs:
         run: make
 
       - name: Run validation checks
-        run: make check
+        run: make ci-check
 
   macos:
     name: ci-macos
@@ -80,7 +80,7 @@ jobs:
         run: |
           iio_cflags="$(pkg-config --cflags libiio libxml-2.0)"
           iio_libs="$(pkg-config --libs --static libiio libxml-2.0)"
-          make check IIO_CFLAGS="$iio_cflags" IIO_LIBS="$iio_libs"
+          make ci-check IIO_CFLAGS="$iio_cflags" IIO_LIBS="$iio_libs"
 
   windows:
     name: ci-windows
@@ -116,4 +116,4 @@ jobs:
         run: make
 
       - name: Run validation checks
-        run: make check
+        run: make ci-check

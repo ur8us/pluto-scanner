@@ -15,7 +15,7 @@ import time
 import urllib.request
 
 
-BASE = "http://127.0.0.1:8080"
+BASE = ""
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 
@@ -108,17 +108,21 @@ class SSEReader:
                     if line == "event: line":
                         saw_event = True
                     elif saw_event and line.startswith("data:"):
-                        self.rows.put(json.loads(line[5:].strip()))
+                        row = json.loads(line[5:].strip())
+                        row["_arrival_monotonic"] = time.monotonic()
+                        self.rows.put(row)
                         saw_event = False
         except Exception as exc:
             if not self.stop_requested:
                 self.error = exc
 
-    def collect_for_view(self, view_id, minimum_rows=5, timeout=10):
+    def collect_for_view(
+        self, view_id, minimum_rows=5, timeout=10, require_live=False
+    ):
         """Collect rows matching one backend view id."""
         deadline = time.monotonic() + timeout
         matched = []
-        while time.monotonic() < deadline and len(matched) < minimum_rows:
+        while time.monotonic() < deadline:
             try:
                 row = self.rows.get(timeout=0.25)
             except queue.Empty:
@@ -127,6 +131,11 @@ class SSEReader:
                 continue
             if int(row.get("view", -1)) == int(view_id):
                 matched.append(row)
+                if len(matched) >= minimum_rows and (
+                    not require_live
+                    or any(int(item.get("preview", 0)) == 0 for item in matched)
+                ):
+                    break
         return matched
 
     def stop(self):
@@ -134,11 +143,12 @@ class SSEReader:
         self.thread.join(timeout=1)
 
 
-def port_is_free():
-    """Return whether the scanner's fixed HTTP port is currently unused."""
+def allocate_loopback_port():
+    """Reserve a currently free loopback port for one private test process."""
     sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     try:
-        return sock.connect_ex(("127.0.0.1", 8080)) != 0
+        sock.bind(("127.0.0.1", 0))
+        return sock.getsockname()[1]
     finally:
         sock.close()
 
@@ -184,12 +194,13 @@ def int_field(payload, name):
 
 def run_check():
     """Run the cache preview validation against a private synthetic backend."""
+    global BASE
     if not os.path.isfile(TEST_BINARY):
         raise RuntimeError(
             f"missing {TEST_BINARY}; run make cic-synthetic-test or make check"
         )
-    if not port_is_free():
-        raise RuntimeError("TCP port 8080 is already in use")
+    port = allocate_loopback_port()
+    BASE = f"http://127.0.0.1:{port}"
 
     center = 435_000_000.0
     span_hz = 4096.0e6 / 3_000_000.0
@@ -199,7 +210,7 @@ def run_check():
         binary = os.path.join(temp_dir, os.path.basename(TEST_BINARY))
         shutil.copy2(TEST_BINARY, binary)
         process = subprocess.Popen(
-            [binary],
+            [binary, "--port", str(port)],
             cwd=temp_dir,
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
@@ -238,7 +249,9 @@ def run_check():
             if view_plan.get("status") != "ok":
                 raise RuntimeError(f"view change failed: {view_plan}")
             view_id = int_field(view_plan, "view_id")
-            rows = reader.collect_for_view(view_id, minimum_rows=6, timeout=15)
+            rows = reader.collect_for_view(
+                view_id, minimum_rows=6, timeout=20, require_live=True
+            )
             if len(rows) < 3:
                 raise RuntimeError(f"only {len(rows)} rows captured for view {view_id}")
             if int(rows[0].get("preview", 0)) != 1:
@@ -260,6 +273,16 @@ def run_check():
                 raise RuntimeError(
                     f"captured {len(preview_rows)} previews but preview_count was {expected_count}"
                 )
+            preview_interval_ms = float(preview_rows[0].get("preview_interval_ms", 0))
+            if preview_interval_ms <= 0:
+                raise RuntimeError(f"missing preview interval metadata: {preview_rows[0]}")
+            first_line_ms = float(view_plan.get("first_line_ms", 0))
+            if expected_count * preview_interval_ms + preview_interval_ms < first_line_ms:
+                raise RuntimeError(
+                    "cached preview coverage is too short for the planned fresh frame: "
+                    f"count={expected_count} interval={preview_interval_ms} "
+                    f"first={first_line_ms}"
+                )
             for row in rows:
                 if int_field(row, "decim_factor") != 64 or int_field(row, "overlap_factor") != 64:
                     raise RuntimeError(f"row changed CIC/overlap metadata: {row}")
@@ -274,7 +297,7 @@ def run_check():
                 raise RuntimeError(f"rate change failed: {rate_plan}")
             rate_view_id = int_field(rate_plan, "view_id")
             rate_rows = reader.collect_for_view(
-                rate_view_id, minimum_rows=8, timeout=15
+                rate_view_id, minimum_rows=8, timeout=20, require_live=True
             )
             if len(rate_rows) < 2:
                 raise RuntimeError(
@@ -295,6 +318,19 @@ def run_check():
                 raise RuntimeError("no cached preview rows captured after rate change")
             if not rate_live_rows:
                 raise RuntimeError("no live row captured after rate-change previews")
+            rate_interval_ms = float(
+                rate_preview_rows[0].get("preview_interval_ms", 0)
+            )
+            rate_first_line_ms = float(rate_plan.get("first_line_ms", 0))
+            if rate_interval_ms <= 0 or (
+                int(rate_preview_rows[0].get("preview_count", 0))
+                * rate_interval_ms
+                + rate_interval_ms
+                < rate_first_line_ms
+            ):
+                raise RuntimeError(
+                    "rate-change preview coverage does not hide the planned live fill"
+                )
 
             http_json("POST", "/api/stop", {})
             stop_backend_process(process)
@@ -313,6 +349,8 @@ def run_check():
         "live_rows": len(live_rows),
         "rate_preview_rows": len(rate_preview_rows),
         "rate_live_rows": len(rate_live_rows),
+        "preview_interval_ms": preview_interval_ms,
+        "rate_preview_interval_ms": rate_interval_ms,
         "first_line_ms": float(view_plan.get("first_line_ms", 0.0)),
         "log_tail": output[-1000:],
     }

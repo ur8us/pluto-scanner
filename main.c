@@ -115,11 +115,19 @@ static int win32_nanosleep(const struct timespec *req, struct timespec *rem)
 #define SINGLE_DECIM_ASYNC_MIN_LEN 8192U
 #define SINGLE_DECIM_ASYNC_MAX_LEN 262144U
 #define CACHED_PREVIEW_MAX_SAMPLES 16777984U
-#define CACHED_PREVIEW_MAX_LINES 4U
+#define CACHED_PREVIEW_MAX_LINES 128U
 #define CACHED_PREVIEW_MAX_AGE_MS 5000LL
 #define SINGLE_ZERO_IF_GUARD_HZ 50000.0
+#define PLUTO_REFERENCE_INPUT_HZ 40000000.0
+/* The stock AD936x driver doubles a 40 MHz input reference for the RFPLL. */
+#define PLUTO_RFPLL_REFERENCE_HZ (2.0 * PLUTO_REFERENCE_INPUT_HZ)
+#define PLUTO_RFPLL_FRACTIONAL_MODULUS 8388593.0
+#define PLUTO_RFPLL_VCO_MIN_HZ 6000000000.0
+#define PLUTO_RFPLL_VCO_MAX_HZ 12000000000.0
 #define CIC_STAGES          3
-#define FFT_LEVEL_REF_SIZE  FFT_SIZE_MIN
+/* The minimum scan FFT has a Hann ENBW close to 90 kHz at 61.44 MSPS.
+ * Waterfall presentation uses this as the common white-noise reference. */
+#define WATERFALL_NOISE_REFERENCE_ENBW_HZ 90000.0
 #define FFTS_PER_STEP       32
 #define SCAN_FFTS_PER_STEP  1
 /* Phase-1 measured best scan profile for Pluto: 1024-sample buffers,
@@ -267,8 +275,9 @@ static double g_bw_ratio     = DEFAULT_BW_RATIO;
 static int g_display_bins    = 1024;
 static uint32_t g_min_rate_lps = 10;
 static uint32_t g_rate_limit_lps = 20;
+/* Enable the conservative 40 MHz-reference RFPLL rounding model below. */
+static uint32_t g_fq_err_correction = 1;
 static uint32_t g_view_id    = 1;
-static int g_next_preview_max_lines = 0;
 static int g_http_port = DEFAULT_HTTP_PORT;
 static char g_bind_address[128] = DEFAULT_BIND_ADDRESS;
 static double g_hardwaregain_db = PLUTO_DEFAULT_GAIN_DB;
@@ -797,6 +806,7 @@ static void save_config(void)
     fprintf(f, "fft_size = %d\n", g_fft_size);
     fprintf(f, "min_rate_lps = %u\n", g_min_rate_lps);
     fprintf(f, "rate_limit_lps = %u\n", g_rate_limit_lps);
+    fprintf(f, "fq_err_correction = %u\n", g_fq_err_correction);
     fprintf(f, "goto_freq = %.0f\n", g_goto_freq);
     fprintf(f, "goto_target_zoom = %.6g\n", g_goto_target_zoom);
     fprintf(f, "goto_animate = %u\n", g_goto_animate);
@@ -852,6 +862,10 @@ static void load_config(void)
         else if (strcmp(key, "fft_size") == 0) { update_fft_size((int)val); }
         else if (strcmp(key, "min_rate_lps") == 0) { uval = (unsigned int)val; g_min_rate_lps = normalize_min_rate_lps(uval); }
         else if (strcmp(key, "rate_limit_lps") == 0) { uval = (unsigned int)val; g_rate_limit_lps = normalize_rate_limit_lps(uval); }
+        else if (strcmp(key, "fq_err_correction") == 0) {
+            if (isfinite(val))
+                g_fq_err_correction = val != 0.0 ? 1U : 0U;
+        }
         else if (strcmp(key, "goto_freq") == 0)      { if (val > 0.0) g_goto_freq = val; }
         else if (strcmp(key, "goto_target_zoom") == 0) { g_goto_target_zoom = normalize_goto_target_zoom(val); }
         else if (strcmp(key, "goto_animate") == 0)   { uval = (unsigned int)val; g_goto_animate = uval ? 1 : 0; }
@@ -1883,6 +1897,29 @@ static int pluto_sdr_set_gain_mode(pluto_sdr_dev_t *dev, const char *mode)
     return PLUTO_ERR_OK;
 }
 
+/**
+ * @brief Select the AD936x receive input port.
+ *
+ * The value is written through the stock `rf_port_select` IIO channel
+ * attribute. The selected port takes effect on the next stream start.
+ *
+ * @param dev Open Pluto device.
+ * @param port AD936x port name, such as `A_BALANCED`.
+ * @return `PLUTO_ERR_OK` on success, otherwise the negative IIO error.
+ */
+static int pluto_sdr_set_rf_port(pluto_sdr_dev_t *dev, const char *port)
+{
+    int rc;
+
+    if (!dev || !port || !*port)
+        return -1;
+    rc = (int)iio_channel_attr_write(dev->phy_rx0, "rf_port_select", port);
+    if (rc < 0)
+        return rc;
+    copy_cstr(dev->rf_port, sizeof(dev->rf_port), port);
+    return PLUTO_ERR_OK;
+}
+
 static int pluto_sdr_set_hardwaregain(pluto_sdr_dev_t *dev, double gain_db)
 {
     int rc;
@@ -2463,6 +2500,8 @@ typedef struct {
     double bw_ratio;
     double step_width;
     double last_width;
+    /* Modeled actual-minus-requested source-center offset, in hertz. */
+    double frequency_correction_hz;
     double center_freq;
     double second_if_hz;
     double zero_if_guard_hz;
@@ -2471,9 +2510,18 @@ typedef struct {
     long long preview_age_ms;
     int preview_sequence;
     int preview_count;
+    /* Planned display pacing for cached preview rows, in milliseconds. */
+    double preview_interval_ms;
+    /* Monotonic live-capture timing, used only for transition diagnostics. */
+    long long live_capture_started_msec;
+    long long live_first_input_msec;
+    long long live_first_fft_msec;
+    long long live_first_publish_msec;
     uint32_t direct_sampling;
     double direct_mix_phase;
     double direct_mix_inc;
+    /* Display-only white-noise density factor; coherent FFT data is unchanged. */
+    float waterfall_noise_scale;
     float mag_scale;
     float *window;
     float *fft_scratch;
@@ -2631,6 +2679,7 @@ static float *recent_sample_cache_snapshot(const scan_ctx_t *ctx,
     double coverage_guard_hz;
     double phase = 0.0;
     double phase_inc;
+    const char *reject_reason = NULL;
 
     if (out_age_ms)
         *out_age_ms = 0;
@@ -2643,16 +2692,23 @@ static float *recent_sample_cache_snapshot(const scan_ctx_t *ctx,
     coverage_guard_hz = fmax(
         (ctx->visible_end - ctx->visible_start) * 0.05,
         ctx->raw_samplerate / (double)(ctx->fft_size > 0 ? ctx->fft_size : 1) * 2.0);
-    if (!g_recent_samples.valid || !g_recent_samples.samples ||
-        g_recent_samples.count < (size_t)needed_samples ||
-        g_recent_samples.updated_msec <= 0 || age_ms < 0 ||
-        age_ms > CACHED_PREVIEW_MAX_AGE_MS ||
-        fabs(g_recent_samples.samplerate_hz - ctx->raw_samplerate) > 1.0 ||
-        fabs(g_recent_samples.rf_bandwidth_hz - rf_bandwidth_hz) > 1.0 ||
-        ctx->visible_start - coverage_guard_hz <
-            g_recent_samples.source_start_hz - 1.0 ||
-        ctx->visible_end + coverage_guard_hz >
-            g_recent_samples.source_end_hz + 1.0) {
+    if (!g_recent_samples.valid || !g_recent_samples.samples)
+        reject_reason = "no contiguous raw cache";
+    else if (g_recent_samples.count < (size_t)needed_samples)
+        reject_reason = "insufficient raw samples";
+    else if (g_recent_samples.updated_msec <= 0 || age_ms < 0 ||
+             age_ms > CACHED_PREVIEW_MAX_AGE_MS)
+        reject_reason = "raw cache is stale";
+    else if (fabs(g_recent_samples.samplerate_hz - ctx->raw_samplerate) > 1.0)
+        reject_reason = "raw sample rate changed";
+    else if (fabs(g_recent_samples.rf_bandwidth_hz - rf_bandwidth_hz) > 1.0)
+        reject_reason = "RF bandwidth changed";
+    else if (ctx->visible_start - coverage_guard_hz <
+             g_recent_samples.source_start_hz - 1.0 ||
+             ctx->visible_end + coverage_guard_hz >
+             g_recent_samples.source_end_hz + 1.0)
+        reject_reason = "target view exceeds raw RF coverage";
+    if (reject_reason) {
         pthread_mutex_unlock(&g_recent_samples_mutex);
         return NULL;
     }
@@ -2687,6 +2743,9 @@ static float *recent_sample_cache_snapshot(const scan_ctx_t *ctx,
     }
     if (out_age_ms)
         *out_age_ms = age_ms;
+    fprintf(stderr,
+            "[SDR] Cached preview accepted: %u raw samples, age %lld ms, shift %.6f Hz\n",
+            needed_samples, age_ms, shift_hz);
     return snapshot;
 }
 
@@ -2833,6 +2892,115 @@ static double receiver_frequency_from_radio(double air_freq)
 static int receiver_frequency_valid(double rx_freq)
 {
     return rx_freq >= RF_RECEIVER_MIN_HZ && rx_freq <= RF_RECEIVER_MAX_HZ;
+}
+
+/**
+ * @brief Model the quantization error of Pluto's fractional-N RX RFPLL.
+ *
+ * The supported IIO frequency attribute accepts an integer-Hz RX LO request.
+ * Stock Pluto hardware normally derives the RX LO from a 40 MHz reference,
+ * first rounds the supported IIO request to an integer hertz. The AD936x Linux
+ * clock bridge then represents that rate as `freq >> 1` and reads it back as
+ * `freq << 1`, so an odd request is programmed as the preceding even hertz.
+ * With the normal 40 MHz Pluto reference, the stock driver doubles the RFPLL
+ * parent to 80 MHz. It then selects a power-of-two VCO divider for the 6..12
+ * GHz RFPLL range and rounds the fractional numerator to the AD936x
+ * `8,388,593` modulus. The driver owns the actual divider and calibration;
+ * this is intentionally a display/bin coordinate model, never a replacement
+ * for IIO LO control.
+ *
+ * @param requested_rx_hz Requested Pluto receive LO in hertz.
+ * @return Modeled actual-minus-requested receive-LO error in hertz, or zero
+ *         when the requested LO cannot be represented by this model.
+ */
+static double pluto_rfpll_modeled_error_hz(double requested_rx_hz)
+{
+    double divider = 1.0;
+    double iio_requested_rx_hz;
+    double driver_requested_rx_hz;
+    double vco_hz;
+    double ratio;
+    double integer_part;
+    double fractional_part;
+    double actual_vco_hz;
+
+    if (!isfinite(requested_rx_hz) || requested_rx_hz <= 0.0)
+        return 0.0;
+    iio_requested_rx_hz = (double)llround(requested_rx_hz);
+    driver_requested_rx_hz = 2.0 * floor(iio_requested_rx_hz * 0.5);
+    while (driver_requested_rx_hz * divider < PLUTO_RFPLL_VCO_MIN_HZ &&
+           divider < 64.0)
+        divider *= 2.0;
+    vco_hz = driver_requested_rx_hz * divider;
+    if (vco_hz < PLUTO_RFPLL_VCO_MIN_HZ ||
+        vco_hz > PLUTO_RFPLL_VCO_MAX_HZ)
+        return 0.0;
+
+    ratio = vco_hz / PLUTO_RFPLL_REFERENCE_HZ;
+    integer_part = floor(ratio);
+    fractional_part = round((ratio - integer_part) *
+                            PLUTO_RFPLL_FRACTIONAL_MODULUS);
+    if (fractional_part >= PLUTO_RFPLL_FRACTIONAL_MODULUS) {
+        integer_part += 1.0;
+        fractional_part = 0.0;
+    }
+    actual_vco_hz = PLUTO_RFPLL_REFERENCE_HZ *
+        (integer_part + fractional_part / PLUTO_RFPLL_FRACTIONAL_MODULUS);
+    /* Include the same integer-Hz IIO request rounding used by
+     * pluto_sdr_set_frequency(), then the fractional-N tuning-word error. */
+    return actual_vco_hz / divider - requested_rx_hz;
+}
+
+/**
+ * @brief Convert a receive-LO error into the corresponding air-frequency sign.
+ *
+ * A positive converter preserves the air-to-receiver slope. A negative
+ * converter may invert it on the lower side of its absolute-value mapping.
+ *
+ * @param air_hz Air/source frequency at the planned receiver center in hertz.
+ * @param receiver_error_hz Actual-minus-requested RX LO error in hertz.
+ * @return Actual-minus-requested air-frequency source-center error in hertz.
+ */
+static double air_error_from_receiver_error(double air_hz,
+                                            double receiver_error_hz)
+{
+    if (!isfinite(air_hz) || !isfinite(receiver_error_hz))
+        return 0.0;
+    if (g_converter_freq >= 0.0)
+        return receiver_error_hz;
+    return air_hz >= -g_converter_freq ? receiver_error_hz : -receiver_error_hz;
+}
+
+/**
+ * @brief Return the RFPLL-model source-coordinate correction for one air LO.
+ *
+ * @param air_hz Requested air/source center frequency in hertz.
+ * @return Signed modeled source-center correction in hertz; zero when disabled.
+ */
+static double modeled_frequency_correction_hz(double air_hz)
+{
+    double receiver_hz;
+
+    if (!g_fq_err_correction)
+        return 0.0;
+    receiver_hz = receiver_frequency_from_radio(air_hz);
+    return air_error_from_receiver_error(
+        air_hz, pluto_rfpll_modeled_error_hz(receiver_hz));
+}
+
+/**
+ * @brief Return the total display/bin correction for one air-frequency LO.
+ *
+ * The correction moves the assumed source interval onto the deterministic
+ * RFPLL model. It never changes the IIO tuning request, configured air range,
+ * converter math, or RFPLL/DDS hardware state.
+ *
+ * @param air_hz Requested air/source center frequency in hertz.
+ * @return Signed source-center correction in hertz.
+ */
+static double configured_frequency_correction_hz(double air_hz)
+{
+    return modeled_frequency_correction_hz(air_hz);
 }
 
 static int append_air_interval(freq_interval_t *intervals, int count,
@@ -3125,7 +3293,55 @@ static double current_second_if_hz(void)
     center = direct_sampling_enabled() ?
         direct_source_center_for_visible(start, end, plan.source_span) :
         single_source_center_for_visible(start, end, plan.source_span);
+    center += configured_frequency_correction_hz(center);
     return second_if_for_center(start, end, center);
+}
+
+/**
+ * @brief Return the current modeled source-center correction for diagnostics.
+ *
+ * @return Effective signed correction in hertz, or zero outside single mode.
+ */
+static double current_frequency_correction_hz(void)
+{
+    double start;
+    double end;
+    single_fft_plan_t plan;
+    double center;
+
+    if (planned_run_mode() != RUN_MODE_SINGLE || direct_sampling_enabled())
+        return 0.0;
+    raw_visible_band(&start, &end);
+    if (end <= start)
+        return 0.0;
+    plan = single_fft_plan_for_span(end - start);
+    center = single_source_center_for_visible(start, end, plan.source_span);
+    return configured_frequency_correction_hz(center);
+}
+
+/**
+ * @brief Return the RFPLL air-coordinate model even when correction is disabled.
+ *
+ * @return Signed modeled actual-minus-requested source-center error in hertz.
+ */
+static double current_frequency_model_error_hz(void)
+{
+    double start;
+    double end;
+    single_fft_plan_t plan;
+    double center;
+    double receiver_hz;
+
+    if (planned_run_mode() != RUN_MODE_SINGLE || direct_sampling_enabled())
+        return 0.0;
+    raw_visible_band(&start, &end);
+    if (end <= start)
+        return 0.0;
+    plan = single_fft_plan_for_span(end - start);
+    center = single_source_center_for_visible(start, end, plan.source_span);
+    receiver_hz = receiver_frequency_from_radio(center);
+    return air_error_from_receiver_error(
+        center, pluto_rfpll_modeled_error_hz(receiver_hz));
 }
 
 static int required_points_for_band(double start, double end)
@@ -3227,6 +3443,68 @@ static float fft_window_magnitude_scale(const float *window, int fft_size)
     if (window_sum <= 0.0)
         return 1.0f / (float)fft_size;
     return (float)(1.0 / window_sum);
+}
+
+/**
+ * @brief Calculate the equivalent noise bandwidth of the active FFT window.
+ *
+ * The returned ENBW is in hertz. Unlike coherent gain, ENBW describes the
+ * noise power admitted by one FFT bin: `Fs * sum(w^2) / sum(w)^2`.
+ *
+ * @param window Exact FFT window coefficients.
+ * @param fft_size Number of window/FFT samples.
+ * @param samplerate_hz Sample rate at the FFT input in samples/s.
+ * @return Positive equivalent noise bandwidth in hertz, or zero on invalid input.
+ */
+static double fft_window_equivalent_noise_bandwidth(const float *window,
+                                                    int fft_size,
+                                                    double samplerate_hz)
+{
+    double sum = 0.0;
+    double sum_sq = 0.0;
+
+    if (!window || fft_size <= 0 || !isfinite(samplerate_hz) ||
+        samplerate_hz <= 0.0)
+        return 0.0;
+    for (int i = 0; i < fft_size; i++) {
+        double w = window[i];
+        sum += w;
+        sum_sq += w * w;
+    }
+    if (sum <= 0.0 || sum_sq <= 0.0)
+        return 0.0;
+    return samplerate_hz * sum_sq / (sum * sum);
+}
+
+/**
+ * @brief Return the display-only white-noise normalization for one FFT plan.
+ *
+ * Coherent amplitude remains normalized by `1 / sum(window)`. A white-noise
+ * bin instead scales with `sqrt(ENBW)`, so its apparent waterfall brightness
+ * falls at fine resolution unless this presentation factor is applied.
+ *
+ * @param window Exact FFT window coefficients.
+ * @param fft_size FFT length in samples.
+ * @param samplerate_hz FFT input sample rate in samples/s.
+ * @return Dimensionless display factor relative to the common 90 kHz ENBW.
+ */
+static float waterfall_noise_presentation_scale(const float *window,
+                                                 int fft_size,
+                                                 double samplerate_hz)
+{
+    double enbw = fft_window_equivalent_noise_bandwidth(window, fft_size,
+                                                         samplerate_hz);
+    double scale;
+
+    if (enbw <= 0.0)
+        return 1.0f;
+    scale = sqrt(WATERFALL_NOISE_REFERENCE_ENBW_HZ / enbw);
+    if (!isfinite(scale) || scale <= 0.0)
+        return 1.0f;
+    /* Invalid plans must not turn into an unbounded display gain. */
+    if (scale > 1024.0)
+        scale = 1024.0;
+    return (float)scale;
 }
 
 /**
@@ -3729,6 +4007,27 @@ static double ctx_true_line_rate(const scan_ctx_t *ctx)
         ((double)ctx->fft_size * (double)ctx->decim_factor);
 }
 
+/**
+ * @brief Estimate the cadence at which this context publishes display rows.
+ *
+ * This includes CIC overlap used by the minimum-rate control and the final
+ * maximum-rate keep ratio, unlike `ctx_true_line_rate()`.
+ *
+ * @param ctx Active scan context.
+ * @return Estimated emitted waterfall rows per second.
+ */
+static double ctx_published_line_rate(const scan_ctx_t *ctx)
+{
+    double rate;
+
+    if (!ctx)
+        return 0.0;
+    rate = ctx->estimated_line_rate;
+    if (ctx->rate_keep_ratio > 0.0 && ctx->rate_keep_ratio < 1.0)
+        rate *= ctx->rate_keep_ratio;
+    return rate;
+}
+
 /** Return raw FFT-bin coverage of the current visible single-mode interval. */
 static double current_visible_raw_bins(void)
 {
@@ -4136,6 +4435,8 @@ static int scan_ctx_apply_fft_config(scan_ctx_t *ctx)
             ctx->direct_mix_inc += 2.0 * M_PI;
     }
     ctx->mag_scale = mag_scale;
+    ctx->waterfall_noise_scale = waterfall_noise_presentation_scale(
+        window, fft_size, fft_samplerate);
     ctx->window = window;
     ctx->fft_scratch = fft_scratch;
     ctx->decim_accum = decim_accum;
@@ -4606,11 +4907,104 @@ static void prepare_direct_sampling_samples(scan_ctx_t *ctx, float *buf, uint32_
 }
 
 /**
+ * @brief Return the median Rayleigh magnitude after selecting the peak of N bins.
+ *
+ * White complex Gaussian FFT bins have Rayleigh magnitudes. The exact median
+ * of the peak of `count` independent bins makes peak-per-pixel reduction less
+ * bright at low zoom without reducing a narrow signal's peak sensitivity.
+ *
+ * @param count Number of raw FFT bins reduced into one display pixel.
+ * @return Median magnitude in units of the underlying Rayleigh sigma.
+ */
+static double rayleigh_peak_median(int count)
+{
+    double root;
+    double tail;
+
+    if (count <= 1)
+        return sqrt(2.0 * log(2.0));
+    root = exp(log(0.5) / (double)count);
+    tail = 1.0 - root;
+    if (tail <= 0.0)
+        return sqrt(2.0 * log(2.0));
+    return sqrt(-2.0 * log(tail));
+}
+
+/**
+ * @brief Return a display-only normalization for peak-per-pixel aggregation.
+ *
+ * @param raw_bins Number of FFT/CIC bins contributing to one screen pixel.
+ * @return Dimensionless factor that keeps median white-noise brightness near
+ *         the one-bin reference while retaining peak aggregation for signals.
+ */
+static float peak_reducer_noise_scale(int raw_bins)
+{
+    double one = rayleigh_peak_median(1);
+    double many = rayleigh_peak_median(raw_bins);
+
+    if (many <= 0.0 || !isfinite(many))
+        return 1.0f;
+    return (float)(one / many);
+}
+
+/**
+ * @brief Estimate the strongest raw FFT/CIC bin coordinate before display reduction.
+ *
+ * The result is diagnostic metadata for live frequency validation. It uses a
+ * three-point log-magnitude parabola when both adjacent bins are available;
+ * the interpolation is bounded to one half-bin so noise or an edge maximum
+ * cannot invent a coordinate outside the selected source bin.
+ *
+ * @param values Raw magnitude bins in increasing source-frequency order.
+ * @param count Number of valid raw bins.
+ * @param start_hz Source-coordinate frequency at the lower bin edge, in hertz.
+ * @param span_hz Source-coordinate span represented by `values`, in hertz.
+ * @return Interpolated peak source coordinate in hertz, or zero when invalid.
+ */
+static double raw_peak_frequency_hz(const float *values, int count,
+                                    double start_hz, double span_hz)
+{
+    int peak_index = 0;
+    float peak = 0.0f;
+    double bin_fraction = 0.5;
+
+    if (!values || count <= 0 || !isfinite(start_hz) ||
+        !isfinite(span_hz) || span_hz <= 0.0)
+        return 0.0;
+
+    for (int i = 0; i < count; i++) {
+        if (isfinite(values[i]) && values[i] > peak) {
+            peak = values[i];
+            peak_index = i;
+        }
+    }
+    if (!(peak > 0.0f))
+        return 0.0;
+
+    if (peak_index > 0 && peak_index + 1 < count &&
+        values[peak_index - 1] > 0.0f && values[peak_index + 1] > 0.0f) {
+        double left = log((double)values[peak_index - 1]);
+        double center = log((double)values[peak_index]);
+        double right = log((double)values[peak_index + 1]);
+        double denominator = left - 2.0 * center + right;
+        double offset;
+
+        if (isfinite(denominator) && fabs(denominator) > 1.0e-12) {
+            offset = 0.5 * (left - right) / denominator;
+            if (isfinite(offset))
+                bin_fraction += fmax(-0.5, fmin(0.5, offset));
+        }
+    }
+    return start_hz + ((double)peak_index + bin_fraction) *
+        span_hz / (double)count;
+}
+
+/**
  * @brief Convert normalized FFT magnitude into the 8-bit waterfall transport.
  *
  * Input magnitudes are already corrected for Hann coherent gain and optional
- * CIC DC/droop effects. This function only applies the common dB display
- * window so FFT size and CIC factor do not shift signal amplitude.
+ * CIC DC/droop effects. `publish_scan_line()` additionally applies the
+ * documented display-only noise-density factor before this common dB window.
  *
  * @param mag Linear normalized magnitude.
  * @return Packed unsigned waterfall level.
@@ -4689,6 +5083,12 @@ static void publish_scan_line(scan_ctx_t *ctx)
     int prefix_len;
     size_t packed_len;
     size_t json_size;
+    double raw_peak_hz;
+    long long now;
+    long long live_capture_age_ms = 0;
+    long long live_first_input_ms = 0;
+    long long live_first_fft_ms = 0;
+    long long live_first_publish_ms = 0;
     const char *prefix_fmt =
         "event: line\ndata: {\"view\":%u,\"n\":%d,\"b\":%d,"
         "\"mode\":\"%s\","
@@ -4696,6 +5096,11 @@ static void publish_scan_line(scan_ctx_t *ctx)
         "\"full_f0\":%.0f,\"full_f1\":%.0f,"
         "\"visible_start_hz\":%.0f,\"visible_end_hz\":%.0f,"
         "\"second_if_hz\":%.0f,\"zero_if_guard_hz\":%.0f,"
+        "\"fq_err_correction_hz\":%.9f,"
+        "\"raw_peak_hz\":%.9f,"
+        "\"live_capture_age_ms\":%lld,"
+        "\"live_first_input_ms\":%lld,\"live_first_fft_ms\":%lld,"
+        "\"live_first_publish_ms\":%lld,"
         "\"display_bins\":%d,\"source_bins\":%d,\"published_bins\":%d,"
         "\"raw_source_bins\":%d,"
         "\"effective_fft_size\":%d,"
@@ -4703,6 +5108,8 @@ static void publish_scan_line(scan_ctx_t *ctx)
         "\"minimum_rate_overlap\":%d,\"minimum_rate_limited\":%d,"
         "\"minimum_rate_achieved\":%d,"
         "\"true_line_rate\":%.3f,"
+        "\"preview_interval_ms\":%.3f,"
+        "\"waterfall_noise_scale\":%.6f,"
         "\"visible_raw_bins\":%.3f,\"visible_bins_per_pixel\":%.6f,"
         "\"preview\":%d,\"preview_age_ms\":%lld,"
         "\"preview_sequence\":%d,\"preview_count\":%d,"
@@ -4710,6 +5117,24 @@ static void publish_scan_line(scan_ctx_t *ctx)
 
     if (source_bins <= 0 || display_bins <= 0 || source_span <= 0.0 || visible_span <= 0.0)
         return;
+
+    now = now_msec();
+    if (!ctx->preview_mode && ctx->live_first_publish_msec == 0)
+        ctx->live_first_publish_msec = now;
+    if (ctx->live_capture_started_msec > 0) {
+        live_capture_age_ms = now - ctx->live_capture_started_msec;
+        if (ctx->live_first_input_msec > 0)
+            live_first_input_ms = ctx->live_first_input_msec -
+                ctx->live_capture_started_msec;
+        if (ctx->live_first_fft_msec > 0)
+            live_first_fft_ms = ctx->live_first_fft_msec -
+                ctx->live_capture_started_msec;
+        if (ctx->live_first_publish_msec > 0)
+            live_first_publish_ms = ctx->live_first_publish_msec -
+                ctx->live_capture_started_msec;
+    }
+    raw_peak_hz = raw_peak_frequency_hz(ctx->line_buf, source_bins,
+                                        ctx->scan_start, source_span);
 
     line_packed = malloc((size_t)display_bins);
     if (!line_packed)
@@ -4731,7 +5156,9 @@ static void publish_scan_line(scan_ctx_t *ctx)
             if (ctx->line_buf[i] > peak)
                 peak = ctx->line_buf[i];
         }
-        line_packed[x] = magnitude_to_u8(peak);
+        line_packed[x] = magnitude_to_u8(
+            peak * ctx->waterfall_noise_scale *
+            peak_reducer_noise_scale(last - first));
     }
 
     prefix_len = snprintf(NULL, 0, prefix_fmt,
@@ -4741,11 +5168,15 @@ static void publish_scan_line(scan_ctx_t *ctx)
         ctx->configured_start, ctx->configured_end,
         ctx->visible_start, ctx->visible_end,
         ctx->second_if_hz, ctx->zero_if_guard_hz,
+        ctx->frequency_correction_hz,
+        raw_peak_hz, live_capture_age_ms, live_first_input_ms,
+        live_first_fft_ms, live_first_publish_ms,
         display_bins, display_bins, display_bins, source_bins, ctx->fft_size,
         ctx->decim_factor, ctx->decim_hop, ctx->overlap_factor,
         ctx->minimum_rate_limited, ctx->minimum_rate_limited,
         ctx->minimum_rate_achieved,
         ctx_true_line_rate(ctx),
+        ctx->preview_interval_ms, ctx->waterfall_noise_scale,
         ctx->visible_raw_bins, ctx->visible_bins_per_pixel,
         ctx->preview_mode, ctx->preview_age_ms,
         ctx->preview_sequence, ctx->preview_count);
@@ -4769,11 +5200,15 @@ static void publish_scan_line(scan_ctx_t *ctx)
         ctx->configured_start, ctx->configured_end,
         ctx->visible_start, ctx->visible_end,
         ctx->second_if_hz, ctx->zero_if_guard_hz,
+        ctx->frequency_correction_hz,
+        raw_peak_hz, live_capture_age_ms, live_first_input_ms,
+        live_first_fft_ms, live_first_publish_ms,
         display_bins, display_bins, display_bins, source_bins, ctx->fft_size,
         ctx->decim_factor, ctx->decim_hop, ctx->overlap_factor,
         ctx->minimum_rate_limited, ctx->minimum_rate_limited,
         ctx->minimum_rate_achieved,
         ctx_true_line_rate(ctx),
+        ctx->preview_interval_ms, ctx->waterfall_noise_scale,
         ctx->visible_raw_bins, ctx->visible_bins_per_pixel,
         ctx->preview_mode, ctx->preview_age_ms,
         ctx->preview_sequence, ctx->preview_count);
@@ -4866,6 +5301,8 @@ static void complete_processed_channel(scan_ctx_t *ctx, int channel)
     if (!ctx || channel < 0 || channel >= ctx->total_steps)
         return;
     preview_completion = ctx->preview_mode;
+    if (!preview_completion && ctx->live_first_fft_msec == 0)
+        ctx->live_first_fft_msec = now_msec();
     if (!should_publish_processed_line(ctx)) {
         if (preview_completion)
             ctx->preview_sequence++;
@@ -5284,6 +5721,9 @@ static void scan_callback(float *buf, uint32_t buf_len, uint32_t refill_flags,
     }
 
     ctx->last_callback_msec = now_msec();
+    if (ctx->live_capture_started_msec > 0 &&
+        ctx->live_first_input_msec == 0)
+        ctx->live_first_input_msec = ctx->last_callback_msec;
     channel = ctx->single_mode ? 0 : pluto_sdr_get_scan_index(dev);
     if (channel < 0) {
         ctx->tuning_skipped++;
@@ -5473,6 +5913,9 @@ static int run_pseudo_random_sample_source(scan_ctx_t *ctx, uint32_t async_len)
         ctx->capture_sample_next = sample_index_end;
 #endif
         ctx->last_callback_msec = now_msec();
+        if (ctx->live_capture_started_msec > 0 &&
+            ctx->live_first_input_msec == 0)
+            ctx->live_first_input_msec = ctx->last_callback_msec;
 
         recent_sample_cache_append(ctx, buf, async_len, 0);
 
@@ -5549,17 +5992,15 @@ static void *scan_thread_func(void *arg)
     uint32_t line_sample_count;
     uint32_t preview_sample_count = 0;
     int preview_line_count = 0;
-    int preview_max_lines_override = 0;
     unsigned int kernel_buffers;
     single_fft_plan_t single_plan = {0};
     float *preview_samples = NULL;
     long long preview_age_ms = 0;
+    double preview_first_line_ms = 0.0;
+    double frequency_correction_hz = 0.0;
 
     mode = planned_run_mode();
     g_active_mode = mode;
-    preview_max_lines_override = g_next_preview_max_lines;
-    g_next_preview_max_lines = 0;
-
     if (mode != RUN_MODE_SINGLE)
         recent_sample_cache_invalidate();
 
@@ -5579,10 +6020,14 @@ static void *scan_thread_func(void *arg)
                                              single_plan.source_span) :
             single_source_center_for_visible(visible_start, visible_end,
                                              single_plan.source_span);
+        frequency_correction_hz = direct_sampling_enabled() ? 0.0 :
+            configured_frequency_correction_hz(center);
         total_steps = 1;
         step = single_plan.source_span;
-        scan_start = center - single_plan.source_span * 0.5;
-        scan_end = center + single_plan.source_span * 0.5;
+        scan_start = center + frequency_correction_hz -
+            single_plan.source_span * 0.5;
+        scan_end = center + frequency_correction_hz +
+            single_plan.source_span * 0.5;
         device_center = direct_sampling_enabled() ? 0.0 : receiver_frequency_from_radio(center);
         if (!direct_sampling_enabled() && !receiver_frequency_valid(device_center)) {
             fprintf(stderr, "[SDR] Converter frequency puts receiver center outside %.0f - %.0f Hz\n",
@@ -5625,6 +6070,7 @@ static void *scan_thread_func(void *arg)
     ctx.scan_end = ctx.single_mode ? scan_end :
         build_scan_effective_end_for_band(scan_start, scan_end, total_steps, step);
     ctx.center_freq = (scan_start + scan_end) * 0.5;
+    ctx.frequency_correction_hz = frequency_correction_hz;
     ctx.zero_if_guard_hz = ctx.single_mode ? single_plan.zero_if_guard_hz : 0.0;
     ctx.second_if_hz = ctx.single_mode ?
         second_if_for_center(ctx.visible_start, ctx.visible_end, ctx.center_freq) : 0.0;
@@ -5658,13 +6104,28 @@ static void *scan_thread_func(void *arg)
                                                         ctx.rate_limit_lps,
                                                         ctx.single_mode);
     ctx.rate_keep_credit = 1.0;
+    {
+        double published_rate = ctx_published_line_rate(&ctx);
+        ctx.preview_interval_ms = published_rate > 0.0 ?
+            1000.0 / published_rate : 0.0;
+        if (ctx.preview_interval_ms > 0.0 && ctx.preview_interval_ms < 10.0)
+            ctx.preview_interval_ms = 10.0;
+    }
 
     if (ctx.single_mode && !ctx.direct_sampling) {
-        int max_preview_lines = ctx.decim_factor > 1 ?
-            (int)CACHED_PREVIEW_MAX_LINES : 1;
-        if (preview_max_lines_override > 0 &&
-            max_preview_lines > preview_max_lines_override)
-            max_preview_lines = preview_max_lines_override;
+        int max_preview_lines = 1;
+        if (ctx.decim_factor > 1) {
+            preview_first_line_ms = estimated_first_line_ms_for_plan(
+                ctx.raw_samplerate, ctx.fft_size, line_sample_count,
+                ctx.total_steps, ctx.decim_factor);
+            if (ctx.preview_interval_ms > 0.0)
+                max_preview_lines = (int)ceil(preview_first_line_ms /
+                                              ctx.preview_interval_ms) + 1;
+            if (max_preview_lines < 1)
+                max_preview_lines = 1;
+            if (max_preview_lines > (int)CACHED_PREVIEW_MAX_LINES)
+                max_preview_lines = (int)CACHED_PREVIEW_MAX_LINES;
+        }
 
         for (int lines = max_preview_lines; lines >= 1; lines--) {
             uint64_t needed_decimated = (uint64_t)ctx.fft_size;
@@ -5688,12 +6149,29 @@ static void *scan_thread_func(void *arg)
                 break;
             }
         }
+        if (!preview_samples && ctx.decim_factor > 1) {
+            fprintf(stderr,
+                    "[SDR] Cached preview unavailable for view %u; live CIC fill will be used\n",
+                    ctx.view_id);
+        }
         recent_sample_cache_begin(
             ctx.center_freq,
             ctx.center_freq - single_plan.hardware_rf_bandwidth * 0.5,
             ctx.center_freq + single_plan.hardware_rf_bandwidth * 0.5,
             ctx.raw_samplerate, single_plan.hardware_rf_bandwidth);
         if (preview_samples) {
+            /* Distribute every cached row across the predicted fresh live
+             * fill. Keeping the old raw-line cadence here can show one preview
+             * and then leave a visible pause, especially at x64 CIC where the
+             * cache contains several overlapping target frames. This affects
+             * display timing only; each preview remains one independent FFT. */
+            if (preview_line_count > 0 && preview_first_line_ms > 0.0) {
+                double coverage_interval = preview_first_line_ms /
+                    (double)preview_line_count;
+                ctx.preview_interval_ms = coverage_interval;
+                if (ctx.preview_interval_ms < 10.0)
+                    ctx.preview_interval_ms = 10.0;
+            }
             ctx.preview_mode = 1;
             ctx.preview_age_ms = preview_age_ms;
             ctx.preview_sequence = 1;
@@ -5739,6 +6217,8 @@ static void *scan_thread_func(void *arg)
     if (ret != PLUTO_ERR_OK) { fprintf(stderr, "[SDR] set_samplerate failed: %d\n", ret); device_error = 1; }
     ret = pluto_sdr_set_bandwidth(g_dev, ctx.single_mode ? single_plan.hardware_rf_bandwidth : g_rf_bandwidth);
     if (ret != PLUTO_ERR_OK) { fprintf(stderr, "[SDR] set_rf_bandwidth failed: %d\n", ret); device_error = 1; }
+    ret = pluto_sdr_set_rf_port(g_dev, g_rf_port);
+    if (ret != PLUTO_ERR_OK) { fprintf(stderr, "[SDR] set_rf_port_select failed: %d\n", ret); device_error = 1; }
     ret = pluto_sdr_set_gain_mode(g_dev, g_gain_mode);
     if (ret != PLUTO_ERR_OK) { fprintf(stderr, "[SDR] set_gain_mode failed: %d\n", ret); device_error = 1; }
     if (strcmp(g_gain_mode, "manual") == 0) {
@@ -5808,6 +6288,7 @@ static void *scan_thread_func(void *arg)
     }
 
     if (g_scanning) {
+        ctx.live_capture_started_msec = now_msec();
         ctx.last_callback_msec = now_msec();
         ctx.watchdog_stop = 0;
         ctx.watchdog_triggered = 0;
@@ -6637,6 +7118,19 @@ static int validate_pluto_settings(double samplerate, double rf_bandwidth, const
     return 0;
 }
 
+/**
+ * @brief Check whether a frontend-selectable AD936x RX input name is supported.
+ *
+ * @param port Requested `rf_port_select` value.
+ * @return Nonzero for a supported balanced input, otherwise zero.
+ */
+static int rf_port_is_supported(const char *port)
+{
+    return port && (strcmp(port, "A_BALANCED") == 0 ||
+                    strcmp(port, "B_BALANCED") == 0 ||
+                    strcmp(port, "C_BALANCED") == 0);
+}
+
 static int validate_visible_range(double start, double end,
                                   char *err, size_t err_len)
 {
@@ -6850,6 +7344,7 @@ static void handle_request(int client_fd, const char *req, size_t req_len,
                                                  plan.source_span) :
                 single_source_center_for_visible(scan_start, scan_end,
                                                  plan.source_span);
+            center += current_frequency_correction_hz();
             step = plan.source_span;
             scan_start = center - plan.source_span * 0.5;
             scan_end = center + plan.source_span * 0.5;
@@ -6888,6 +7383,8 @@ static void handle_request(int client_fd, const char *req, size_t req_len,
         double active_bw_ratio = current_active_bw_ratio();
         double second_if_hz = current_second_if_hz();
         double zero_if_guard_hz = current_zero_if_guard_hz();
+        double fq_err_model_hz = current_frequency_model_error_hz();
+        double fq_err_effective_hz = current_frequency_correction_hz();
         format_sample_rates_json(sample_rates, sizeof(sample_rates));
 
         int n = snprintf(body, sizeof(body),
@@ -6904,6 +7401,8 @@ static void handle_request(int client_fd, const char *req, size_t req_len,
             "\"visible_start_hz\":%.0f,\"visible_end_hz\":%.0f,"
             "\"scan_start_hz\":%.0f,\"scan_end_hz\":%.0f,"
             "\"second_if_hz\":%.0f,\"zero_if_guard_hz\":%.0f,"
+            "\"fq_err_correction\":%u,\"fq_err_model_hz\":%.9f,"
+            "\"fq_err_effective_hz\":%.9f,"
             "\"samplerate\":%.0f,\"rf_bandwidth\":%.0f,\"bw_ratio\":%.2f,"
             "\"hardware_samplerate\":%.0f,\"hardware_rf_bandwidth\":%.0f,"
             "\"hardware_bw_ratio\":%.2f,"
@@ -6925,7 +7424,7 @@ static void handle_request(int client_fd, const char *req, size_t req_len,
             "\"view_id\":%u,\"fft_size\":%d,\"effective_fft_size\":%d,"
             "\"decim_factor\":%d,\"decim_hop\":%d,\"overlap_factor\":%.3f,"
             "\"effective_input_samples\":%u,"
-            "\"gain_mode\":\"%s\",\"hardwaregain_db\":%.1f,"
+            "\"gain_mode\":\"%s\",\"hardwaregain_db\":%.1f,\"rf_port\":\"%s\","
             "\"rssi_db\":%.2f,\"input_peak\":%.0f,\"clipped_samples\":%llu,"
             "\"goto_freq_hz\":%.0f,\"goto_target_zoom\":%.6g,"
             "\"goto_animate\":%u,"
@@ -6943,6 +7442,7 @@ static void handle_request(int client_fd, const char *req, size_t req_len,
             scan_start,
             scan_end,
             second_if_hz, zero_if_guard_hz,
+            g_fq_err_correction, fq_err_model_hz, fq_err_effective_hz,
             active_samplerate, active_rf_bandwidth, active_bw_ratio,
             active_samplerate, active_rf_bandwidth, active_bw_ratio,
             active_samplerate, active_rf_bandwidth, active_bw_ratio,
@@ -6958,7 +7458,8 @@ static void handle_request(int client_fd, const char *req, size_t req_len,
             bins_per_step, line_bins, raw_line_bins, display_bins,
             g_view_id, current_fft_size(), effective_fft,
             decim_factor, decim_hop, overlap_factor, line_sample_count,
-            g_gain_mode, g_hardwaregain_db, g_last_rssi_db, g_last_input_peak,
+            g_gain_mode, g_hardwaregain_db, g_rf_port,
+            g_last_rssi_db, g_last_input_peak,
             (unsigned long long)g_last_clipped_samples,
             g_goto_freq, g_goto_target_zoom, g_goto_animate, g_goto_delay_s,
             sample_rates);
@@ -7097,6 +7598,7 @@ static void handle_request(int client_fd, const char *req, size_t req_len,
         double hardwaregain_tmp = g_hardwaregain_db;
         char gain_mode_tmp[32];
         char rf_port_tmp[32];
+        char string_tmp[32];
         double visible_start_tmp = 0.0;
         double visible_end_tmp = 0.0;
         uint32_t fft_tmp = (uint32_t)current_fft_size();
@@ -7132,10 +7634,14 @@ static void handle_request(int client_fd, const char *req, size_t req_len,
         samplerate_tmp = PLUTO_AUTO_SAMPLE_RATE_HZ;
         rf_bandwidth_tmp = PLUTO_AUTO_RF_BANDWIDTH_HZ;
         bw_ratio_tmp = PLUTO_AUTO_BW_RATIO;
-        if (json_get_string(&json, "gain_mode", gain_mode_tmp, sizeof(gain_mode_tmp), &present) != 0) goto start_bad_json;
+        if (json_get_string(&json, "gain_mode", string_tmp, sizeof(string_tmp), &present) != 0) goto start_bad_json;
+        if (present)
+            copy_cstr(gain_mode_tmp, sizeof(gain_mode_tmp), string_tmp);
         if (json_get_double(&json, "hardwaregain_db", &number_tmp, &present) != 0) goto start_bad_json;
         if (present) hardwaregain_tmp = number_tmp;
-        if (json_get_string(&json, "rf_port", rf_port_tmp, sizeof(rf_port_tmp), &present) != 0) goto start_bad_json;
+        if (json_get_string(&json, "rf_port", string_tmp, sizeof(string_tmp), &present) != 0) goto start_bad_json;
+        if (present)
+            copy_cstr(rf_port_tmp, sizeof(rf_port_tmp), string_tmp);
         if (json_get_uint(&json, "fft_size", &uint_tmp, &present) != 0) goto start_bad_json;
         if (present) fft_tmp = uint_tmp;
         if (json_get_uint(&json, "display_bins", &uint_tmp, &present) != 0) goto start_bad_json;
@@ -7177,6 +7683,12 @@ static void handle_request(int client_fd, const char *req, size_t req_len,
                                     gain_mode_tmp, hardwaregain_tmp,
                                     err, sizeof(err)) != 0) {
             send_json_error(client_fd, 400, "Bad Request", cors, err);
+            close(client_fd);
+            return;
+        }
+        if (!rf_port_is_supported(rf_port_tmp)) {
+            send_json_error(client_fd, 400, "Bad Request", cors,
+                            "rf_port must be A_BALANCED, B_BALANCED, or C_BALANCED");
             close(client_fd);
             return;
         }
@@ -7298,7 +7810,7 @@ static void handle_request(int client_fd, const char *req, size_t req_len,
             "\"hardware_bw_ratio\":%.2f,"
             "\"active_samplerate\":%.0f,\"active_rf_bandwidth\":%.0f,"
             "\"active_bw_ratio\":%.3f,"
-            "\"gain_mode\":\"%s\",\"hardwaregain_db\":%.1f,"
+            "\"gain_mode\":\"%s\",\"hardwaregain_db\":%.1f,\"rf_port\":\"%s\","
             "\"rssi_db\":%.2f,\"input_peak\":%.0f,\"clipped_samples\":%llu,"
             "\"sample_rates\":%s}",
             status,
@@ -7321,7 +7833,7 @@ static void handle_request(int client_fd, const char *req, size_t req_len,
             active_bw_ratio,
             active_samplerate, active_rf_bandwidth, active_bw_ratio,
             active_samplerate, active_rf_bandwidth, active_bw_ratio,
-            g_gain_mode, g_hardwaregain_db,
+            g_gain_mode, g_hardwaregain_db, g_rf_port,
             g_last_rssi_db, g_last_input_peak,
             (unsigned long long)g_last_clipped_samples,
             sample_rates);
@@ -7640,7 +8152,6 @@ start_bad_json:
                 (min_changed && planned_run_mode() == RUN_MODE_SINGLE);
             if (g_scanning && restart_needed) {
                 g_view_id++;
-                g_next_preview_max_lines = 1;
                 ret = start_scan();
             }
         }
@@ -7730,7 +8241,6 @@ start_bad_json:
         save_config();
         if (g_scanning && planned_run_mode() == RUN_MODE_SINGLE) {
             g_view_id++;
-            g_next_preview_max_lines = 1;
             ret = start_scan();
         }
 

@@ -78,7 +78,7 @@ BUILD_ROOT ?= $(RELEASE_DIR)/build-$(RELEASE_TARGET)
 OUT_DIR ?= $(RELEASE_DIR)/out
 RELEASE_BINARY ?= $(RELEASE_DIR)/bin/$(TARGET)
 
-.PHONY: all help build-info clean distclean run check smoke-test cic-synthetic-test
+.PHONY: all help build-info clean distclean run check ci-check smoke-test cic-synthetic-test
 .PHONY: install-deps-help release-deps release-binary package-tar package-zip
 .PHONY: package-appimage package-dmg release-local
 
@@ -107,6 +107,7 @@ help:
 	@echo "  make all              Same as make"
 	@echo "  make run              Run with default PLUTO_URI=ip:192.168.2.1"
 	@echo "  make check            Build and run local validation checks"
+	@echo "  make ci-check         Run GitHub-safe checks without developer test apps"
 	@echo "  make clean            Remove local build outputs"
 	@echo "  make cic-synthetic-test"
 	@echo ""
@@ -170,7 +171,14 @@ check: all $(TEST_TARGET)
 	tools/cic_stability_check.py --quiet
 	tools/cic_continuity_check.py --quiet
 	PLUTO_CIC_TEST_BINARY="$(TEST_TARGET)" tools/cic_synthetic_signal_check.py --quiet
+	PLUTO_CIC_TEST_BINARY="$(TEST_TARGET)" tools/frequency_coordinate_check.py >/dev/null
 	@echo "Build checks passed."
+
+ci-check: all
+	perl -0777 -ne 'print $$1 if /<script>(.*?)<\/script>/s' index.html | node --check
+	tools/cic_stability_check.py --quiet
+	tools/cic_continuity_check.py --quiet
+	@echo "CI checks passed."
 
 cic-synthetic-test: $(TEST_TARGET)
 	PLUTO_CIC_TEST_BINARY="$(TEST_TARGET)" tools/cic_synthetic_signal_check.py

@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
 import json
+import os
 import sys
 import time
 import urllib.request
 
-BASE = "http://localhost:8080"
+BASE = os.environ.get("BASE_URL", "http://localhost:8080")
 
 
 def post_json(path, payload):

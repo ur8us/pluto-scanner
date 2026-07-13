@@ -91,7 +91,11 @@ Agents must preserve these two Pluto operating modes. Do not port Fobos assumpti
      after a resolution change before a new waterfall line appears. Preview
      processing reuses compatible memory-held samples for the first rows, must
      use the same CIC/Hann/FFT path, must be marked in SSE metadata, and must
-     reset all CIC state before live acquisition resumes.
+     reset all CIC state before live acquisition resumes. The backend may send
+     multiple preview rows immediately, but the frontend must release them at
+     `preview_interval_ms = first_line_ms / preview_count` while the independent
+     live stream fills; never retain the old raw-line cadence here or join
+     pre-restart cache samples to post-restart live samples in an FFT.
 
 ## FFT, CIC, and RF Planning Rules
 
@@ -102,6 +106,17 @@ screen pixel. Keep raw FFT/CIC bin counts in metadata as `raw_source_bins` or
 frontend data model. Current SSE rows compress the display bytes as
 `encoding:"u8b64"` with `db` containing base64 packed `uint8` values; keep
 frontend compatibility with legacy `d:[...]` rows when editing this path.
+
+Browser page zoom and responsive layout are presentation changes, not backend
+view changes. Resize local canvas backing stores through `ResizeObserver` and
+an animation-frame coalescer; keep the active SSE row width valid and resample
+it locally. Do not restart the SDR only because CSS geometry or device-pixel
+ratio changed. The frequency scale, markers, rulers, and reducer use the same
+binary64 hertz coordinate transform. Status formatting is display-only. The
+blue scale-spacing label belongs between the second and third major ticks. It
+uses the longest of `<- 10Hz ->`, `<-10Hz->`, `<10Hz>`, or `10Hz` that fits in
+the measured rendered-label gap; it is not a zero-IF, hop, or physical
+passband gap.
 
 RF bandwidth must be strictly lower than sample rate for all Pluto profiles:
 
@@ -153,8 +168,9 @@ Frontend RF display:
 
 ## Output Level Normalization
 
-The scanner must show the same signal at the same level when FFT size or CIC
-decimation changes.
+The scanner must preserve the same coherent signal calibration when FFT size or
+CIC decimation changes. Waterfall white-noise presentation is separately
+normalized for resolution bandwidth.
 
 - FFT windowing uses a Hann window.
 - Magnitudes are normalized by coherent window gain: `1 / sum(window)`.
@@ -168,6 +184,14 @@ decimation changes.
   (decim * sin(pi * f / raw_sample_rate))) ^ 3`.
 - Clamp the inverse CIC compensation to `8x` and floor the modeled CIC gain at
   `0.05` so edge bins cannot explode if the response approaches a null.
+- Waterfall byte presentation additionally normalizes white-noise density with
+  `sqrt(90000 / hann_enbw_hz)`, where
+  `hann_enbw_hz = fft_samplerate * sum(window^2) / sum(window)^2`. It is
+  display-only: do not feed it into CIC state or coherent FFT amplitude.
+- Peak-per-pixel reduction uses a Rayleigh median correction for the actual
+  raw-bin count in a pixel. Preserve peak signal sensitivity while preventing
+  low-zoom multi-bin reduction from making the noise background artificially
+  brighter. See `SPECTRUM_CALC.MD` for the exact formula and the `1024x` cap.
 - Validate changes with `tools/fft_level_normalization_check.py`.
 
 ## Runtime Stability Expectations
@@ -251,7 +275,7 @@ Preserve:
 - Markers and band overlays.
 - Browser heartbeat showing disconnected/idle/scanning.
 
-The Pluto UI exposes sample rate, RF bandwidth, passband usage, gain mode, and hardware gain. Preserve the visible `Shown: start - end (range) MHz` status-line text. Do not re-add the old separate Range badge, the `FW:` indicator, RSSI/Peak readout, frontend Device/serial indicator, or passive `Pluto Input` group. Backend logs should print Pluto software version and serial once the hardware opens.
+The Pluto UI exposes sample rate, RF bandwidth, passband usage, gain mode, and hardware gain. Preserve the visible `Shown: start - end MHz, Span: range MHz` status-line text. Do not re-add the old separate Range badge, the `FW:` indicator, RSSI/Peak readout, frontend Device/serial indicator, or passive `Pluto Input` group. Backend logs should print Pluto software version and serial once the hardware opens.
 
 ## Documentation Standard
 
@@ -287,6 +311,24 @@ opening `SPECTRUM_CALC.MD`.
 ## Pluto Coefficient Planning
 
 Agents changing scan/hop or single-frequency behavior must preserve these coefficient rules.
+
+### RFPLL Coordinate Model
+
+`fq_err_correction=1` is a local configuration enable flag for the conservative
+40 MHz-reference AD936x RFPLL rounding model. In single-frequency mode,
+first apply the same `llround()` integer-hertz RX-LO request written to IIO,
+then the AD936x `freq >> 1` / `freq << 1` clock bridge (odd requests become
+the preceding even hertz). Calculate the nearest fractional-N LO using modulus
+`8388593` against the stock driver's doubled `80 MHz` RFPLL parent for a
+`40 MHz` Pluto reference input, and a power-of-two VCO divider placing the VCO
+in `6..12 GHz`. Calculate
+`actual_lo - unrounded_requested_lo`, convert that signed error through the
+active converter branch, and add it to the *source-bin coordinate* only. Do
+not change the IIO LO write, requested air frequencies, or converter setting.
+Do not add a fixed local calibration residual. Keep `fq_err_model_hz` and
+`fq_err_effective_hz` in `/api/status` and total correction plus `raw_peak_hz`
+in row diagnostic metadata. This is a coordinate model, not a retune; it does
+not correct sample-clock or converter error outside the measured installation.
 
 Scan/hop mode is used when the visible span needs more than one Pluto passband:
 
@@ -377,6 +419,10 @@ Do not auto-start a saved scan when the backend is idle. The page may restore sa
 
 ## Tests
 
+GitHub Actions must use `make ci-check` for routine CI. `pluto-scanner-cic-test`
+is a developer-only executable and must not be built or run by GitHub CI unless
+that policy is explicitly changed.
+
 Before handing changes back:
 
 ```sh
@@ -385,6 +431,7 @@ tools/http_smoke_test.sh
 tools/cic_stability_check.py
 tools/cic_continuity_check.py
 tools/cic_synthetic_signal_check.py
+tools/frequency_coordinate_check.py
 tools/headless_tester.py
 tools/ui_browser_test.py
 tools/phase3_browser_stress.py

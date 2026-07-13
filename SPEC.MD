@@ -124,6 +124,8 @@ the waterfall.
 | `SINGLE_DECIM_ASYNC_MIN_LEN` | 8192 | Smallest raw line advance targeted for CIC refills |
 | `SINGLE_DECIM_ASYNC_MAX_LEN` | 262144 | Largest CIC async refill before capping queue memory |
 | `SINGLE_ZERO_IF_GUARD_HZ` | 50000 | Zero-IF clearance |
+| `PLUTO_RFPLL_REFERENCE_HZ` | 40 MHz | Reference used by coordinate correction model |
+| `PLUTO_RFPLL_FRACTIONAL_MODULUS` | 8388593 | AD936x fractional-N model modulus |
 | `PLUTO_EST_SINGLE_STREAM_SPS` | 2.1e6 | Empirical host throughput (raw) |
 | `PLUTO_EST_CIC_STREAM_SPS` | 1.85e6 | CIC-path throughput |
 | `PLUTO_RATE_LIMIT_GUARD` | 0.85 | Max-rate throttle guard |
@@ -219,6 +221,25 @@ with HTTP `400`, and it must do so before mutating `g_freq_start`/`g_freq_end`.
 It must not silently move the user's configured air band to a nearby valid
 receiver interval.
 
+### 3.4.2 RFPLL coordinate correction
+
+`fq_err_correction = 1` is a local configuration flag enabled by default. In
+single-frequency mode, the backend applies the exact integer-hertz `llround()`
+used for the IIO RX-LO write, then the AD936x driver's even-hertz clock bridge
+(`freq >> 1`, followed by `freq << 1`), and finally models fractional-N RFPLL
+quantization from the stock driver's doubled 80 MHz RFPLL parent for a 40 MHz
+Pluto reference input, and the power-of-two divider that places the RF VCO in
+the 6–12 GHz range. It converts the signed
+actual-minus-requested receive-LO error through the active converter branch and
+shifts the *source-bin coordinate* by that per-tune amount. The user-visible air range and IIO
+`altvoltage0/frequency` request do not change. No fixed local calibration
+constant is supported. `GET /api/status` exposes `fq_err_correction`,
+`fq_err_model_hz`, and `fq_err_effective_hz`; SSE row metadata exposes the
+applied `fq_err_correction_hz` and interpolated `raw_peak_hz` for live
+verification. The RFPLL model is a diagnostic estimate; validate hardware
+alignment against a known reference before treating a remaining offset as
+software error.
+
 ### 3.5 Acquisition loop details
 
 For scan mode the per-step acquisition follows
@@ -258,12 +279,14 @@ hidden sample discontinuity.
 For compatible single-frequency view changes, the backend keeps a bounded
 recent raw-sample cache. If the new visible interval, sample rate, RF bandwidth,
 and source coverage match the cached stream, the backend snapshots enough past
-samples for one to four complete FFT windows, digitally rotates them if the
+samples for the predicted live-fill interval, digitally rotates them if the
 source center moved, and runs them through the normal CIC/Hann/FFT path as
 `preview=1` rows. Very fine frequency resolution can require many seconds of
 samples per FFT, so this avoids the traditional multi-second blank delay after
 a resolution change. Preview samples are never concatenated with new live
-samples; CIC state is reset before live acquisition resumes.
+samples; CIC state is reset before live acquisition resumes. The number of
+preview rows is calculated from the fresh-frame latency and the planned output
+cadence, subject to the bounded compatible cache.
 
 ### 3.6 I/Q decoding
 
@@ -280,11 +303,19 @@ Converted to complex `float[2*i], float[2*i+1]` layout for the FFT.
 - CIC runtime state: three bounded moving sums of length `decim`, one delay
   ring per stage, sampled every `decim` raw samples.
 - CIC frequency droop: inverse normalised CIC response, clamped `[0.05, 8]`.
-- Final transport: `mag → dB (20·log10) → uint8` mapped over `[−100, −20] dB`.
+- Waterfall noise presentation: multiply only the packed display magnitude by
+  `sqrt(90000 / Hann_ENBW)` and a Rayleigh peak-reducer factor for the actual
+  raw-bin count in the screen pixel.
+- Final transport: `display_mag → dB (20·log10) → uint8` mapped over
+  `[−100, −20] dB`.
+- Automatic waterfall mode keeps the same palette and SSE bytes, but expands
+  its robust upper level target by `2.12` after the existing `1.2` headroom
+  factor. Manual level controls are unchanged.
 
 `magnitude_to_u8` performs the dB→byte mapping. This keeps a
-steady tone at the same displayed level across FFT size, CIC factor, and
-passband position.
+coherently calibrated tone stable before display presentation, while the
+additional ENBW factor keeps white-noise background brightness stable as
+resolution narrows.
 
 The raw buffers feeding CIC must remain contiguous. The scanner may drop
 queued buffers in non-CIC paths, but single-frequency CIC mode waits for queue
@@ -363,6 +394,10 @@ ordinary user-editable controls.
 `fft_size`, `display_bins`, `min_rate_lps`, `rate_limit_lps`,
 `visible_start_hz`, `visible_end_hz`. (*forced to auto profile, see §3.8.)
 
+`rf_port` is one of `A_BALANCED`, `B_BALANCED`, or `C_BALANCED`, selected by
+the `Input` control as Pluto RX input 1, 2, or 3. It is written to the standard
+AD936x `rf_port_select` attribute immediately before a stream starts.
+
 `freq_start`/`freq_end` are air-frequency values in MHz. Receiver limits are
 validated after applying `converter_freq`; invalid converted bands return
 HTTP `400` without changing the persisted configured band.
@@ -379,11 +414,18 @@ data: {"view":<id>,"n":<line#>,"b":<total_steps>,"mode":"scan|single",
        "full_f0":<configured_start_hz>,"full_f1":<configured_end_hz>,
        "visible_start_hz":<start>,"visible_end_hz":<end>,
        "second_if_hz":<if_offset>,"zero_if_guard_hz":<guard>,
+       "fq_err_correction_hz":<total_coordinate_correction>,
+       "raw_peak_hz":<interpolated_raw_fft_peak>,
+       "live_capture_age_ms":<monotonic_age>,
+       "live_first_input_ms":<delay>,"live_first_fft_ms":<delay>,
+       "live_first_publish_ms":<delay>,
        "display_bins":<N>,"source_bins":<N>,"raw_source_bins":<N>,
        "effective_fft_size":<fft>,"decim_factor":<d>,"decim_hop":<h>,
        "overlap_factor":<o>,
        "minimum_rate_overlap":<0|1>,"minimum_rate_achieved":<0|1>,
        "true_line_rate":<lines_per_second>,
+       "preview_interval_ms":<planned_playback_interval>,
+       "waterfall_noise_scale":<enbw_display_factor>,
        "preview":<0|1>,"preview_age_ms":<ms>,
        "preview_sequence":<i>,"preview_count":<n>,
        "encoding":"u8b64","db":"<base64 packed uint8 row>"}
@@ -395,6 +437,12 @@ data: {"view":<id>,"n":<line#>,"b":<total_steps>,"mode":"scan|single",
 - Legacy rows with `d:[<u8>, ...]` are still accepted by the frontend.
 - `source_bins` is intentionally set to `display_bins` (the published width).
 - `raw_source_bins` exposes the pre-reduction FFT/CIC bin count for diagnostics.
+- `raw_peak_hz` is the strongest pre-reduction bin with bounded three-point
+  interpolation. It is diagnostic metadata for a known carrier, not a second
+  display row or an RF tuning command.
+- The `live_*_ms` fields are monotonic delays from live capture start. Preview
+  rows report zero until fresh acquisition reaches that stage; they make a
+  preview-to-live pause measurable without mixing the two sample streams.
 - `view` is the `view_id`; the frontend ignores rows whose `view` is older than
   the one it requested, so zoom/pan changes never show stale data.
 - `minimum_rate_overlap=1` means the min-rate control shortened `decim_hop`
@@ -402,8 +450,12 @@ data: {"view":<id>,"n":<line#>,"b":<total_steps>,"mode":"scan|single",
 - `preview=1` rows are compatible historical samples processed through the same
   CIC/Hann/FFT path for low-latency high-resolution changes. They provide the
   first waterfall rows from memory while the live stream fills the larger FFT
-  window. Animated Go To waits for a matching `preview=0` row before treating
-  the final live view as settled.
+  window. When previews exist, `preview_interval_ms` is exactly the estimated
+  fresh-line wait divided by `preview_count`, not the prior raw FFT cadence.
+  The frontend queues previews and following live rows in arrival order, so
+  cached rows do not burst and then leave an empty pause. Animated Go To
+  accepts a matching current-resolution preview row and does not stretch an
+  older row into the new viewport.
 
 ---
 
@@ -421,7 +473,9 @@ bundler, no framework, no npm runtime dependency.
 - **Ruler overlays** — two `<canvas>` layers (`#rulerOverlay`,
   `#scopeRulerOverlay`) drawn on top of the main canvases.
 - **Frequency scale** — auto-ticked ruler below the scope with major/mid/minor
-  ticks chosen for the current span (`chooseFrequencyStep`).
+  ticks chosen for the current span (`chooseFrequencyStep`). Labels group Hz
+  digits after the kHz group (`10489.500 300 MHz`), and a centred light-blue
+  `<10Hz>`-style marker shows the major-tick distance.
 
 ### 4.2 Color map
 
@@ -437,6 +491,8 @@ manual dual slider); auto levels use robust percentiles (8 % noise floor,
 - `encoding:"u8b64"`/`db` must decode to `display_bins` bytes, or legacy `d`
   must be a length-`display_bins` array of integers `0..255`.
 - `f0 < f1` and finite.
+- Cached previews are queued and rendered at `preview_interval_ms`; live rows
+  arriving behind that queue retain chronological order.
 
 On stall (no line for 6× the expected line interval, clamped `5–30 s`) the
 client reconnects. Heartbeat shows `disconnected` / `idle` / `scanning`.
@@ -456,8 +512,8 @@ client reconnects. Heartbeat shows `disconnected` / `idle` / `scanning`.
 - **Go To dialog** — target frequency + zoom (`1×..1,000,000×`), optional
   animation with delay (`0.2/0.5/1/2/3/5 s`). Non-animated Go To retunes
   immediately. Animated Go To requests a backend view at every step and waits
-  for a matching waterfall row so each step uses the true current resolution
-  instead of only stretching the previous lower-resolution image.
+  for a matching current-resolution FFT/CIC row (a compatible preview or live
+  row) so each step does not stretch the previous lower-resolution image.
 - **Persistence** — the visible viewport is saved to `localStorage` and the URL
   hash (`#view=start-end`); restored on page load. A saved scan is **not**
   auto-started if the backend was idle.
