@@ -2944,6 +2944,42 @@
             }
 
             /**
+             * Return the decimal precision used by the rendered frequency scale.
+             *
+             * @param {{left:number,right:number}} axis Visible frequency axis in hertz.
+             * @param {number} width Scale width in CSS pixels.
+             * @returns {number} MHz fractional digits used by major tick labels.
+             */
+            function frequencyScaleDecimalsForAxis(axis, width) {
+                if (
+                    !axis ||
+                    !Number.isFinite(axis.left) ||
+                    !Number.isFinite(axis.right) ||
+                    axis.right <= axis.left
+                ) {
+                    return 3;
+                }
+                return frequencyDecimalsForTicks(
+                    buildFrequencyMarks(axis.left, axis.right, width || 800),
+                );
+            }
+
+            /**
+             * Format a frequency with the same precision as the main scale.
+             *
+             * @param {number} freq Frequency in hertz.
+             * @param {{left:number,right:number}} axis Visible frequency axis in hertz.
+             * @param {number} width Scale width in CSS pixels.
+             * @returns {string} Frequency label matching main-scale formatting.
+             */
+            function formatFrequencyLikeScale(freq, axis, width) {
+                return formatTickMHz(
+                    freq,
+                    frequencyScaleDecimalsForAxis(axis, width),
+                );
+            }
+
+            /**
              * Format the spacing label between adjacent major frequency ticks.
              *
              * @param {number} deltaHz Tick spacing in hertz.
@@ -4891,7 +4927,11 @@
                     currentSteps,
                     currentBins ? currentBins.length : 0,
                 );
-                const decimals = decimalsForSpan(axis.right - axis.left);
+                const scaleWidth =
+                    document.getElementById("freqScale").clientWidth ||
+                    canvas.getBoundingClientRect().width ||
+                    wfCanvas.width ||
+                    800;
                 const lines = [];
                 const marker = nearestMarkerAtCanvas(canvas, evt.clientX);
                 if (marker)
@@ -4904,16 +4944,20 @@
                 const bandNames = bandsAtFrequency(freq);
                 if (bandNames.length) lines.push(bandNames.join(", "));
                 if (currentConverterFreq !== 0) {
-                    lines.push("RF: " + formatMHz(freq, decimals));
+                    lines.push(
+                        "RF: " +
+                            formatFrequencyLikeScale(freq, axis, scaleWidth),
+                    );
                     lines.push(
                         "RX: " +
-                            formatMHz(
+                            formatFrequencyLikeScale(
                                 receiverFrequencyFromRadio(freq),
-                                decimals,
+                                axis,
+                                scaleWidth,
                             ),
                     );
                 } else {
-                    lines.push(formatMHz(freq, decimals));
+                    lines.push(formatFrequencyLikeScale(freq, axis, scaleWidth));
                 }
                 if (includeLevel) {
                     const rect = canvas.getBoundingClientRect();
@@ -6947,6 +6991,11 @@
                         whole_mhz: formatTickMHz(10489000000, 0),
                         khz: formatTickMHz(10489500000, 3),
                         hz: formatTickMHz(10489500300, 6),
+                        hover_like_scale: formatFrequencyLikeScale(
+                            testFrequency,
+                            axis,
+                            900,
+                        ),
                         delta: formatScaleDelta(10),
                         second_delta_left: secondPair && secondPair.left.freq,
                         second_delta_right: secondPair && secondPair.right.freq,
