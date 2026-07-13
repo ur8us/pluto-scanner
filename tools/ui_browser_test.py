@@ -116,6 +116,7 @@ def main():
             "khz": "10489.500 MHz",
             "hz": "10489.500 300 MHz",
             "hover_like_scale": "10489.500 300 MHz",
+            "hover_tenth_hz": "10489.500 0023 MHz",
             "delta": "10Hz",
             "second_delta_left": 10489500100,
             "second_delta_right": 10489500200,

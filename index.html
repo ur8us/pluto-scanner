@@ -2944,13 +2944,34 @@
             }
 
             /**
-             * Return the decimal precision used by the rendered frequency scale.
+             * Return the rendered major tick spacing in hertz.
+             *
+             * @param {Array<{kind:string,step:number}>} ticks Tick model.
+             * @returns {number} Smallest major-tick step in hertz, or `NaN`.
+             */
+            function majorFrequencyStepForTicks(ticks) {
+                let step = Infinity;
+                for (const tick of ticks) {
+                    if (tick.kind !== "major") continue;
+                    const tickStep = Math.abs(Number(tick.step));
+                    if (Number.isFinite(tickStep) && tickStep > 0)
+                        step = Math.min(step, tickStep);
+                }
+                return step === Infinity ? NaN : step;
+            }
+
+            /**
+             * Return hover-readout precision for the rendered frequency scale.
+             *
+             * Hover labels follow the main scale. When the adjacent major marks
+             * are at most 5 Hz apart, they add one digit so the pointer readout
+             * resolves 0.1 Hz.
              *
              * @param {{left:number,right:number}} axis Visible frequency axis in hertz.
              * @param {number} width Scale width in CSS pixels.
-             * @returns {number} MHz fractional digits used by major tick labels.
+             * @returns {number} MHz fractional digits for hover labels.
              */
-            function frequencyScaleDecimalsForAxis(axis, width) {
+            function frequencyHoverDecimalsForAxis(axis, width) {
                 if (
                     !axis ||
                     !Number.isFinite(axis.left) ||
@@ -2959,23 +2980,30 @@
                 ) {
                     return 3;
                 }
-                return frequencyDecimalsForTicks(
-                    buildFrequencyMarks(axis.left, axis.right, width || 800),
+                const ticks = buildFrequencyMarks(
+                    axis.left,
+                    axis.right,
+                    width || 800,
                 );
+                const decimals = frequencyDecimalsForTicks(ticks);
+                const majorStep = majorFrequencyStepForTicks(ticks);
+                return Number.isFinite(majorStep) && majorStep <= 5
+                    ? Math.max(decimals, 7)
+                    : decimals;
             }
 
             /**
-             * Format a frequency with the same precision as the main scale.
+             * Format a hover frequency with scale-derived precision.
              *
              * @param {number} freq Frequency in hertz.
              * @param {{left:number,right:number}} axis Visible frequency axis in hertz.
              * @param {number} width Scale width in CSS pixels.
-             * @returns {string} Frequency label matching main-scale formatting.
+             * @returns {string} Frequency label for the pointer readout.
              */
             function formatFrequencyLikeScale(freq, axis, width) {
                 return formatTickMHz(
                     freq,
-                    frequencyScaleDecimalsForAxis(axis, width),
+                    frequencyHoverDecimalsForAxis(axis, width),
                 );
             }
 
@@ -6985,7 +7013,12 @@
                         { freq: 10489500200, pos: 71 },
                     ]);
                     const axis = { left: 10489500000, right: 10489500400 };
+                    const fineAxis = {
+                        left: 10489500000,
+                        right: 10489500020,
+                    };
                     const testFrequency = 10489500300;
+                    const fineFrequency = 10489500002.3;
                     return {
                         range: formatScanRange(10489500300, 10489500600),
                         span_khz: formatVisibleSpan(12500),
@@ -6996,6 +7029,11 @@
                         hover_like_scale: formatFrequencyLikeScale(
                             testFrequency,
                             axis,
+                            900,
+                        ),
+                        hover_tenth_hz: formatFrequencyLikeScale(
+                            fineFrequency,
+                            fineAxis,
                             900,
                         ),
                         delta: formatScaleDelta(10),
