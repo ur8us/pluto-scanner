@@ -3,12 +3,10 @@
 
 import json
 import os
-import shutil
 import signal
 import socket
 import subprocess
 import sys
-import tempfile
 import time
 import urllib.request
 
@@ -72,6 +70,37 @@ def allocate_loopback_port():
         sock.close()
 
 
+def stop_backend_process(process):
+    """Stop one private synthetic backend on the current platform."""
+    if os.name == "nt":
+        process.terminate()
+    else:
+        process.send_signal(signal.SIGINT)
+
+
+def save_test_config(config_path, enabled):
+    """Install one isolated RFPLL setting and return the prior file bytes."""
+    previous = None
+    if os.path.exists(config_path):
+        with open(config_path, "rb") as config:
+            previous = config.read()
+    with open(config_path, "w", encoding="ascii") as config:
+        config.write(f"fq_err_correction = {1 if enabled else 0}\n")
+    return previous
+
+
+def restore_test_config(config_path, previous):
+    """Restore the test-binary configuration after a coordinate test case."""
+    if previous is None:
+        try:
+            os.remove(config_path)
+        except FileNotFoundError:
+            pass
+        return
+    with open(config_path, "wb") as config:
+        config.write(previous)
+
+
 def start_payload(center_hz):
     """Build a narrow single-frequency request around the test coordinate."""
     # An odd span places this plan's source centre on a half-hertz boundary,
@@ -99,86 +128,82 @@ def run_case(enabled):
     center_hz = 840_000_123.5
     port = allocate_loopback_port()
     BASE = f"http://127.0.0.1:{port}"
-    test_build_dir = os.path.dirname(os.path.abspath(TEST_BINARY))
-    with tempfile.TemporaryDirectory(
-        prefix="pluto-fq-coordinate-", dir=test_build_dir
-    ) as temp_dir:
-        binary = os.path.join(temp_dir, os.path.basename(TEST_BINARY))
-        shutil.copy2(TEST_BINARY, binary)
-        with open(os.path.join(temp_dir, "pluto-scanner.conf"), "w", encoding="ascii") as config:
-            config.write(f"fq_err_correction = {1 if enabled else 0}\n")
+    test_dir = os.path.dirname(os.path.abspath(TEST_BINARY))
+    config_path = os.path.join(test_dir, "pluto-scanner.conf")
+    previous_config = save_test_config(config_path, enabled)
+    process = None
+    try:
         process = subprocess.Popen(
-            # Keep the private executable below the test build directory.
-            # MSYS2's global temporary mount can deny execution of freshly
-            # copied .exe files on the GitHub Windows runner. The backend
-            # loads its configuration beside the executable, so this also
-            # keeps each test case isolated from local runtime state.
-            [binary, "--port", str(port)],
-            cwd=temp_dir,
+            # Do not execute a copied .exe: GitHub's MSYS2 Windows runner can
+            # reject it with WinError 5. The test configuration is adjacent to
+            # the built binary because the backend resolves it from argv[0].
+            [os.path.abspath(TEST_BINARY), "--port", str(port)],
+            cwd=test_dir,
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
             text=True,
         )
-        try:
-            wait_for_server(process)
-            response = http_json("POST", "/api/start", start_payload(center_hz))
-            if response.get("status") != "ok":
-                raise RuntimeError(f"start failed: {response}")
-            status = http_json("GET", "/api/status")
-            if int(status.get("fq_err_correction", -1)) != int(enabled):
-                raise RuntimeError(f"wrong correction flag: {status}")
-            model_hz = float(status.get("fq_err_model_hz", 0.0))
-            effective_hz = float(status.get("fq_err_effective_hz", 0.0))
-            visible_start = float(status["visible_start_hz"])
-            visible_end = float(status["visible_end_hz"])
-            display_bins = int(status["display_bins"])
-            source_start = float(status["scan_start_hz"])
-            source_span = float(status["source_span_hz"])
-            requested_source_start = source_start - effective_hz
-            actual_source_start = requested_source_start + model_hz
+        wait_for_server(process)
+        response = http_json("POST", "/api/start", start_payload(center_hz))
+        if response.get("status") != "ok":
+            raise RuntimeError(f"start failed: {response}")
+        status = http_json("GET", "/api/status")
+        if int(status.get("fq_err_correction", -1)) != int(enabled):
+            raise RuntimeError(f"wrong correction flag: {status}")
+        model_hz = float(status.get("fq_err_model_hz", 0.0))
+        effective_hz = float(status.get("fq_err_effective_hz", 0.0))
+        visible_start = float(status["visible_start_hz"])
+        visible_end = float(status["visible_end_hz"])
+        display_bins = int(status["display_bins"])
+        source_start = float(status["scan_start_hz"])
+        source_span = float(status["source_span_hz"])
+        requested_source_start = source_start - effective_hz
+        actual_source_start = requested_source_start + model_hz
 
-            # These are the same binary64 coordinate equations used by the
-            # backend reducer: the spectrum line sees the actual LO, while its
-            # source interval is either corrected or intentionally uncorrected.
-            scale_x = (center_hz - visible_start) / (visible_end - visible_start) * display_bins
-            plotted_hz = source_start + (center_hz - actual_source_start)
-            spectrum_x = (plotted_hz - visible_start) / (visible_end - visible_start) * display_bins
-            expected_x_error = (effective_hz - model_hz) / (visible_end - visible_start) * display_bins
-            actual_x_error = spectrum_x - scale_x
-            if abs(actual_x_error - expected_x_error) > 1e-6:
-                raise RuntimeError(
-                    "coordinate model mismatch: "
-                    f"actual={actual_x_error} expected={expected_x_error}"
-                )
-            expected_effective = model_hz if enabled else 0.0
-            if abs(effective_hz - expected_effective) > 1e-9:
-                raise RuntimeError(
-                    f"wrong effective correction: got {effective_hz}, "
-                    f"expected {expected_effective}"
-                )
-            if abs(model_hz) < 0.5:
-                raise RuntimeError(
-                    "test view did not exercise the integer-Hz IIO request "
-                    f"rounding contribution: {model_hz}"
-                )
-            http_json("POST", "/api/stop", {})
-            return {
-                "enabled": enabled,
-                "model_hz": model_hz,
-                "effective_hz": effective_hz,
-                "scale_x": scale_x,
-                "spectrum_x": spectrum_x,
-                "x_error": actual_x_error,
-                "source_span_hz": source_span,
-            }
-        finally:
-            if process.poll() is None:
-                process.send_signal(signal.SIGINT)
+        # These are the same binary64 coordinate equations used by the
+        # backend reducer: the spectrum line sees the actual LO, while its
+        # source interval is either corrected or intentionally uncorrected.
+        scale_x = (center_hz - visible_start) / (visible_end - visible_start) * display_bins
+        plotted_hz = source_start + (center_hz - actual_source_start)
+        spectrum_x = (plotted_hz - visible_start) / (visible_end - visible_start) * display_bins
+        expected_x_error = (effective_hz - model_hz) / (visible_end - visible_start) * display_bins
+        actual_x_error = spectrum_x - scale_x
+        if abs(actual_x_error - expected_x_error) > 1e-6:
+            raise RuntimeError(
+                "coordinate model mismatch: "
+                f"actual={actual_x_error} expected={expected_x_error}"
+            )
+        expected_effective = model_hz if enabled else 0.0
+        if abs(effective_hz - expected_effective) > 1e-9:
+            raise RuntimeError(
+                f"wrong effective correction: got {effective_hz}, "
+                f"expected {expected_effective}"
+            )
+        if abs(model_hz) < 0.5:
+            raise RuntimeError(
+                "test view did not exercise the integer-Hz IIO request "
+                f"rounding contribution: {model_hz}"
+            )
+        http_json("POST", "/api/stop", {})
+        return {
+            "enabled": enabled,
+            "model_hz": model_hz,
+            "effective_hz": effective_hz,
+            "scale_x": scale_x,
+            "spectrum_x": spectrum_x,
+            "x_error": actual_x_error,
+            "source_span_hz": source_span,
+        }
+    finally:
+        if process is not None and process.poll() is None:
+            stop_backend_process(process)
+        if process is not None:
             try:
                 process.communicate(timeout=10)
             except subprocess.TimeoutExpired:
                 process.kill()
                 process.communicate(timeout=5)
+        restore_test_config(config_path, previous_config)
 
 
 def main():
