@@ -99,12 +99,20 @@ def run_case(enabled):
     center_hz = 840_000_123.5
     port = allocate_loopback_port()
     BASE = f"http://127.0.0.1:{port}"
-    with tempfile.TemporaryDirectory(prefix="pluto-fq-coordinate-") as temp_dir:
+    test_build_dir = os.path.dirname(os.path.abspath(TEST_BINARY))
+    with tempfile.TemporaryDirectory(
+        prefix="pluto-fq-coordinate-", dir=test_build_dir
+    ) as temp_dir:
         binary = os.path.join(temp_dir, os.path.basename(TEST_BINARY))
         shutil.copy2(TEST_BINARY, binary)
         with open(os.path.join(temp_dir, "pluto-scanner.conf"), "w", encoding="ascii") as config:
             config.write(f"fq_err_correction = {1 if enabled else 0}\n")
         process = subprocess.Popen(
+            # Keep the private executable below the test build directory.
+            # MSYS2's global temporary mount can deny execution of freshly
+            # copied .exe files on the GitHub Windows runner. The backend
+            # loads its configuration beside the executable, so this also
+            # keeps each test case isolated from local runtime state.
             [binary, "--port", str(port)],
             cwd=temp_dir,
             stdout=subprocess.PIPE,
