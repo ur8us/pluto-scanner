@@ -118,12 +118,13 @@ static int win32_nanosleep(const struct timespec *req, struct timespec *rem)
 #define CACHED_PREVIEW_MAX_LINES 128U
 #define CACHED_PREVIEW_MAX_AGE_MS 5000LL
 #define SINGLE_ZERO_IF_GUARD_HZ 50000.0
-#define PLUTO_REFERENCE_INPUT_HZ 40000000.0
+#define PLUTO_REFERENCE_INPUT_HZ 40000000ULL
 /* The stock AD936x driver doubles a 40 MHz input reference for the RFPLL. */
-#define PLUTO_RFPLL_REFERENCE_HZ (2.0 * PLUTO_REFERENCE_INPUT_HZ)
-#define PLUTO_RFPLL_FRACTIONAL_MODULUS 8388593.0
-#define PLUTO_RFPLL_VCO_MIN_HZ 6000000000.0
-#define PLUTO_RFPLL_VCO_MAX_HZ 12000000000.0
+#define PLUTO_RFPLL_REFERENCE_HZ (2ULL * PLUTO_REFERENCE_INPUT_HZ)
+#define PLUTO_RFPLL_FRACTIONAL_MODULUS 8388593ULL
+#define PLUTO_RFPLL_VCO_MIN_HZ 6000000000ULL
+#define PLUTO_RFPLL_VCO_MAX_HZ 12000000000ULL
+#define JSON_COORD_FMT "%.9f"
 #define CIC_STAGES          3
 /* The minimum scan FFT has a Hann ENBW close to 90 kHz at 61.44 MSPS.
  * Waterfall presentation uses this as the common white-noise reference. */
@@ -791,14 +792,14 @@ static void save_config(void)
 {
     FILE *f = fopen(CONFIG_FILE, "w");
     if (!f) return;
-    fprintf(f, "freq_start = %.0f\n", g_freq_start);
-    fprintf(f, "freq_end = %.0f\n", g_freq_end);
-    fprintf(f, "converter_freq = %.0f\n", g_converter_freq);
+    fprintf(f, "freq_start = " JSON_COORD_FMT "\n", g_freq_start);
+    fprintf(f, "freq_end = " JSON_COORD_FMT "\n", g_freq_end);
+    fprintf(f, "converter_freq = " JSON_COORD_FMT "\n", g_converter_freq);
     fprintf(f, "samplerate = %.0f\n", g_samplerate);
     fprintf(f, "rf_bandwidth = %.0f\n", g_rf_bandwidth);
     fprintf(f, "bw_ratio = %g\n", g_bw_ratio);
-    fprintf(f, "visible_start = %.0f\n", g_visible_start);
-    fprintf(f, "visible_end = %.0f\n", g_visible_end);
+    fprintf(f, "visible_start = " JSON_COORD_FMT "\n", g_visible_start);
+    fprintf(f, "visible_end = " JSON_COORD_FMT "\n", g_visible_end);
     fprintf(f, "gain_mode = %s\n", g_gain_mode);
     fprintf(f, "hardwaregain_db = %.2f\n", g_hardwaregain_db);
     fprintf(f, "rf_port = %s\n", g_rf_port);
@@ -807,7 +808,7 @@ static void save_config(void)
     fprintf(f, "min_rate_lps = %u\n", g_min_rate_lps);
     fprintf(f, "rate_limit_lps = %u\n", g_rate_limit_lps);
     fprintf(f, "fq_err_correction = %u\n", g_fq_err_correction);
-    fprintf(f, "goto_freq = %.0f\n", g_goto_freq);
+    fprintf(f, "goto_freq = " JSON_COORD_FMT "\n", g_goto_freq);
     fprintf(f, "goto_target_zoom = %.6g\n", g_goto_target_zoom);
     fprintf(f, "goto_animate = %u\n", g_goto_animate);
     fprintf(f, "goto_delay_s = %g\n", g_goto_delay_s);
@@ -2915,40 +2916,48 @@ static int receiver_frequency_valid(double rx_freq)
  */
 static double pluto_rfpll_modeled_error_hz(double requested_rx_hz)
 {
-    double divider = 1.0;
-    double iio_requested_rx_hz;
-    double driver_requested_rx_hz;
-    double vco_hz;
-    double ratio;
-    double integer_part;
-    double fractional_part;
-    double actual_vco_hz;
+    long long iio_requested_rx_hz;
+    uint64_t driver_requested_rx_hz;
+    uint64_t vco_hz;
+    uint64_t integer_part;
+    uint64_t remainder_hz;
+    uint64_t fractional_part;
+    uint64_t output_divider;
+    long double actual_vco_hz;
+    int vco_div = -1;
 
     if (!isfinite(requested_rx_hz) || requested_rx_hz <= 0.0)
         return 0.0;
-    iio_requested_rx_hz = (double)llround(requested_rx_hz);
-    driver_requested_rx_hz = 2.0 * floor(iio_requested_rx_hz * 0.5);
-    while (driver_requested_rx_hz * divider < PLUTO_RFPLL_VCO_MIN_HZ &&
-           divider < 64.0)
-        divider *= 2.0;
-    vco_hz = driver_requested_rx_hz * divider;
-    if (vco_hz < PLUTO_RFPLL_VCO_MIN_HZ ||
-        vco_hz > PLUTO_RFPLL_VCO_MAX_HZ)
+    iio_requested_rx_hz = llround(requested_rx_hz);
+    if (iio_requested_rx_hz <= 0)
+        return 0.0;
+    driver_requested_rx_hz =
+        (((uint64_t)iio_requested_rx_hz) >> 1U) << 1U;
+
+    vco_hz = driver_requested_rx_hz;
+    while (vco_hz <= PLUTO_RFPLL_VCO_MIN_HZ) {
+        if (vco_hz > UINT64_MAX / 2U)
+            return 0.0;
+        vco_hz <<= 1U;
+        vco_div++;
+    }
+    if (vco_div < 0 || vco_hz > PLUTO_RFPLL_VCO_MAX_HZ)
         return 0.0;
 
-    ratio = vco_hz / PLUTO_RFPLL_REFERENCE_HZ;
-    integer_part = floor(ratio);
-    fractional_part = round((ratio - integer_part) *
-                            PLUTO_RFPLL_FRACTIONAL_MODULUS);
-    if (fractional_part >= PLUTO_RFPLL_FRACTIONAL_MODULUS) {
-        integer_part += 1.0;
-        fractional_part = 0.0;
-    }
-    actual_vco_hz = PLUTO_RFPLL_REFERENCE_HZ *
-        (integer_part + fractional_part / PLUTO_RFPLL_FRACTIONAL_MODULUS);
+    integer_part = vco_hz / PLUTO_RFPLL_REFERENCE_HZ;
+    remainder_hz = vco_hz % PLUTO_RFPLL_REFERENCE_HZ;
+    fractional_part = (remainder_hz * PLUTO_RFPLL_FRACTIONAL_MODULUS +
+                       PLUTO_RFPLL_REFERENCE_HZ / 2U) /
+        PLUTO_RFPLL_REFERENCE_HZ;
+    output_divider = 1ULL << (unsigned int)(vco_div + 1);
+    actual_vco_hz = (long double)PLUTO_RFPLL_REFERENCE_HZ *
+        ((long double)integer_part +
+         (long double)fractional_part /
+         (long double)PLUTO_RFPLL_FRACTIONAL_MODULUS);
     /* Include the same integer-Hz IIO request rounding used by
      * pluto_sdr_set_frequency(), then the fractional-N tuning-word error. */
-    return actual_vco_hz / divider - requested_rx_hz;
+    return (double)(actual_vco_hz / (long double)output_divider -
+                    (long double)requested_rx_hz);
 }
 
 /**
@@ -4948,31 +4957,52 @@ static float peak_reducer_noise_scale(int raw_bins)
 }
 
 /**
- * @brief Estimate the strongest raw FFT/CIC bin coordinate before display reduction.
+ * @brief Estimate the strongest visible raw FFT/CIC bin coordinate.
  *
- * The result is diagnostic metadata for live frequency validation. It uses a
- * three-point log-magnitude parabola when both adjacent bins are available;
- * the interpolation is bounded to one half-bin so noise or an edge maximum
- * cannot invent a coordinate outside the selected source bin.
+ * The result is diagnostic metadata for live frequency validation. Hidden
+ * source-span bins outside the visible interval are ignored so zero-IF/DC
+ * artifacts cannot replace the carrier the user is actually inspecting. The
+ * peak coordinate uses a three-point log-magnitude parabola when adjacent bins
+ * are available; the interpolation is bounded to one half-bin so noise or an
+ * edge maximum cannot invent a coordinate outside the selected source bin.
  *
  * @param values Raw magnitude bins in increasing source-frequency order.
  * @param count Number of valid raw bins.
  * @param start_hz Source-coordinate frequency at the lower bin edge, in hertz.
  * @param span_hz Source-coordinate span represented by `values`, in hertz.
+ * @param visible_start_hz Visible interval lower edge in hertz.
+ * @param visible_end_hz Visible interval upper edge in hertz.
  * @return Interpolated peak source coordinate in hertz, or zero when invalid.
  */
 static double raw_peak_frequency_hz(const float *values, int count,
-                                    double start_hz, double span_hz)
+                                    double start_hz, double span_hz,
+                                    double visible_start_hz,
+                                    double visible_end_hz)
 {
     int peak_index = 0;
+    int first;
+    int last;
     float peak = 0.0f;
     double bin_fraction = 0.5;
 
     if (!values || count <= 0 || !isfinite(start_hz) ||
-        !isfinite(span_hz) || span_hz <= 0.0)
+        !isfinite(span_hz) || span_hz <= 0.0 ||
+        !isfinite(visible_start_hz) || !isfinite(visible_end_hz) ||
+        visible_end_hz <= visible_start_hz)
         return 0.0;
 
-    for (int i = 0; i < count; i++) {
+    first = (int)floor(((visible_start_hz - start_hz) / span_hz) *
+                       (double)count);
+    last = (int)ceil(((visible_end_hz - start_hz) / span_hz) *
+                     (double)count);
+    if (first < 0)
+        first = 0;
+    if (last > count)
+        last = count;
+    if (last <= first)
+        return 0.0;
+
+    for (int i = first; i < last; i++) {
         if (isfinite(values[i]) && values[i] > peak) {
             peak = values[i];
             peak_index = i;
@@ -5092,10 +5122,10 @@ static void publish_scan_line(scan_ctx_t *ctx)
     const char *prefix_fmt =
         "event: line\ndata: {\"view\":%u,\"n\":%d,\"b\":%d,"
         "\"mode\":\"%s\","
-        "\"f0\":%.0f,\"f1\":%.0f,"
-        "\"full_f0\":%.0f,\"full_f1\":%.0f,"
-        "\"visible_start_hz\":%.0f,\"visible_end_hz\":%.0f,"
-        "\"second_if_hz\":%.0f,\"zero_if_guard_hz\":%.0f,"
+        "\"f0\":" JSON_COORD_FMT ",\"f1\":" JSON_COORD_FMT ","
+        "\"full_f0\":" JSON_COORD_FMT ",\"full_f1\":" JSON_COORD_FMT ","
+        "\"visible_start_hz\":" JSON_COORD_FMT ",\"visible_end_hz\":" JSON_COORD_FMT ","
+        "\"second_if_hz\":" JSON_COORD_FMT ",\"zero_if_guard_hz\":" JSON_COORD_FMT ","
         "\"fq_err_correction_hz\":%.9f,"
         "\"raw_peak_hz\":%.9f,"
         "\"live_capture_age_ms\":%lld,"
@@ -5134,7 +5164,9 @@ static void publish_scan_line(scan_ctx_t *ctx)
                 ctx->live_capture_started_msec;
     }
     raw_peak_hz = raw_peak_frequency_hz(ctx->line_buf, source_bins,
-                                        ctx->scan_start, source_span);
+                                        ctx->scan_start, source_span,
+                                        ctx->visible_start,
+                                        ctx->visible_end);
 
     line_packed = malloc((size_t)display_bins);
     if (!line_packed)
@@ -7396,11 +7428,12 @@ static void handle_request(int client_fd, const char *req, size_t req_len,
             "\"receiver_range_note\":\"unofficial extended Pluto range\","
             "\"scanning\":%d,\"device_present\":%d,"
             "\"auto_restart_on_reconnect\":%d,"
-            "\"freq_start\":%.0f,\"freq_end\":%.0f,\"converter_freq\":%.0f,"
-            "\"configured_start_hz\":%.0f,\"configured_end_hz\":%.0f,"
-            "\"visible_start_hz\":%.0f,\"visible_end_hz\":%.0f,"
-            "\"scan_start_hz\":%.0f,\"scan_end_hz\":%.0f,"
-            "\"second_if_hz\":%.0f,\"zero_if_guard_hz\":%.0f,"
+            "\"freq_start\":" JSON_COORD_FMT ",\"freq_end\":" JSON_COORD_FMT ","
+            "\"converter_freq\":" JSON_COORD_FMT ","
+            "\"configured_start_hz\":" JSON_COORD_FMT ",\"configured_end_hz\":" JSON_COORD_FMT ","
+            "\"visible_start_hz\":" JSON_COORD_FMT ",\"visible_end_hz\":" JSON_COORD_FMT ","
+            "\"scan_start_hz\":" JSON_COORD_FMT ",\"scan_end_hz\":" JSON_COORD_FMT ","
+            "\"second_if_hz\":" JSON_COORD_FMT ",\"zero_if_guard_hz\":" JSON_COORD_FMT ","
             "\"fq_err_correction\":%u,\"fq_err_model_hz\":%.9f,"
             "\"fq_err_effective_hz\":%.9f,"
             "\"samplerate\":%.0f,\"rf_bandwidth\":%.0f,\"bw_ratio\":%.2f,"
@@ -7408,7 +7441,7 @@ static void handle_request(int client_fd, const char *req, size_t req_len,
             "\"hardware_bw_ratio\":%.2f,"
             "\"active_samplerate\":%.0f,\"active_rf_bandwidth\":%.0f,"
             "\"active_bw_ratio\":%.3f,"
-            "\"step_hz\":%.0f,\"steps\":%d,"
+            "\"step_hz\":" JSON_COORD_FMT ",\"steps\":%d,"
             "\"required_points\":%d,\"mode\":\"%s\",\"active_mode\":\"%s\","
             "\"min_rate_lps\":%u,\"rate_limit_lps\":%u,"
             "\"rate_drop_factor\":%d,\"raw_line_rate\":%.3f,"
@@ -7417,7 +7450,7 @@ static void handle_request(int client_fd, const char *req, size_t req_len,
             "\"minimum_rate_overlap\":%d,\"minimum_rate_limited\":%d,"
             "\"minimum_rate_achieved\":%d,"
             "\"traffic_kbytes_s\":%.1f,"
-            "\"source_span_hz\":%.0f,\"visible_raw_bins\":%.3f,"
+            "\"source_span_hz\":" JSON_COORD_FMT ",\"visible_raw_bins\":%.3f,"
             "\"visible_bins_per_pixel\":%.6f,\"visible_raw_bins_per_pixel\":%.6f,"
             "\"bins_per_step\":%d,\"line_bins\":%d,\"raw_line_bins\":%d,"
             "\"display_bins\":%d,"
@@ -7426,7 +7459,7 @@ static void handle_request(int client_fd, const char *req, size_t req_len,
             "\"effective_input_samples\":%u,"
             "\"gain_mode\":\"%s\",\"hardwaregain_db\":%.1f,\"rf_port\":\"%s\","
             "\"rssi_db\":%.2f,\"input_peak\":%.0f,\"clipped_samples\":%llu,"
-            "\"goto_freq_hz\":%.0f,\"goto_target_zoom\":%.6g,"
+            "\"goto_freq_hz\":" JSON_COORD_FMT ",\"goto_target_zoom\":%.6g,"
             "\"goto_animate\":%u,"
             "\"goto_delay_s\":%.1f,"
             "\"sample_rates\":%s}",
@@ -7557,7 +7590,7 @@ static void handle_request(int client_fd, const char *req, size_t req_len,
         {
             char json_body[256];
             snprintf(json_body, sizeof(json_body),
-                "{\"status\":\"ok\",\"goto_freq_hz\":%.0f,"
+                "{\"status\":\"ok\",\"goto_freq_hz\":" JSON_COORD_FMT ","
                 "\"goto_target_zoom\":%.6g,"
                 "\"goto_animate\":%u,\"goto_delay_s\":%.1f}",
                 g_goto_freq, g_goto_target_zoom,
@@ -7789,11 +7822,11 @@ static void handle_request(int client_fd, const char *req, size_t req_len,
             "\"manufacturer\":\"%s\",\"product\":\"%s\","
             "\"receiver_min_hz\":%.0f,\"receiver_max_hz\":%.0f,"
             "\"receiver_range_note\":\"unofficial extended Pluto range\","
-            "\"freq_start\":%.0f,\"freq_end\":%.0f,"
-            "\"configured_start_hz\":%.0f,\"configured_end_hz\":%.0f,"
-            "\"visible_start_hz\":%.0f,\"visible_end_hz\":%.0f,"
-            "\"second_if_hz\":%.0f,\"zero_if_guard_hz\":%.0f,"
-            "\"converter_freq\":%.0f,\"steps\":%d,\"step_hz\":%.0f,"
+            "\"freq_start\":" JSON_COORD_FMT ",\"freq_end\":" JSON_COORD_FMT ","
+            "\"configured_start_hz\":" JSON_COORD_FMT ",\"configured_end_hz\":" JSON_COORD_FMT ","
+            "\"visible_start_hz\":" JSON_COORD_FMT ",\"visible_end_hz\":" JSON_COORD_FMT ","
+            "\"second_if_hz\":" JSON_COORD_FMT ",\"zero_if_guard_hz\":" JSON_COORD_FMT ","
+            "\"converter_freq\":" JSON_COORD_FMT ",\"steps\":%d,\"step_hz\":" JSON_COORD_FMT ","
             "\"required_points\":%d,\"mode\":\"%s\","
             "\"min_rate_lps\":%u,\"rate_limit_lps\":%u,"
             "\"rate_drop_factor\":%d,\"raw_line_rate\":%.3f,"
@@ -7963,11 +7996,11 @@ start_bad_json:
             char json_body[2048];
             snprintf(json_body, sizeof(json_body),
                 "{\"status\":\"%s\",\"view_id\":%u,"
-                "\"freq_start\":%.0f,\"freq_end\":%.0f,"
-                "\"configured_start_hz\":%.0f,\"configured_end_hz\":%.0f,"
-                "\"visible_start_hz\":%.0f,\"visible_end_hz\":%.0f,"
-                "\"second_if_hz\":%.0f,\"zero_if_guard_hz\":%.0f,"
-                "\"steps\":%d,\"step_hz\":%.0f,\"display_bins\":%d,"
+                "\"freq_start\":" JSON_COORD_FMT ",\"freq_end\":" JSON_COORD_FMT ","
+                "\"configured_start_hz\":" JSON_COORD_FMT ",\"configured_end_hz\":" JSON_COORD_FMT ","
+                "\"visible_start_hz\":" JSON_COORD_FMT ",\"visible_end_hz\":" JSON_COORD_FMT ","
+                "\"second_if_hz\":" JSON_COORD_FMT ",\"zero_if_guard_hz\":" JSON_COORD_FMT ","
+                "\"steps\":%d,\"step_hz\":" JSON_COORD_FMT ",\"display_bins\":%d,"
                 "\"required_points\":%d,\"mode\":\"%s\","
                 "\"min_rate_lps\":%u,\"rate_limit_lps\":%u,"
                 "\"rate_drop_factor\":%d,\"raw_line_rate\":%.3f,"

@@ -29,6 +29,8 @@ Design goals (from `README.md`):
    built from many seconds of samples. Instead of forcing the user to wait
    several seconds after a resolution change, compatible memory-held samples
    are reused for the first preview rows while live acquisition catches up.
+8. Exact frequency tuning — deterministic compensation for PLL and DDS-style
+   rounding errors keeps received signals plotted at their true frequencies.
 
 ---
 
@@ -124,7 +126,8 @@ the waterfall.
 | `SINGLE_DECIM_ASYNC_MIN_LEN` | 8192 | Smallest raw line advance targeted for CIC refills |
 | `SINGLE_DECIM_ASYNC_MAX_LEN` | 262144 | Largest CIC async refill before capping queue memory |
 | `SINGLE_ZERO_IF_GUARD_HZ` | 50000 | Zero-IF clearance |
-| `PLUTO_RFPLL_REFERENCE_HZ` | 40 MHz | Reference used by coordinate correction model |
+| `PLUTO_REFERENCE_INPUT_HZ` | 40 MHz | Physical Pluto reference input used by the coordinate model |
+| `PLUTO_RFPLL_REFERENCE_HZ` | 80 MHz | AD936x driver RFPLL parent after the 40 MHz reference doubler |
 | `PLUTO_RFPLL_FRACTIONAL_MODULUS` | 8388593 | AD936x fractional-N model modulus |
 | `PLUTO_EST_SINGLE_STREAM_SPS` | 2.1e6 | Empirical host throughput (raw) |
 | `PLUTO_EST_CIC_STREAM_SPS` | 1.85e6 | CIC-path throughput |
@@ -229,7 +232,9 @@ used for the IIO RX-LO write, then the AD936x driver's even-hertz clock bridge
 (`freq >> 1`, followed by `freq << 1`), and finally models fractional-N RFPLL
 quantization from the stock driver's doubled 80 MHz RFPLL parent for a 40 MHz
 Pluto reference input, and the power-of-two divider that places the RF VCO in
-the 6–12 GHz range. It converts the signed
+the driver range above 6 GHz and up to 12 GHz. The fractional tuning word is
+computed with integer arithmetic matching the ADI driver:
+`fract = floor((remainder * 8388593 + parent / 2) / parent)`. It converts the signed
 actual-minus-requested receive-LO error through the active converter branch and
 shifts the *source-bin coordinate* by that per-tune amount. The user-visible air range and IIO
 `altvoltage0/frequency` request do not change. No fixed local calibration
@@ -239,6 +244,11 @@ applied `fq_err_correction_hz` and interpolated `raw_peak_hz` for live
 verification. The RFPLL model is a diagnostic estimate; validate hardware
 alignment against a known reference before treating a remaining offset as
 software error.
+
+Hertz coordinates in API responses and SSE row metadata are serialized with
+fractional precision. Whole-Hz JSON formatting is not allowed for
+`visible_*_hz`, `scan_*_hz`, `f0`, `f1`, `second_if_hz`, `step_hz`, or other
+coordinate fields because one-million zoom views need sub-Hz placement.
 
 ### 3.5 Acquisition loop details
 
@@ -437,9 +447,11 @@ data: {"view":<id>,"n":<line#>,"b":<total_steps>,"mode":"scan|single",
 - Legacy rows with `d:[<u8>, ...]` are still accepted by the frontend.
 - `source_bins` is intentionally set to `display_bins` (the published width).
 - `raw_source_bins` exposes the pre-reduction FFT/CIC bin count for diagnostics.
-- `raw_peak_hz` is the strongest pre-reduction bin with bounded three-point
-  interpolation. It is diagnostic metadata for a known carrier, not a second
-  display row or an RF tuning command.
+- `raw_peak_hz` is the strongest visible pre-reduction bin with bounded
+  three-point interpolation. Hidden source-span bins outside
+  `visible_start_hz..visible_end_hz`, including zero-IF/DC artifacts, must not
+  replace the carrier being inspected. It is diagnostic metadata for a known
+  carrier, not a second display row or an RF tuning command.
 - The `live_*_ms` fields are monotonic delays from live capture start. Preview
   rows report zero until fresh acquisition reaches that stage; they make a
   preview-to-live pause measurable without mixing the two sample streams.

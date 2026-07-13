@@ -86,13 +86,22 @@ source interval*, not to the IIO tuning request:
 requested_rx_hz = receiver_frequency_from_air(requested_source_center_hz)
 iio_requested_rx_hz = round(requested_rx_hz)
 driver_requested_rx_hz = 2 * floor(iio_requested_rx_hz / 2)
-divider = smallest power of two where
-  6e9 <= driver_requested_rx_hz * divider <= 12e9
+divider = ADI driver's output divisor:
+  vco_hz = driver_requested_rx_hz
+  vco_div = -1
+  while vco_hz <= 6e9:
+    vco_hz *= 2
+    vco_div += 1
+  divider = 2^(vco_div + 1)
 rfpll_parent_hz = 2 * 40e6
-rfpll_ratio = driver_requested_rx_hz * divider / rfpll_parent_hz
-fractional_word = round(frac(rfpll_ratio) * 8388593)
-modeled_actual_rx_hz = rfpll_parent_hz *
-  (floor(rfpll_ratio) + fractional_word / 8388593) / divider
+integer_word = floor(vco_hz / rfpll_parent_hz)
+remainder_hz = vco_hz % rfpll_parent_hz
+fractional_word =
+  floor((remainder_hz * 8388593 + rfpll_parent_hz / 2) /
+        rfpll_parent_hz)
+modeled_actual_rx_hz =
+  rfpll_parent_hz * (integer_word + fractional_word / 8388593) /
+  divider
 receiver_error_hz = modeled_actual_rx_hz - requested_rx_hz
 air_error_hz = receiver_error_hz for a positive converter
 air_error_hz = +/- receiver_error_hz for a negative converter branch
@@ -104,7 +113,10 @@ For the normal `40e6` Pluto reference input, the stock AD936x driver selects
 an `80e6` RFPLL parent through its reference doubler. Therefore the two
 RFPLL calculations above use `rfpll_parent_hz = 2 * reference_input_hz =
 80e6`; `40e6` remains the physical input-reference value. The fractional-N
-word is rounded against this 80 MHz parent.
+word is rounded against this 80 MHz parent with the same integer arithmetic
+as the ADI Linux/no-OS driver. This matters at one-million zoom: the correction
+is a sub-Hz coordinate term, so API and SSE metadata must serialize coordinate
+fields with fractional precision rather than whole-Hz `%.0f` formatting.
 
 The reducer uses `actual_source_start_hz = requested_source_start_hz +
 effective_error_hz`. The displayed `visible_start_hz`/`visible_end_hz` remain

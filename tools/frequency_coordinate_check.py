@@ -125,7 +125,8 @@ def start_payload(center_hz):
 def run_case(enabled):
     """Start one backend with the RFPLL model enabled or disabled."""
     global BASE
-    center_hz = 840_000_123.5
+    center_hz = 840_000_123.25
+    payload = start_payload(center_hz)
     port = allocate_loopback_port()
     BASE = f"http://127.0.0.1:{port}"
     test_dir = os.path.dirname(os.path.abspath(TEST_BINARY))
@@ -144,7 +145,7 @@ def run_case(enabled):
             text=True,
         )
         wait_for_server(process)
-        response = http_json("POST", "/api/start", start_payload(center_hz))
+        response = http_json("POST", "/api/start", payload)
         if response.get("status") != "ok":
             raise RuntimeError(f"start failed: {response}")
         status = http_json("GET", "/api/status")
@@ -154,6 +155,16 @@ def run_case(enabled):
         effective_hz = float(status.get("fq_err_effective_hz", 0.0))
         visible_start = float(status["visible_start_hz"])
         visible_end = float(status["visible_end_hz"])
+        if abs(visible_start - float(payload["visible_start_hz"])) > 1e-6:
+            raise RuntimeError(
+                "visible_start_hz lost fractional precision: "
+                f"{visible_start} vs {payload['visible_start_hz']}"
+            )
+        if abs(visible_end - float(payload["visible_end_hz"])) > 1e-6:
+            raise RuntimeError(
+                "visible_end_hz lost fractional precision: "
+                f"{visible_end} vs {payload['visible_end_hz']}"
+            )
         display_bins = int(status["display_bins"])
         source_start = float(status["scan_start_hz"])
         source_span = float(status["source_span_hz"])

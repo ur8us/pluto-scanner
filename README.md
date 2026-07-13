@@ -89,6 +89,7 @@ I want this project to explore new principles for SDR tools:
 5. Waterfall speed limits expressed as a range from and to lines per second instead of tying behavior directly to FFT size. The program should do its best to satisfy the user's desired behavior.
 6. Persistent waterfall history: when zooming or moving through frequencies, the waterfall is not cleared. It shows all recorded data that still applies, even when stretched. This is a known SDR UI principle, but it still needs better implementation so history remains useful across large zoom and frequency changes.
 7. Low-latency resolution changes: very fine frequency resolution needs FFTs built from many seconds of samples. Traditional SDR programs can make the user wait several seconds after switching resolution before the first new waterfall line appears. This scanner reuses compatible samples already held in memory for the first preview lines, so the display responds quickly while live acquisition catches up.
+8. Exact frequency tuning: deterministic compensation for PLL and DDS-style rounding errors keeps received signals plotted at their true frequencies.
 
 ## Defaults
 
@@ -344,8 +345,10 @@ http://localhost:8080
   source-bin coordinate in single-frequency mode. It includes the exact
   integer-hertz IIO LO request rounding and AD936x even-hertz clock bridge
   before the fractional-N tuning word. For Pluto's 40 MHz reference input the
-  model uses the driver's doubled 80 MHz RFPLL parent, keeping scale and FFT
-  coordinates aligned without changing the requested LO. `/api/status` exposes modeled and effective values for diagnosis; a
+  model uses the driver's doubled 80 MHz RFPLL parent and integer tuning-word
+  rounding, keeping scale and FFT coordinates aligned without changing the
+  requested LO. Fractional-hertz coordinates are preserved in API and SSE
+  metadata so one-million zoom views do not lose sub-Hz placement. `/api/status` exposes modeled and effective values for diagnosis; a
   known external reference or converter error still requires real measurement.
 - Coherent FFT magnitude remains Hann/CIC calibrated. The packed waterfall
   applies a separate Hann-ENBW noise-density and peak-reducer presentation

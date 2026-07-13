@@ -321,7 +321,9 @@ then the AD936x `freq >> 1` / `freq << 1` clock bridge (odd requests become
 the preceding even hertz). Calculate the nearest fractional-N LO using modulus
 `8388593` against the stock driver's doubled `80 MHz` RFPLL parent for a
 `40 MHz` Pluto reference input, and a power-of-two VCO divider placing the VCO
-in `6..12 GHz`. Calculate
+in the driver range above `6 GHz` and up to `12 GHz`. Match the ADI driver's
+integer tuning-word rounding:
+`fract = floor((remainder * 8388593 + parent / 2) / parent)`. Calculate
 `actual_lo - unrounded_requested_lo`, convert that signed error through the
 active converter branch, and add it to the *source-bin coordinate* only. Do
 not change the IIO LO write, requested air frequencies, or converter setting.
@@ -329,6 +331,11 @@ Do not add a fixed local calibration residual. Keep `fq_err_model_hz` and
 `fq_err_effective_hz` in `/api/status` and total correction plus `raw_peak_hz`
 in row diagnostic metadata. This is a coordinate model, not a retune; it does
 not correct sample-clock or converter error outside the measured installation.
+API and SSE coordinate fields must preserve fractional hertz; do not serialize
+active `visible_*_hz`, `scan_*_hz`, `f0`, `f1`, `second_if_hz`, or `step_hz`
+with whole-Hz formatting.
+`raw_peak_hz` must search only the visible interval, so hidden zero-IF/DC peaks
+outside the displayed spectrum cannot replace the inspected carrier.
 
 Scan/hop mode is used when the visible span needs more than one Pluto passband:
 
