@@ -15,3 +15,4 @@ playwright-report/
 ui-test-screenshots/
 PHASE*/
 .release/
+misc/

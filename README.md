@@ -85,7 +85,7 @@ I want this project to explore new principles for SDR tools:
 1. AI-first development.
 2. A web interface that minimizes traffic.
 3. A spectrum view with very large zoom: from gigahertz-wide full-screen spans down to hertz-per-pixel detail, one million times zoom.
-4. Seamless merging of scan/hop mode and single-frequency reception, hidden from the user, while zoom changes preserve the waterfall noise-floor background color rather than keeping an individual carrier at a fixed visual level.
+4. Seamless merging of scan/hop mode and single-frequency reception, hidden from the user.
 5. Waterfall speed limits expressed as a range from and to lines per second instead of tying behavior directly to FFT size. The program should do its best to satisfy the user's desired behavior.
 6. Persistent waterfall history: when zooming or moving through frequencies, the waterfall is not cleared. It shows all recorded data that still applies, even when stretched. This is a known SDR UI principle, but it still needs better implementation so history remains useful across large zoom and frequency changes.
 7. Low-latency resolution changes: very fine frequency resolution needs FFTs built from many seconds of samples. Traditional SDR programs can make the user wait several seconds after switching resolution before the first new waterfall line appears. This scanner reuses compatible samples already held in memory for the first preview lines, so the display responds quickly while live acquisition catches up.
