@@ -2450,6 +2450,7 @@ typedef struct {
     int rate_drop_cycle;
     int rate_have_cycle;
     int max_ffts_per_buffer;
+    uint32_t line_sample_count;
     uint32_t rate_limit_lps;
     double rate_keep_ratio;
     double rate_keep_credit;
@@ -5262,6 +5263,45 @@ static void publish_scan_line(scan_ctx_t *ctx)
 static int rate_limiter_should_keep(scan_ctx_t *ctx);
 
 /**
+ * @brief Refresh the active maximum-rate limiter from global settings.
+ *
+ * Rate-limit changes do not alter scan/hop FFT geometry, so the running scan
+ * context can update its keep/drop ratio without stopping Pluto. In single
+ * mode this also updates the post-FFT limiter used by CIC paths; minimum-rate
+ * changes that affect overlap still restart the stream through `/api/rate`.
+ *
+ * @param ctx Active scan context.
+ */
+static void scan_ctx_refresh_rate_limit(scan_ctx_t *ctx)
+{
+    uint32_t limit_lps;
+    double line_rate = 0.0;
+
+    if (!ctx || ctx->line_sample_count == 0)
+        return;
+    limit_lps = normalize_rate_limit_lps(g_rate_limit_lps);
+    if (limit_lps == ctx->rate_limit_lps)
+        return;
+
+    ctx->rate_limit_lps = limit_lps;
+    ctx->rate_drop_factor = rate_drop_factor_for_plan(
+        ctx->raw_samplerate, ctx->line_sample_count,
+        ctx->total_steps, ctx->decim_factor,
+        ctx->rate_limit_lps, &line_rate);
+    ctx->estimated_line_rate = line_rate;
+    ctx->rate_keep_ratio = rate_keep_ratio_for_line_rate(
+        ctx->estimated_line_rate, ctx->rate_limit_lps,
+        ctx->single_mode);
+    ctx->rate_keep_credit = 1.0;
+    ctx->rate_drop_cycle = 0;
+    ctx->rate_have_cycle = 0;
+    ctx->last_publish_msec = 0;
+    fprintf(stderr,
+            "[SDR] Updated active max waterfall rate to %u lines/s, drop %d\n",
+            ctx->rate_limit_lps, ctx->rate_drop_factor);
+}
+
+/**
  * @brief Enforce the configured maximum waterfall publish rate by wall clock.
  *
  * The existing ratio limiter drops callbacks before or after FFT work based on
@@ -5707,6 +5747,8 @@ static void *scan_worker_thread(void *arg)
 
 static int scan_callback_should_process(scan_ctx_t *ctx, int channel)
 {
+    scan_ctx_refresh_rate_limit(ctx);
+
     if (ctx->rate_keep_ratio >= 0.999999)
         return 1;
 
@@ -6127,6 +6169,7 @@ static void *scan_thread_func(void *arg)
     kernel_buffers = ctx.single_mode ? PLUTO_CONTINUOUS_KERNEL_BUFFERS :
         PLUTO_SCAN_KERNEL_BUFFERS;
     ctx.rate_limit_lps = normalize_rate_limit_lps(g_rate_limit_lps);
+    ctx.line_sample_count = line_sample_count;
     ctx.rate_drop_factor = rate_drop_factor_for_plan(ctx.raw_samplerate, line_sample_count,
                                                      ctx.total_steps,
                                                      ctx.decim_factor,
@@ -8181,8 +8224,10 @@ start_bad_json:
         }
         if (rate_changed || min_changed) {
             save_config();
-            restart_needed = rate_changed ||
-                (min_changed && planned_run_mode() == RUN_MODE_SINGLE);
+            run_mode_t mode = planned_run_mode();
+            restart_needed = mode == RUN_MODE_SINGLE &&
+                (min_changed ||
+                 (rate_changed && g_min_rate_lps > g_rate_limit_lps));
             if (g_scanning && restart_needed) {
                 g_view_id++;
                 ret = start_scan();

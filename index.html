@@ -6690,12 +6690,11 @@
             }
 
             async function updateBackendWaterfallRate() {
-                /* Rate changes restart single CIC capture when overlap or the
-                 * final limiter plan changes. The queued presentation rows use
-                 * the preceding interval, so retaining them causes the first
-                 * new previews to render as an immediate burst. */
+                /* Rate changes affect display pacing and may restart only
+                 * single-frequency plans whose overlap geometry changed. They
+                 * are not frequency/view changes, so existing view rows remain
+                 * valid while the backend applies the new limiter. */
                 clearWaterfallPresentationQueue();
-                if (scanRunning) pendingViewChange = true;
                 const result = await apiPost("/api/rate", {
                     min_rate_lps: parseInt(
                         document.getElementById("minRate").value,
