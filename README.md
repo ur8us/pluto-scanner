@@ -11,26 +11,6 @@ behavior is implemented as a host-side Pluto hop loop:
 set RX LO -> discard stale buffers -> refill useful buffer -> FFT -> publish row
 ```
 
-## Project Scope
-
-This project is focused on ADALM-Pluto SDR and directly compatible devices.
-Support for other receiver families is not planned for now.
-Multiple simultaneous receivers and multi-user operation are also not planned
-for the current program; the UI and backend are designed around one local
-operator controlling one Pluto.
-
-Demodulators and decoders are also out of scope for now. This includes SSB, FM,
-AM, and digital-mode decoding. The program is intended as a spectrum/waterfall
-scanner and high-zoom inspection tool, not as a general audio or data receiver.
-
-The scanner can still be used to detect and study many signal types by their
-spectrum and waterfall behavior: broadcast radio carriers, amateur and satellite
-signals, Wi-Fi and other ISM-band activity, telemetry bursts, local oscillators,
-spurious emissions, harmonics, and intermittent RF noise. It is also useful for
-searching for sources of RF interference by watching where signals appear,
-drift, repeat, or disappear while antennas, cables, devices, or locations are
-changed.
-
 ## Releases
 
 Release builds are published on GitHub:
@@ -80,16 +60,38 @@ file. To use a specific Pluto address:
 
 ## My Motivation
 
-I want this project to explore new principles for SDR tools:
+I want this project to explore new principles for SDR tools (click to watch video descriptions):
 
-1. AI-first development.
-2. A web interface that minimizes traffic.
-3. A spectrum view with very large zoom: from gigahertz-wide full-screen spans down to hertz-per-pixel detail, one million times zoom.
+1. [AI-first development.](https://www.youtube.com/watch?v=ZIS-IX3Hf2Q)
+2. [A web interface that minimizes traffic.](https://www.youtube.com/watch?v=8sGSH4dmKbU)
+3. [A spectrum view with very large zoom: from gigahertz-wide full-screen spans down to hertz-per-pixel detail, one million times zoom.](https://www.youtube.com/watch?v=fvIV3nouoQ4)
 4. Seamless merging of scan/hop mode and single-frequency reception, hidden from the user.
 5. Waterfall speed limits expressed as a range from and to lines per second instead of tying behavior directly to FFT size. The program should do its best to satisfy the user's desired behavior.
 6. Persistent waterfall history: when zooming or moving through frequencies, the waterfall is not cleared. It shows all recorded data that still applies, even when stretched. This is a known SDR UI principle, but it still needs better implementation so history remains useful across large zoom and frequency changes.
 7. Low-latency resolution changes: very fine frequency resolution needs FFTs built from many seconds of samples. Traditional SDR programs can make the user wait several seconds after switching resolution before the first new waterfall line appears. This scanner reuses compatible samples already held in memory for the first preview lines, so the display responds quickly while live acquisition catches up.
 8. Exact frequency tuning: deterministic compensation for PLL and DDS-style rounding errors keeps received signals plotted at their true frequencies.
+
+
+## Project Scope
+
+This project is focused on ADALM-Pluto SDR and directly compatible devices.
+Support for other receiver families is not planned for now.
+Multiple simultaneous receivers and multi-user operation are also not planned
+for the current program; the UI and backend are designed around one local
+operator controlling one Pluto.
+
+Demodulators and decoders are also out of scope for now. This includes SSB, FM,
+AM, and digital-mode decoding. The program is intended as a spectrum/waterfall
+scanner and high-zoom inspection tool, not as a general audio or data receiver.
+
+The scanner can still be used to detect and study many signal types by their
+spectrum and waterfall behavior: broadcast radio carriers, amateur and satellite
+signals, Wi-Fi and other ISM-band activity, telemetry bursts, local oscillators,
+spurious emissions, harmonics, and intermittent RF noise. It is also useful for
+searching for sources of RF interference by watching where signals appear,
+drift, repeat, or disappear while antennas, cables, devices, or locations are
+changed.
+
 
 ## Defaults
 
