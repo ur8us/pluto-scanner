@@ -1065,6 +1065,11 @@
             const RATE_LIMIT_MIN_INDEX = 2;
             const RATE_LIMIT_MAX_INDEX = 7;
             const RATE_LIMIT_DEFAULT_INDEX = 5;
+            const RF_PORT_LABELS = {
+                A_BALANCED: "1 (A balanced)",
+                B_BALANCED: "2 (B balanced)",
+                C_BALANCED: "3 (C balanced)",
+            };
             const AUTO_RESTART_DELAY_MS = 900;
             const SSE_STALL_MIN_MS = 5000;
             const SSE_STALL_MAX_MS = 30000;
@@ -1540,7 +1545,7 @@
                 document.getElementById("freqStart").disabled = locked;
                 document.getElementById("freqEnd").disabled = locked;
                 document.getElementById("converterFreq").disabled = locked;
-                document.getElementById("rfPort").disabled = locked;
+                document.getElementById("rfPort").disabled = !connected;
                 document.getElementById("directSampling").disabled = locked;
                 document.getElementById("clockIn").disabled = locked;
                 document.getElementById("btnStart").disabled =
@@ -2963,9 +2968,12 @@
             /**
              * Return hover-readout precision for the rendered frequency scale.
              *
-             * Hover labels follow the main scale. When the adjacent major marks
-             * are at most 5 Hz apart, they add one digit so the pointer readout
-             * resolves 0.1 Hz.
+             * Hover labels follow the main scale's fine precision, but they keep
+             * at least three MHz decimals even when major ticks are whole MHz.
+             * Views narrower than 100 kHz keep hertz digits visible as grouped
+             * MHz fractions, such as `10489.500 300 MHz`.
+             * When the adjacent major marks are at most 5 Hz apart, they add one
+             * digit so the pointer readout resolves 0.1 Hz.
              *
              * @param {{left:number,right:number}} axis Visible frequency axis in hertz.
              * @param {number} width Scale width in CSS pixels.
@@ -2987,9 +2995,14 @@
                 );
                 const decimals = frequencyDecimalsForTicks(ticks);
                 const majorStep = majorFrequencyStepForTicks(ticks);
+                const spanHz = Math.abs(axis.right - axis.left);
+                const hoverDecimals = Math.max(
+                    decimals,
+                    spanHz < 100000 ? 6 : 3,
+                );
                 return Number.isFinite(majorStep) && majorStep <= 5
                     ? Math.max(decimals, 7)
-                    : decimals;
+                    : hoverDecimals;
             }
 
             /**
@@ -6226,6 +6239,48 @@
             }
 
             /**
+             * Rebuild the Pluto RX input selector from backend availability.
+             *
+             * @param {string[]|undefined} ports Supported `rf_port_select` names.
+             * @param {string|undefined} selected Backend-confirmed active port.
+             * @returns {void}
+             */
+            function syncRfPortOptions(ports, selected) {
+                const select = document.getElementById("rfPort");
+                if (!select || !Array.isArray(ports)) return;
+                const normalized = ports.filter((port, index) => {
+                    return (
+                        RF_PORT_LABELS[port] &&
+                        ports.indexOf(port) === index
+                    );
+                });
+                if (!normalized.length) normalized.push("A_BALANCED");
+                const currentValues = Array.from(select.options).map(
+                    (option) => option.value,
+                );
+                const same =
+                    currentValues.length === normalized.length &&
+                    currentValues.every((value, index) => {
+                        return value === normalized[index];
+                    });
+                if (!same) {
+                    select.replaceChildren(
+                        ...normalized.map((port) => {
+                            const option = document.createElement("option");
+                            option.value = port;
+                            option.textContent = RF_PORT_LABELS[port];
+                            return option;
+                        }),
+                    );
+                }
+                const next =
+                    selected && normalized.includes(selected)
+                        ? selected
+                        : normalized[0];
+                select.value = next;
+            }
+
+            /**
              * Reflect the backend's active Pluto RF profile in the status bar.
              *
              * @param {Object} plan Backend status/start/view payload.
@@ -6274,9 +6329,17 @@
                     const gainMode = document.getElementById("gainMode");
                     if (gainMode) gainMode.value = String(plan.gain_mode);
                 }
+                syncRfPortOptions(plan.rf_ports, plan.rf_port);
                 if (plan.rf_port !== undefined) {
                     const port = document.getElementById("rfPort");
-                    if (port) port.value = String(plan.rf_port);
+                    if (
+                        port &&
+                        Array.from(port.options).some((option) => {
+                            return option.value === String(plan.rf_port);
+                        })
+                    ) {
+                        port.value = String(plan.rf_port);
+                    }
                 }
                 if (plan.hardwaregain_db !== undefined) {
                     const gain = Number(plan.hardwaregain_db);
@@ -6689,6 +6752,30 @@
                 }, 80);
             }
 
+            /**
+             * Send the selected Pluto RX input to the backend immediately.
+             *
+             * Unlike frequency and converter edits, changing `rf_port_select`
+             * does not alter spectrum coordinates, so the running waterfall does
+             * not need a view restart.
+             *
+             * @returns {Promise<void>}
+             */
+            async function updateBackendRfPort() {
+                const port = document.getElementById("rfPort");
+                if (!port) return;
+                const result = await apiPost("/api/rf-port", {
+                    rf_port: port.value,
+                });
+                if (result && result.status === "ok") {
+                    syncPlutoControls(result);
+                } else if (result && result.rf_port !== undefined) {
+                    syncPlutoControls(result);
+                } else {
+                    updateUI(scanRunning, false);
+                }
+            }
+
             async function updateBackendWaterfallRate() {
                 /* Rate changes affect display pacing and may restart only
                  * single-frequency plans whose overlap geometry changed. They
@@ -6780,6 +6867,9 @@
                 .addEventListener("change", function () {
                     scheduleGainUpdate();
                 });
+            document
+                .getElementById("rfPort")
+                .addEventListener("change", updateBackendRfPort);
 
             function handleRateSliderInput(changed) {
                 const changes = syncRateRangeFromSliders(changed);
@@ -7016,6 +7106,14 @@
                         left: 10489500000,
                         right: 10489500020,
                     };
+                    const wideIntegerTickAxis = {
+                        left: 10400000000,
+                        right: 10500000000,
+                    };
+                    const sub100KhzAxis = {
+                        left: 10489500000,
+                        right: 10489580000,
+                    };
                     const testFrequency = 10489500300;
                     const fineFrequency = 10489500002.3;
                     return {
@@ -7028,6 +7126,16 @@
                         hover_like_scale: formatFrequencyLikeScale(
                             testFrequency,
                             axis,
+                            900,
+                        ),
+                        hover_wide_integer_ticks: formatFrequencyLikeScale(
+                            testFrequency,
+                            wideIntegerTickAxis,
+                            900,
+                        ),
+                        hover_sub_100khz: formatFrequencyLikeScale(
+                            testFrequency,
+                            sub100KhzAxis,
                             900,
                         ),
                         hover_tenth_hz: formatFrequencyLikeScale(
@@ -7174,10 +7282,6 @@
                         currentConverterFreq = status.converter_freq;
                         document.getElementById("converterFreq").value =
                             status.converter_freq / 1e6;
-                    }
-                    if (status.rf_port !== undefined) {
-                        document.getElementById("rfPort").value =
-                            String(status.rf_port);
                     }
                     syncPlutoControls(status);
                     if (status.direct_sampling_max_hz !== undefined) {

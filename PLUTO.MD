@@ -88,7 +88,7 @@ int n = iio_device_attr_write(dev->phy, "attr_name", buf);
 | `rssi` | double | Received signal strength (dB) |
 | `rf_port_select` | string | `A_BALANCED`, `B_BALANCED`, `C_BALANCED` |
 
-**`altvoltage0` (TX LO channel):**
+**`altvoltage0` (RX LO channel):**
 
 | Attribute | Type | Description |
 |---|---|---|

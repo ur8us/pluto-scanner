@@ -442,8 +442,8 @@ tools/frequency_coordinate_check.py
 tools/headless_tester.py
 tools/ui_browser_test.py
 tools/phase3_browser_stress.py
-tools/zoom_sweep.py --use-existing --freq-start-mhz 70 --freq-end-mhz 1000 --min-rate-lps 10 --rate-limit-lps 20 --out zoom-rate-matrix.md
-tools/browser_zoom_matrix.py --output browser-zoom-matrix.json --freq-start-mhz 70 --freq-end-mhz 1000 --min-rate-lps 10 --rate-limit-lps 20 --settle-seconds 4
+tools/zoom_sweep.py --use-existing --freq-start-mhz 70 --freq-end-mhz 6000 --min-rate-lps 10 --rate-limit-lps 20 --out zoom-rate-matrix.md
+tools/browser_zoom_matrix.py --output browser-zoom-matrix.json --freq-start-mhz 70 --freq-end-mhz 6000 --min-rate-lps 10 --rate-limit-lps 20 --settle-seconds 4
 tools/fm_screenshot.py --output images/fm-broadcast-waterfall.png --wait-seconds 60
 tools/frontend_random_validation.py --output frontend-random-validation.json
 ```

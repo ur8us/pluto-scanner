@@ -37,11 +37,13 @@ expect_status 200 GET /
 expect_status 200 GET /api/status
 expect_status 400 POST /api/fft '{"fft_size":"bad"}'
 expect_status 400 POST /api/view '{"visible_start_hz":100,"visible_end_hz":50}'
+expect_status 400 POST /api/rf-port '{"rf_port":"INVALID"}'
 expect_status 404 GET /does-not-exist
 
 status_headers="$(mktemp)"
 status_body="$(mktemp)"
-trap 'rm -f "$status_headers" "$status_body"' EXIT
+rf_body="$(mktemp)"
+trap 'rm -f "$status_headers" "$status_body" "$rf_body"' EXIT
 status_code="$(curl -sS -D "$status_headers" -o "$status_body" \
     -w '%{http_code}' "$BASE_URL/api/status")"
 if [ "$status_code" != 200 ]; then
@@ -76,5 +78,37 @@ for key in ("device", "mode", "steps", "sample_rates"):
     if key not in payload:
         raise SystemExit(f"GET /api/status missing JSON key: {key}")
 PY
+
+rf_info="$(
+    python3 - "$status_body" <<'PY'
+import json
+import sys
+with open(sys.argv[1], "rb") as f:
+    payload = json.load(f)
+ports = payload.get("rf_ports") or ["A_BALANCED"]
+current = payload.get("rf_port") or ports[0]
+target = next((port for port in ports if port != current), current)
+print(current + " " + target)
+PY
+)"
+original_rf_port="${rf_info% *}"
+test_rf_port="${rf_info#* }"
+rf_code="$(curl -sS -o "$rf_body" -w '%{http_code}' \
+    -X POST -H 'Content-Type: application/json' \
+    --data "{\"rf_port\":\"$test_rf_port\"}" "$BASE_URL/api/rf-port")"
+if [ "$rf_code" != 200 ]; then
+    echo "POST /api/rf-port returned $rf_code, expected 200" >&2
+    exit 1
+fi
+python3 - "$rf_body" "$test_rf_port" <<'PY'
+import json
+import sys
+with open(sys.argv[1], "rb") as f:
+    payload = json.load(f)
+if payload.get("status") != "ok" or payload.get("rf_port") != sys.argv[2]:
+    raise SystemExit(f"unexpected /api/rf-port response: {payload}")
+PY
+curl -sS -o /dev/null -X POST -H 'Content-Type: application/json' \
+    --data "{\"rf_port\":\"$original_rf_port\"}" "$BASE_URL/api/rf-port"
 
 echo "HTTP smoke checks passed for $BASE_URL"

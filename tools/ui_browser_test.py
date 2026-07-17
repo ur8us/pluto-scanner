@@ -116,6 +116,8 @@ def main():
             "khz": "10489.500 MHz",
             "hz": "10489.500 300 MHz",
             "hover_like_scale": "10489.500 300 MHz",
+            "hover_wide_integer_ticks": "10489.500 MHz",
+            "hover_sub_100khz": "10489.500 300 MHz",
             "hover_tenth_hz": "10489.500 0023 MHz",
             "delta": "10Hz",
             "second_delta_left": 10489500100,
@@ -146,7 +148,7 @@ def main():
             el.clear()
             el.send_keys(value)
         Select(driver.find_element(By.ID, "gainMode")).select_by_value("manual")
-        Select(driver.find_element(By.ID, "rfPort")).select_by_value("B_BALANCED")
+        Select(driver.find_element(By.ID, "rfPort")).select_by_value("A_BALANCED")
         driver.execute_script(
             "const el=document.getElementById('vgaGain');"
             "el.value='20'; el.dispatchEvent(new Event('input',{bubbles:true}));"
@@ -155,8 +157,22 @@ def main():
         WebDriverWait(driver, 12).until(
             lambda d: d.find_element(By.ID, "statusText").text == "scanning"
         )
-        if api_status(driver).get("rf_port") != "B_BALANCED":
+        first_rf_status = api_status(driver)
+        if first_rf_status.get("rf_port") != "A_BALANCED":
             raise RuntimeError("selected Pluto RX input was not sent to the backend")
+        rf_port_select = Select(driver.find_element(By.ID, "rfPort"))
+        if not driver.find_element(By.ID, "rfPort").is_enabled():
+            raise RuntimeError("Pluto RX input selector is disabled while scanning")
+        available_rf_ports = first_rf_status.get("rf_ports") or ["A_BALANCED"]
+        alternate_rf_port = next(
+            (port for port in available_rf_ports if port != "A_BALANCED"),
+            None,
+        )
+        if alternate_rf_port:
+            rf_port_select.select_by_value(alternate_rf_port)
+            WebDriverWait(driver, 10).until(
+                lambda d: api_status(d).get("rf_port") == alternate_rf_port
+            )
         WebDriverWait(driver, 15).until(
             lambda d: "steps" in d.find_element(By.ID, "infoScan").text.lower()
         )

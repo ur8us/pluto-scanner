@@ -157,7 +157,10 @@ This binds `127.0.0.1:8080` and opens Pluto through the saved/default
 
 The program does not implement authentication, TLS, per-user sessions, or
 multi-user arbitration. Binding to a non-loopback address should therefore be
-treated as trusted-network-only operation.
+treated as trusted-network-only operation. For wildcard LAN binds, the startup
+banner prints `localhost` plus reachable `http://...` URLs for active
+non-loopback interface addresses where they can be enumerated. For a concrete
+non-loopback bind, it prints the bound address.
 
 ### 3.4 Operational modes
 
@@ -352,9 +355,16 @@ CORS headers. `OPTIONS` preflight is answered with `204 No Content`.
 | POST | `/api/view` | JSON | Update visible viewport (`visible_start_hz`, `visible_end_hz`, `display_bins`); restart scan if changed |
 | POST | `/api/fft` | JSON | Set `fft_size` (`1024..65536`, power of two) |
 | POST | `/api/gain` | JSON | Set `gain_mode` + `hardwaregain_db` |
+| POST | `/api/rf-port` | JSON | Set Pluto RX `rf_port_select` (`A_BALANCED`, `B_BALANCED`, `C_BALANCED`) |
 | POST | `/api/rate` | JSON | Set `rate_limit_lps` (max waterfall line rate) |
 | POST | `/api/min-rate` | JSON | Set `min_rate_lps` (min waterfall line rate) |
 | POST | `/api/goto` | JSON | Persist Go To target (`goto_freq_hz`, `goto_target_zoom`, `goto_animate`, `goto_delay_s`) |
+
+`/api/rate` accepts `min_rate_lps` together with `rate_limit_lps` for the
+dual-handle rate slider. Pure maximum-rate changes update pacing in place,
+including scan/hop mode; they do not restart the scan or retune Pluto.
+Minimum-rate changes may restart single-frequency mode when the CIC overlap
+geometry must change.
 
 **Note:** `/api/start` is authoritative for RF settings. The client-supplied
 `samplerate` (or alias `sample_rate`), `rf_bandwidth` (or alias
@@ -392,7 +402,8 @@ ordinary user-editable controls.
 | `fft_size`, `effective_fft_size` | Selected vs planner-chosen FFT |
 | `decim_factor`, `decim_hop`, `overlap_factor` | CIC decimation params |
 | `effective_input_samples` | Samples consumed per published line |
-| `gain_mode`, `hardwaregain_db` | Gain settings |
+| `gain_mode`, `hardwaregain_db`, `rf_port` | Gain and active RX input settings |
+| `rf_ports` | Backend-verified RX input list accepted by the connected Pluto |
 | `rssi_db`, `input_peak`, `clipped_samples` | Live readbacks |
 | `goto_freq_hz`, `goto_target_zoom`, `goto_animate`, `goto_delay_s` | Go To state |
 | `sample_rates` | JSON array of supported rates |
@@ -406,7 +417,9 @@ ordinary user-editable controls.
 
 `rf_port` is one of `A_BALANCED`, `B_BALANCED`, or `C_BALANCED`, selected by
 the `Input` control as Pluto RX input 1, 2, or 3. It is written to the standard
-AD936x `rf_port_select` attribute immediately before a stream starts.
+AD936x `rf_port_select` attribute immediately before a stream starts and can be
+changed during an active stream through `/api/rf-port` without retuning or
+clearing the waterfall.
 
 `freq_start`/`freq_end` are air-frequency values in MHz. Receiver limits are
 validated after applying `converter_freq`; invalid converted bands return
@@ -488,6 +501,12 @@ bundler, no framework, no npm runtime dependency.
   ticks chosen for the current span (`chooseFrequencyStep`). Labels group Hz
   digits after the kHz group (`10489.500 300 MHz`), and a centred light-blue
   `<10Hz>`-style marker shows the major-tick distance.
+  Cursor hover labels use the same hertz coordinate transform, but keep at
+  least three MHz decimals even when major ticks are whole MHz. When the
+  visible waterfall/spectrum width is below `100 kHz`, hover labels must show
+  hertz digits as six MHz fractional digits grouped after the kHz part, e.g.
+  `10489.500 300 MHz`; when adjacent major marks are `≤ 5 Hz`, they must show
+  one additional digit for `0.1 Hz` pointer resolution.
 
 ### 4.2 Color map
 
@@ -543,7 +562,7 @@ client reconnects. Heartbeat shows `disconnected` / `idle` / `scanning`.
 | Constant | Value |
 |---|---|
 | `MAX_ZOOM_FACTOR` | 1,000,000 |
-| `MIN_FREQ_START_MHZ` | 70 |
+| `MIN_AIR_FREQ_START_MHZ` | 0 |
 | `MIN_SCAN_SPAN_MHZ` | 0.1 |
 | `MAX_WF_HISTORY_BINS` | 12,000,000 |
 | `WF_REDRAW_ROWS_PER_FRAME` | 24 |

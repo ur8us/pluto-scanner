@@ -17,11 +17,6 @@ Release builds are published on GitHub:
 
 https://github.com/ur8us/pluto-scanner/releases
 
-Pushing a tag named `v*` starts the GitHub Actions release workflow. The workflow
-builds static release binaries with static `libiio` and `libxml2` linked in,
-packages the runtime assets next to the executable, and uploads the files to the
-GitHub release.
-
 Nightly builds are published as a prerelease named `nightly` and are refreshed
 by the scheduled GitHub Actions workflow. Use them for testing recent changes;
 use tagged releases when you need stable, reproducible files.
@@ -65,7 +60,7 @@ I want this project to explore new principles for SDR tools (click to watch vide
 1. [AI-first development.](https://www.youtube.com/watch?v=ZIS-IX3Hf2Q)
 2. [A web interface that minimizes traffic.](https://www.youtube.com/watch?v=8sGSH4dmKbU)
 3. [A spectrum view with very large zoom: from gigahertz-wide full-screen spans down to hertz-per-pixel detail, one million times zoom.](https://www.youtube.com/watch?v=fvIV3nouoQ4)
-4. Seamless merging of scan/hop mode and single-frequency reception, hidden from the user.
+4. [Seamless merging of scan/hop mode and single-freque ncy reception, hidden from the user.](https://www.youtube.com/watch?v=KnPlvGlBu_s)
 5. Waterfall speed limits expressed as a range from and to lines per second instead of tying behavior directly to FFT size. The program should do its best to satisfy the user's desired behavior.
 6. Persistent waterfall history: when zooming or moving through frequencies, the waterfall is not cleared. It shows all recorded data that still applies, even when stretched. This is a known SDR UI principle, but it still needs better implementation so history remains useful across large zoom and frequency changes.
 7. Low-latency resolution changes: very fine frequency resolution needs FFTs built from many seconds of samples. Traditional SDR programs can make the user wait several seconds after switching resolution before the first new waterfall line appears. This scanner reuses compatible samples already held in memory for the first preview lines, so the display responds quickly while live acquisition catches up.
@@ -167,6 +162,7 @@ Dependencies:
 
 - GCC
 - GNU Make
+- `pkg-config`
 - `libiio` headers and library
 - POSIX threads
 - `libm`
@@ -177,7 +173,7 @@ Dependencies:
 On Debian/Ubuntu-like systems:
 
 ```sh
-sudo apt install build-essential libiio-dev nodejs python3 python3-pip
+sudo apt install build-essential libiio-dev nodejs pkg-config python3 python3-pip
 python3 -m pip install -r requirements.txt
 make
 make check
@@ -213,6 +209,7 @@ Install MSYS2, open the "UCRT64" shell, then install dependencies:
 pacman -S --needed \
   base-devel \
   git \
+  make \
   mingw-w64-ucrt-x86_64-gcc \
   mingw-w64-ucrt-x86_64-libiio \
   mingw-w64-ucrt-x86_64-pkgconf \
@@ -236,7 +233,7 @@ Install Xcode command-line tools and Homebrew dependencies:
 
 ```sh
 xcode-select --install
-brew install libiio node python
+brew install libiio node pkg-config python
 make
 ```
 
@@ -265,9 +262,10 @@ port with `--port`, and bind to another address only on a trusted network:
 ./pluto-scanner --bind :: --port 8080
 ```
 
-When using a custom port, open that port in the browser. When binding to
-`0.0.0.0` or `::` for LAN access, open `http://<scanner-computer-ip>:<port>`
-from the other machine.
+When using a custom port, open that port in the browser. For wildcard LAN binds
+such as `0.0.0.0` or `::`, the startup banner lists `localhost` first and then
+additional `http://...` URLs for active non-loopback interface addresses. For a
+concrete non-loopback bind, it prints the bound address.
 
 Open:
 
@@ -303,7 +301,7 @@ http://localhost:8080
 
 ## UI Controls
 
-- Start/end frequency and converter are air-frequency settings. Receiver limits are checked after converter conversion, so invalid bands are rejected instead of silently rewritten. The adjacent `Input` control selects Pluto RX input 1/2/3 through `rf_port_select` as `A_BALANCED`, `B_BALANCED`, or `C_BALANCED`.
+- Start/end frequency and converter are air-frequency settings. Receiver limits are checked after converter conversion, so invalid bands are rejected instead of silently rewritten. The adjacent `Input` control selects a backend-verified Pluto RX input through `rf_port_select` and can be changed while scanning without retuning.
 - Sample rate, RF bandwidth, and passband usage are auto-profiled for Pluto performance and shown read-only in the UI.
 - RF bandwidth is kept strictly below sample rate in every auto profile.
 - Waterfall rows are published as exactly one processed output bin per screen pixel; raw FFT/CIC bin counts are kept as debug metadata.
@@ -329,6 +327,8 @@ http://localhost:8080
   CIC decimation, then uses integer overlap on the decimated stream to increase
   line cadence. The status line shows this as `FFT=<size> x<decim>` plus an
   overlap factor when active.
+- In scan/hop mode, changing only the maximum waterfall rate updates the active
+  rate limiter in place. It does not restart the scan or retune Pluto.
 - Compatible high-zoom view changes can draw cached historical preview rows
   before the first new live row arrives. Preview rows use the same CIC/Hann/FFT
   path and are not mixed with post-restart samples. This is especially useful
@@ -430,3 +430,16 @@ long-run hardware pass.
 - `index.html` - frontend UI.
 - `bands.ini` - editable band overlays.
 - `markers.ini` - editable frequency markers.
+
+## Static Third-Party Libraries in Release Executables
+
+For user convenience, GitHub release executables are automatically compiled with
+static third-party libraries where the release workflow supports that packaging
+model. The project-managed static libraries are:
+
+- `libiio` - LGPL-2.1-or-later.
+- `libxml2` - MIT License.
+
+Depending on the target platform and compiler toolchain, release executables may
+also include standard C runtime or compiler support code required by that
+platform.

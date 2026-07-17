@@ -16,6 +16,9 @@
  */
 
 #define _USE_MATH_DEFINES
+#ifndef _DEFAULT_SOURCE
+#define _DEFAULT_SOURCE
+#endif
 #define _POSIX_C_SOURCE 200809L
 #include <stdio.h>
 #include <stdlib.h>
@@ -33,8 +36,12 @@
 #include <winsock2.h>
 #include <ws2tcpip.h>
 #include <windows.h>
+#include <iphlpapi.h>
 #include <direct.h>
 #include <io.h>
+#ifndef IF_TYPE_SOFTWARE_LOOPBACK
+#define IF_TYPE_SOFTWARE_LOOPBACK 24
+#endif
 #ifndef ssize_t
 typedef SSIZE_T ssize_t;
 #endif
@@ -60,7 +67,10 @@ static int win32_nanosleep(const struct timespec *req, struct timespec *rem)
 #include <unistd.h>
 #include <sys/socket.h>
 #include <netinet/in.h>
+#include <arpa/inet.h>
 #include <netdb.h>
+#include <ifaddrs.h>
+#include <net/if.h>
 #include <sys/select.h>
 #include <fcntl.h>
 #include <dirent.h>
@@ -83,6 +93,8 @@ static int win32_nanosleep(const struct timespec *req, struct timespec *rem)
 #define MAX_REQUEST         65536
 #define MAX_CLIENTS         64
 #define MAX_SSE_CLIENTS     16
+#define STARTUP_URL_MAX     16
+#define STARTUP_URL_LEN     192
 #define API_JSON_BODY_MAX   8192
 #define MAX_FREQS           512
 #define MAX_SAMPLE_RATES    32
@@ -199,6 +211,7 @@ typedef struct pluto_sdr_dev_t {
     char context_description[256];
     char gain_mode[32];
     char rf_port[32];
+    char rf_ports_available[128];
     char rx_path_rates[256];
     double sample_rate;
     double rf_bandwidth;
@@ -284,6 +297,7 @@ static char g_bind_address[128] = DEFAULT_BIND_ADDRESS;
 static double g_hardwaregain_db = PLUTO_DEFAULT_GAIN_DB;
 static char g_gain_mode[32] = "manual";
 static char g_rf_port[32] = "A_BALANCED";
+static char g_rf_ports_available[128] = "A_BALANCED B_BALANCED C_BALANCED";
 static double g_last_rssi_db = -999.0;
 static double g_last_input_peak = 0.0;
 static uint64_t g_last_clipped_samples = 0;
@@ -1583,6 +1597,11 @@ static void pluto_read_device_string(struct iio_device *dev, const char *attr,
     trim_iio_string(dst);
 }
 
+static int rf_port_list_contains(const char *list, const char *port);
+static void normalize_rf_ports_available(char *dst, size_t dst_len,
+                                         const char *src);
+static void probe_rf_ports_available(pluto_sdr_dev_t *dev);
+
 static void pluto_update_readbacks(pluto_sdr_dev_t *dev)
 {
     long long ll = 0;
@@ -1602,6 +1621,19 @@ static void pluto_update_readbacks(pluto_sdr_dev_t *dev)
                               dev->gain_mode, sizeof(dev->gain_mode));
     pluto_read_channel_string(dev->phy_rx0, "rf_port_select",
                               dev->rf_port, sizeof(dev->rf_port));
+    {
+        char available[sizeof(dev->rf_ports_available)];
+        pluto_read_channel_string(dev->phy_rx0, "rf_port_select_available",
+                                  available, sizeof(available));
+        normalize_rf_ports_available(dev->rf_ports_available,
+                                     sizeof(dev->rf_ports_available),
+                                     available[0] ? available :
+                                     dev->rf_port[0] ? dev->rf_port :
+                                     "A_BALANCED");
+        probe_rf_ports_available(dev);
+        copy_cstr(g_rf_ports_available, sizeof(g_rf_ports_available),
+                  dev->rf_ports_available);
+    }
     pluto_read_device_string(dev->phy, "rx_path_rates",
                              dev->rx_path_rates, sizeof(dev->rx_path_rates));
     g_last_rssi_db = dev->rssi_db;
@@ -1637,6 +1669,8 @@ static int pluto_sdr_open(pluto_sdr_dev_t **out, int index)
     copy_cstr(dev->uri, sizeof(dev->uri), uri);
     copy_cstr(dev->gain_mode, sizeof(dev->gain_mode), g_gain_mode);
     copy_cstr(dev->rf_port, sizeof(dev->rf_port), g_rf_port);
+    copy_cstr(dev->rf_ports_available, sizeof(dev->rf_ports_available),
+              g_rf_ports_available);
     dev->sample_rate = g_samplerate;
     dev->rf_bandwidth = g_rf_bandwidth;
     dev->hardwaregain_db = g_hardwaregain_db;
@@ -1914,6 +1948,8 @@ static int pluto_sdr_set_rf_port(pluto_sdr_dev_t *dev, const char *port)
 
     if (!dev || !port || !*port)
         return -1;
+    if (!rf_port_list_contains(dev->rf_ports_available, port))
+        return -EINVAL;
     rc = (int)iio_channel_attr_write(dev->phy_rx0, "rf_port_select", port);
     if (rc < 0)
         return rc;
@@ -2249,6 +2285,240 @@ static void format_sample_rates_json(char *buf, size_t len)
         buf[len - 1] = 0;
 }
 
+static int rf_port_is_known(const char *port)
+{
+    return port && (strcmp(port, "A_BALANCED") == 0 ||
+                    strcmp(port, "B_BALANCED") == 0 ||
+                    strcmp(port, "C_BALANCED") == 0);
+}
+
+static int rf_port_list_contains(const char *list, const char *port)
+{
+    size_t port_len;
+    const char *p;
+
+    if (!list || !port || !*port)
+        return 0;
+    port_len = strlen(port);
+    p = list;
+    while (*p) {
+        while (*p && isspace((unsigned char)*p))
+            p++;
+        if (!*p)
+            break;
+        const char *start = p;
+        while (*p && !isspace((unsigned char)*p))
+            p++;
+        if ((size_t)(p - start) == port_len &&
+            strncmp(start, port, port_len) == 0)
+            return 1;
+    }
+    return 0;
+}
+
+static int first_rf_port_from_list(const char *list, char *out, size_t out_len)
+{
+    const char *p;
+
+    if (!list || !out || out_len == 0)
+        return -1;
+    p = list;
+    while (*p) {
+        char token[32];
+        size_t n;
+
+        while (*p && isspace((unsigned char)*p))
+            p++;
+        if (!*p)
+            break;
+        const char *start = p;
+        while (*p && !isspace((unsigned char)*p))
+            p++;
+        n = (size_t)(p - start);
+        if (n >= sizeof(token))
+            n = sizeof(token) - 1;
+        memcpy(token, start, n);
+        token[n] = 0;
+        if (rf_port_is_known(token)) {
+            copy_cstr(out, out_len, token);
+            return 0;
+        }
+    }
+    return -1;
+}
+
+static void normalize_rf_ports_available(char *dst, size_t dst_len,
+                                         const char *src)
+{
+    char first[32];
+    size_t pos = 0;
+    const char *p = src;
+
+    if (!dst || dst_len == 0)
+        return;
+    dst[0] = 0;
+    if (!p || !*p)
+        p = "A_BALANCED";
+    while (*p && pos + 1 < dst_len) {
+        char token[32];
+        size_t n;
+
+        while (*p && isspace((unsigned char)*p))
+            p++;
+        if (!*p)
+            break;
+        const char *start = p;
+        while (*p && !isspace((unsigned char)*p))
+            p++;
+        n = (size_t)(p - start);
+        if (n >= sizeof(token))
+            n = sizeof(token) - 1;
+        memcpy(token, start, n);
+        token[n] = 0;
+        if (!rf_port_is_known(token) ||
+            rf_port_list_contains(dst, token))
+            continue;
+        if (pos > 0 && pos + 1 < dst_len)
+            dst[pos++] = ' ';
+        n = strlen(token);
+        if (pos + n >= dst_len)
+            break;
+        memcpy(dst + pos, token, n);
+        pos += n;
+        dst[pos] = 0;
+    }
+    if (dst[0] == 0)
+        copy_cstr(dst, dst_len, "A_BALANCED");
+    if (first_rf_port_from_list(dst, first, sizeof(first)) != 0)
+        copy_cstr(dst, dst_len, "A_BALANCED");
+}
+
+static void rf_port_list_append(char *dst, size_t dst_len, const char *port)
+{
+    size_t pos;
+    size_t n;
+
+    if (!dst || dst_len == 0 || !rf_port_is_known(port) ||
+        rf_port_list_contains(dst, port))
+        return;
+    pos = strlen(dst);
+    n = strlen(port);
+    if (pos > 0) {
+        if (pos + 1 >= dst_len)
+            return;
+        dst[pos++] = ' ';
+        dst[pos] = 0;
+    }
+    if (pos + n >= dst_len)
+        return;
+    memcpy(dst + pos, port, n + 1);
+}
+
+/**
+ * @brief Probe advertised RX input ports and keep only ports Pluto accepts.
+ *
+ * Some Pluto firmware/IIO combinations advertise AD936x balanced inputs that
+ * the actual AD9363 board rejects with `-EINVAL`. The probe runs once while the
+ * device is being opened, before streaming starts, and restores the active port.
+ *
+ * @param dev Open Pluto device with `phy_rx0` and `rf_ports_available`.
+ */
+static void probe_rf_ports_available(pluto_sdr_dev_t *dev)
+{
+    char current[32];
+    char accepted[sizeof(dev->rf_ports_available)];
+    const char *p;
+
+    if (!dev || !dev->phy_rx0)
+        return;
+    copy_cstr(current, sizeof(current),
+              dev->rf_port[0] ? dev->rf_port : "A_BALANCED");
+    accepted[0] = 0;
+    p = dev->rf_ports_available;
+    while (*p) {
+        char token[32];
+        size_t n;
+
+        while (*p && isspace((unsigned char)*p))
+            p++;
+        if (!*p)
+            break;
+        const char *start = p;
+        while (*p && !isspace((unsigned char)*p))
+            p++;
+        n = (size_t)(p - start);
+        if (n >= sizeof(token))
+            n = sizeof(token) - 1;
+        memcpy(token, start, n);
+        token[n] = 0;
+        if (!rf_port_is_known(token))
+            continue;
+        if (iio_channel_attr_write(dev->phy_rx0,
+                                   "rf_port_select", token) == 0)
+            rf_port_list_append(accepted, sizeof(accepted), token);
+    }
+    if (accepted[0] == 0)
+        copy_cstr(accepted, sizeof(accepted), "A_BALANCED");
+    normalize_rf_ports_available(dev->rf_ports_available,
+                                 sizeof(dev->rf_ports_available),
+                                 accepted);
+    if (!rf_port_list_contains(dev->rf_ports_available, current) &&
+        first_rf_port_from_list(dev->rf_ports_available, current,
+                                sizeof(current)) != 0)
+        copy_cstr(current, sizeof(current), "A_BALANCED");
+    (void)iio_channel_attr_write(dev->phy_rx0, "rf_port_select", current);
+    copy_cstr(dev->rf_port, sizeof(dev->rf_port), current);
+}
+
+static int rf_port_is_supported(const char *port)
+{
+    return rf_port_is_known(port) &&
+        rf_port_list_contains(g_rf_ports_available, port);
+}
+
+static void format_rf_ports_json(char *buf, size_t len)
+{
+    size_t pos = 0;
+    const char *p = g_rf_ports_available;
+    int count = 0;
+
+    if (!buf || len == 0)
+        return;
+    pos += (size_t)snprintf(buf + pos, len - pos, "[");
+    while (*p && pos < len) {
+        char token[32];
+        size_t n;
+        int wrote;
+
+        while (*p && isspace((unsigned char)*p))
+            p++;
+        if (!*p)
+            break;
+        const char *start = p;
+        while (*p && !isspace((unsigned char)*p))
+            p++;
+        n = (size_t)(p - start);
+        if (n >= sizeof(token))
+            n = sizeof(token) - 1;
+        memcpy(token, start, n);
+        token[n] = 0;
+        if (!rf_port_is_known(token))
+            continue;
+        wrote = snprintf(buf + pos, len - pos, "%s\"%s\"",
+                         count ? "," : "", token);
+        if (wrote < 0)
+            break;
+        pos += (size_t)wrote;
+        count++;
+    }
+    if (count == 0 && pos < len)
+        pos += (size_t)snprintf(buf + pos, len - pos, "\"A_BALANCED\"");
+    if (pos < len)
+        snprintf(buf + pos, len - pos, "]");
+    else
+        buf[len - 1] = 0;
+}
+
 static int normalize_display_bins(int bins);
 static int current_display_bins(void);
 static double estimated_single_stream_sps_for_line_samples(uint32_t line_sample_count);
@@ -2373,6 +2643,8 @@ static int open_first_device(int verbose)
               "synthetic tone source" : "pseudo-random source");
     g_sample_rates[0] = SCANNER_SAMPLE_RATE_HZ;
     g_sample_rate_count = 1;
+    copy_cstr(g_rf_ports_available, sizeof(g_rf_ports_available),
+              "A_BALANCED B_BALANCED C_BALANCED");
     if (verbose)
         printf("[SDR] Using %s instead of Pluto SDR hardware\n",
                PSEUDO_RANDOM_SAMPLE_SOURCE == SYNTHETIC_TONE_SAMPLE_SOURCE ?
@@ -2408,6 +2680,16 @@ static int open_first_device(int verbose)
     if (ret != PLUTO_ERR_OK && verbose)
         printf("[SDR] Could not read board info: %d\n", ret);
     load_sample_rates(g_dev);
+    if (!rf_port_is_supported(g_rf_port)) {
+        char fallback[32];
+        if (first_rf_port_from_list(g_rf_ports_available, fallback,
+                                    sizeof(fallback)) != 0)
+            copy_cstr(fallback, sizeof(fallback), "A_BALANCED");
+        printf("[SDR] RX input %s is not available; using %s\n",
+               g_rf_port, fallback);
+        copy_cstr(g_rf_port, sizeof(g_rf_port), fallback);
+        save_config();
+    }
     if (verbose)
         printf("[SDR] Pluto hardware: %s %s\n", g_manufacturer, g_product);
     printf("[SDR] Pluto connected: software %s, serial %s\n",
@@ -6609,6 +6891,25 @@ static int apply_gain_settings(void)
     return PLUTO_ERR_OK;
 }
 
+/**
+ * @brief Apply the configured Pluto RX input port to an active stream.
+ *
+ * If the scanner is idle or running in a synthetic build, the setting is only
+ * persisted and will be written when hardware streaming next starts.
+ *
+ * @return `PLUTO_ERR_OK` on success, otherwise an IIO error.
+ */
+static int apply_rf_port_setting(void)
+{
+#if PSEUDO_RANDOM_SAMPLE_SOURCE
+    return PLUTO_ERR_OK;
+#else
+    if (!g_dev || !g_scanning)
+        return PLUTO_ERR_OK;
+    return pluto_sdr_set_rf_port(g_dev, g_rf_port);
+#endif
+}
+
 /* ------------------------------------------------------------------ */
 /* HTTP request handler                                               */
 /* ------------------------------------------------------------------ */
@@ -7193,19 +7494,6 @@ static int validate_pluto_settings(double samplerate, double rf_bandwidth, const
     return 0;
 }
 
-/**
- * @brief Check whether a frontend-selectable AD936x RX input name is supported.
- *
- * @param port Requested `rf_port_select` value.
- * @return Nonzero for a supported balanced input, otherwise zero.
- */
-static int rf_port_is_supported(const char *port)
-{
-    return port && (strcmp(port, "A_BALANCED") == 0 ||
-                    strcmp(port, "B_BALANCED") == 0 ||
-                    strcmp(port, "C_BALANCED") == 0);
-}
-
 static int validate_visible_range(double start, double end,
                                   char *err, size_t err_len)
 {
@@ -7382,6 +7670,7 @@ static void handle_request(int client_fd, const char *req, size_t req_len,
     if (strcmp(http.method, "GET") == 0 && strcmp(http.path, "/api/status") == 0) {
         char body[API_JSON_BODY_MAX];
         char sample_rates[1024];
+        char rf_ports[256];
         double step = 0.0;
         double scan_start = 0.0;
         double scan_end = 0.0;
@@ -7461,6 +7750,7 @@ static void handle_request(int client_fd, const char *req, size_t req_len,
         double fq_err_model_hz = current_frequency_model_error_hz();
         double fq_err_effective_hz = current_frequency_correction_hz();
         format_sample_rates_json(sample_rates, sizeof(sample_rates));
+        format_rf_ports_json(rf_ports, sizeof(rf_ports));
 
         int n = snprintf(body, sizeof(body),
             "{\"device\":\"Pluto SDR\","
@@ -7501,6 +7791,7 @@ static void handle_request(int client_fd, const char *req, size_t req_len,
             "\"decim_factor\":%d,\"decim_hop\":%d,\"overlap_factor\":%.3f,"
             "\"effective_input_samples\":%u,"
             "\"gain_mode\":\"%s\",\"hardwaregain_db\":%.1f,\"rf_port\":\"%s\","
+            "\"rf_ports\":%s,"
             "\"rssi_db\":%.2f,\"input_peak\":%.0f,\"clipped_samples\":%llu,"
             "\"goto_freq_hz\":" JSON_COORD_FMT ",\"goto_target_zoom\":%.6g,"
             "\"goto_animate\":%u,"
@@ -7534,7 +7825,7 @@ static void handle_request(int client_fd, const char *req, size_t req_len,
             bins_per_step, line_bins, raw_line_bins, display_bins,
             g_view_id, current_fft_size(), effective_fft,
             decim_factor, decim_hop, overlap_factor, line_sample_count,
-            g_gain_mode, g_hardwaregain_db, g_rf_port,
+            g_gain_mode, g_hardwaregain_db, g_rf_port, rf_ports,
             g_last_rssi_db, g_last_input_peak,
             (unsigned long long)g_last_clipped_samples,
             g_goto_freq, g_goto_target_zoom, g_goto_animate, g_goto_delay_s,
@@ -7856,8 +8147,10 @@ static void handle_request(int client_fd, const char *req, size_t req_len,
         double second_if_hz = current_second_if_hz();
         double zero_if_guard_hz = current_zero_if_guard_hz();
         char sample_rates[1024];
+        char rf_ports[256];
         char json_body[API_JSON_BODY_MAX];
         format_sample_rates_json(sample_rates, sizeof(sample_rates));
+        format_rf_ports_json(rf_ports, sizeof(rf_ports));
         int n = snprintf(json_body, sizeof(json_body),
             "{\"status\":\"%s\",\"device\":\"Pluto SDR\","
             "\"sw_version\":\"%s\",\"hardware\":\"%s\","
@@ -7887,6 +8180,7 @@ static void handle_request(int client_fd, const char *req, size_t req_len,
             "\"active_samplerate\":%.0f,\"active_rf_bandwidth\":%.0f,"
             "\"active_bw_ratio\":%.3f,"
             "\"gain_mode\":\"%s\",\"hardwaregain_db\":%.1f,\"rf_port\":\"%s\","
+            "\"rf_ports\":%s,"
             "\"rssi_db\":%.2f,\"input_peak\":%.0f,\"clipped_samples\":%llu,"
             "\"sample_rates\":%s}",
             status,
@@ -7909,7 +8203,7 @@ static void handle_request(int client_fd, const char *req, size_t req_len,
             active_bw_ratio,
             active_samplerate, active_rf_bandwidth, active_bw_ratio,
             active_samplerate, active_rf_bandwidth, active_bw_ratio,
-            g_gain_mode, g_hardwaregain_db, g_rf_port,
+            g_gain_mode, g_hardwaregain_db, g_rf_port, rf_ports,
             g_last_rssi_db, g_last_input_peak,
             (unsigned long long)g_last_clipped_samples,
             sample_rates);
@@ -8176,6 +8470,59 @@ start_bad_json:
             status, g_gain_mode, g_hardwaregain_db,
             g_last_rssi_db, g_last_input_peak,
             (unsigned long long)g_last_clipped_samples);
+        send_json_response(client_fd, 200, "OK", cors, json_body);
+        close(client_fd);
+        return;
+    }
+
+    /* POST /api/rf-port */
+    if (strcmp(http.method, "POST") == 0 && strcmp(http.path, "/api/rf-port") == 0) {
+        json_doc_t json;
+        char err[160];
+        char rf_port_tmp[32];
+        char old_rf_port[32];
+        int present = 0;
+        int ret;
+        const char *status;
+        char rf_ports[256];
+        char json_body[512];
+
+        copy_cstr(rf_port_tmp, sizeof(rf_port_tmp), g_rf_port);
+        copy_cstr(old_rf_port, sizeof(old_rf_port), g_rf_port);
+
+        if (json_body_for_request(&http, &json, err, sizeof(err)) != 0) {
+            send_json_error(client_fd, 400, "Bad Request", cors, err);
+            close(client_fd);
+            return;
+        }
+        if (json_get_string(&json, "rf_port", rf_port_tmp,
+                            sizeof(rf_port_tmp), &present) != 0 ||
+            !present) {
+            send_json_error(client_fd, 400, "Bad Request", cors,
+                            "rf_port is required");
+            close(client_fd);
+            return;
+        }
+        if (!rf_port_is_supported(rf_port_tmp)) {
+            send_json_error(client_fd, 400, "Bad Request", cors,
+                            "rf_port must be A_BALANCED, B_BALANCED, or C_BALANCED");
+            close(client_fd);
+            return;
+        }
+
+        copy_cstr(g_rf_port, sizeof(g_rf_port), rf_port_tmp);
+        ret = apply_rf_port_setting();
+        if (ret == PLUTO_ERR_OK) {
+            save_config();
+        } else {
+            copy_cstr(g_rf_port, sizeof(g_rf_port), old_rf_port);
+        }
+        format_rf_ports_json(rf_ports, sizeof(rf_ports));
+        status = (ret == PLUTO_ERR_OK) ? "ok" : "error";
+        snprintf(json_body, sizeof(json_body),
+            "{\"status\":\"%s\",\"rf_port\":\"%s\",\"rf_ports\":%s,"
+            "\"scanning\":%d}",
+            status, g_rf_port, rf_ports, g_scanning);
         send_json_response(client_fd, 200, "OK", cors, json_body);
         close(client_fd);
         return;
@@ -8477,8 +8824,109 @@ static int create_http_server_socket(void)
     return -1;
 }
 
+typedef struct {
+    char urls[STARTUP_URL_MAX][STARTUP_URL_LEN];
+    size_t count;
+} startup_url_list_t;
+
 /**
- * @brief Format the browser URL shown in the startup banner.
+ * @brief Compare two ASCII strings case-insensitively.
+ *
+ * @param a First NUL-terminated string.
+ * @param b Second NUL-terminated string.
+ * @return Non-zero when the strings match ignoring ASCII case.
+ */
+static int ascii_equal_ignore_case(const char *a, const char *b)
+{
+    unsigned char ca;
+    unsigned char cb;
+
+    if (!a || !b)
+        return 0;
+    while (*a && *b) {
+        ca = (unsigned char)*a++;
+        cb = (unsigned char)*b++;
+        if (tolower(ca) != tolower(cb))
+            return 0;
+    }
+    return *a == '\0' && *b == '\0';
+}
+
+/**
+ * @brief Return whether a bind host means all interfaces without a family.
+ *
+ * @param host Bind host text from `--bind`.
+ * @return Non-zero for an empty host or `*`.
+ */
+static int bind_host_is_any(const char *host)
+{
+    return !host || !*host || strcmp(host, "*") == 0;
+}
+
+/**
+ * @brief Return whether a bind host is the IPv4 wildcard address.
+ *
+ * @param host Bind host text from `--bind`.
+ * @return Non-zero for `0.0.0.0`.
+ */
+static int bind_host_is_any_ipv4(const char *host)
+{
+    return host && strcmp(host, "0.0.0.0") == 0;
+}
+
+/**
+ * @brief Return whether a bind host is the IPv6 wildcard address.
+ *
+ * @param host Bind host text from `--bind`.
+ * @return Non-zero for `::` or `[::]`.
+ */
+static int bind_host_is_any_ipv6(const char *host)
+{
+    return host && (strcmp(host, "::") == 0 || strcmp(host, "[::]") == 0);
+}
+
+/**
+ * @brief Return whether a bind host is loopback-only.
+ *
+ * @param host Bind host text from `--bind`.
+ * @return Non-zero for localhost, IPv4 127/8, or IPv6 loopback.
+ */
+static int bind_host_is_loopback(const char *host)
+{
+    if (!host || !*host)
+        return 0;
+    if (ascii_equal_ignore_case(host, "localhost") ||
+        strcmp(host, "::1") == 0 || strcmp(host, "[::1]") == 0)
+        return 1;
+    return strncmp(host, "127.", 4) == 0;
+}
+
+/**
+ * @brief Format one HTTP URL for a numeric or named host.
+ *
+ * IPv6 literals are bracketed for browser use.
+ *
+ * @param host Hostname or numeric address.
+ * @param out Destination buffer.
+ * @param out_len Destination length in bytes.
+ */
+static void format_http_url_for_host(const char *host, char *out, size_t out_len)
+{
+    if (!out || out_len == 0)
+        return;
+    if (!host || !*host)
+        host = "localhost";
+    if (strchr(host, ':') && host[0] != '[')
+        snprintf(out, out_len, "http://[%s]:%d", host, g_http_port);
+    else
+        snprintf(out, out_len, "http://%s:%d", host, g_http_port);
+}
+
+/**
+ * @brief Format the primary browser URL shown in the startup banner.
+ *
+ * Wildcard and loopback binds keep the familiar localhost URL first. Additional
+ * concrete interface URLs are appended separately when the bind is not local.
  *
  * @param out Destination buffer.
  * @param out_len Destination length in bytes.
@@ -8486,18 +8934,231 @@ static int create_http_server_socket(void)
 static void format_listen_url(char *out, size_t out_len)
 {
     const char *host = g_bind_address;
-    if (!out || out_len == 0)
-        return;
-    if (!host || !*host || strcmp(host, "*") == 0 ||
-        strcmp(host, "0.0.0.0") == 0 || strcmp(host, "::") == 0)
-        host = "localhost";
-    else if (strcmp(host, "127.0.0.1") == 0 || strcmp(host, "::1") == 0)
-        host = "localhost";
 
-    if (strchr(host, ':') && host[0] != '[')
-        snprintf(out, out_len, "http://[%s]:%d", host, g_http_port);
-    else
-        snprintf(out, out_len, "http://%s:%d", host, g_http_port);
+    if (bind_host_is_any(host) || bind_host_is_any_ipv4(host) ||
+        bind_host_is_any_ipv6(host) || bind_host_is_loopback(host))
+        host = "localhost";
+    format_http_url_for_host(host, out, out_len);
+}
+
+/**
+ * @brief Clear a startup URL list.
+ *
+ * @param list URL list to reset.
+ */
+static void startup_url_list_init(startup_url_list_t *list)
+{
+    if (list)
+        memset(list, 0, sizeof(*list));
+}
+
+/**
+ * @brief Check whether a startup URL list already contains a URL.
+ *
+ * @param list URL list.
+ * @param url URL text.
+ * @return Non-zero when `url` is already present.
+ */
+static int startup_url_list_contains(const startup_url_list_t *list,
+                                     const char *url)
+{
+    if (!list || !url)
+        return 0;
+    for (size_t i = 0; i < list->count; i++) {
+        if (strcmp(list->urls[i], url) == 0)
+            return 1;
+    }
+    return 0;
+}
+
+/**
+ * @brief Append an already formatted startup URL when capacity allows.
+ *
+ * @param list URL list.
+ * @param url URL text, including scheme and port.
+ */
+static void startup_url_list_add_url(startup_url_list_t *list, const char *url)
+{
+    if (!list || !url || !*url || list->count >= STARTUP_URL_MAX ||
+        startup_url_list_contains(list, url))
+        return;
+    copy_cstr(list->urls[list->count], STARTUP_URL_LEN, url);
+    list->count++;
+}
+
+/**
+ * @brief Format and append one host as an HTTP startup URL.
+ *
+ * @param list URL list.
+ * @param host Hostname or numeric address.
+ */
+static void startup_url_list_add_host(startup_url_list_t *list,
+                                      const char *host)
+{
+    char url[STARTUP_URL_LEN];
+
+    if (!host || !*host)
+        return;
+    format_http_url_for_host(host, url, sizeof(url));
+    startup_url_list_add_url(list, url);
+}
+
+#ifdef _WIN32
+/**
+ * @brief Append active non-loopback Windows adapter addresses as HTTP URLs.
+ *
+ * @param list URL list.
+ * @param include_ipv4 Include IPv4 adapter addresses.
+ * @param include_ipv6 Include IPv6 adapter addresses.
+ */
+static void collect_interface_listen_urls(startup_url_list_t *list,
+                                          int include_ipv4,
+                                          int include_ipv6)
+{
+    ULONG flags = GAA_FLAG_SKIP_ANYCAST | GAA_FLAG_SKIP_MULTICAST |
+        GAA_FLAG_SKIP_DNS_SERVER;
+    ULONG size = 15000;
+    IP_ADAPTER_ADDRESSES *adapters = NULL;
+    ULONG rc;
+
+    adapters = (IP_ADAPTER_ADDRESSES *)malloc(size);
+    if (!adapters)
+        return;
+    rc = GetAdaptersAddresses(AF_UNSPEC, flags, NULL, adapters, &size);
+    if (rc == ERROR_BUFFER_OVERFLOW) {
+        IP_ADAPTER_ADDRESSES *larger =
+            (IP_ADAPTER_ADDRESSES *)realloc(adapters, size);
+        if (!larger) {
+            free(adapters);
+            return;
+        }
+        adapters = larger;
+        rc = GetAdaptersAddresses(AF_UNSPEC, flags, NULL, adapters, &size);
+    }
+    if (rc != NO_ERROR) {
+        free(adapters);
+        return;
+    }
+
+    for (IP_ADAPTER_ADDRESSES *adapter = adapters; adapter;
+         adapter = adapter->Next) {
+        if (adapter->OperStatus != IfOperStatusUp ||
+            adapter->IfType == IF_TYPE_SOFTWARE_LOOPBACK)
+            continue;
+        for (IP_ADAPTER_UNICAST_ADDRESS *ua = adapter->FirstUnicastAddress;
+             ua; ua = ua->Next) {
+            struct sockaddr *sa = ua->Address.lpSockaddr;
+            char host[NI_MAXHOST];
+            int family;
+            socklen_t len;
+
+            if (!sa)
+                continue;
+            family = sa->sa_family;
+            if ((family == AF_INET && !include_ipv4) ||
+                (family == AF_INET6 && !include_ipv6))
+                continue;
+            if (family == AF_INET) {
+                const struct sockaddr_in *sin = (const struct sockaddr_in *)sa;
+                uint32_t addr = ntohl(sin->sin_addr.s_addr);
+                if ((addr >> 24) == 127 || addr == 0)
+                    continue;
+                len = sizeof(*sin);
+            } else if (family == AF_INET6) {
+                const struct sockaddr_in6 *sin6 =
+                    (const struct sockaddr_in6 *)sa;
+                if (IN6_IS_ADDR_LOOPBACK(&sin6->sin6_addr) ||
+                    IN6_IS_ADDR_UNSPECIFIED(&sin6->sin6_addr) ||
+                    IN6_IS_ADDR_LINKLOCAL(&sin6->sin6_addr))
+                    continue;
+                len = sizeof(*sin6);
+            } else {
+                continue;
+            }
+            if (getnameinfo(sa, len, host, sizeof(host), NULL, 0,
+                            NI_NUMERICHOST) == 0)
+                startup_url_list_add_host(list, host);
+        }
+    }
+    free(adapters);
+}
+#else
+/**
+ * @brief Append active non-loopback POSIX interface addresses as HTTP URLs.
+ *
+ * @param list URL list.
+ * @param include_ipv4 Include IPv4 interface addresses.
+ * @param include_ipv6 Include IPv6 interface addresses.
+ */
+static void collect_interface_listen_urls(startup_url_list_t *list,
+                                          int include_ipv4,
+                                          int include_ipv6)
+{
+    struct ifaddrs *ifaddr = NULL;
+
+    if (getifaddrs(&ifaddr) != 0)
+        return;
+    for (struct ifaddrs *ifa = ifaddr; ifa; ifa = ifa->ifa_next) {
+        struct sockaddr *sa = ifa->ifa_addr;
+        char host[NI_MAXHOST];
+        int family;
+        socklen_t len;
+
+        if (!sa || !(ifa->ifa_flags & IFF_UP) ||
+            (ifa->ifa_flags & IFF_LOOPBACK))
+            continue;
+        family = sa->sa_family;
+        if ((family == AF_INET && !include_ipv4) ||
+            (family == AF_INET6 && !include_ipv6))
+            continue;
+        if (family == AF_INET) {
+            const struct sockaddr_in *sin = (const struct sockaddr_in *)sa;
+            uint32_t addr = ntohl(sin->sin_addr.s_addr);
+            if ((addr >> 24) == 127 || addr == 0)
+                continue;
+            len = sizeof(*sin);
+        } else if (family == AF_INET6) {
+            const struct sockaddr_in6 *sin6 =
+                (const struct sockaddr_in6 *)sa;
+            if (IN6_IS_ADDR_LOOPBACK(&sin6->sin6_addr) ||
+                IN6_IS_ADDR_UNSPECIFIED(&sin6->sin6_addr) ||
+                IN6_IS_ADDR_LINKLOCAL(&sin6->sin6_addr))
+                continue;
+            len = sizeof(*sin6);
+        } else {
+            continue;
+        }
+        if (getnameinfo(sa, len, host, sizeof(host), NULL, 0,
+                        NI_NUMERICHOST) == 0)
+            startup_url_list_add_host(list, host);
+    }
+    freeifaddrs(ifaddr);
+}
+#endif
+
+/**
+ * @brief Append reachable non-loopback URLs for the current HTTP bind.
+ *
+ * Wildcard binds enumerate active interface addresses. Concrete non-loopback
+ * binds add that host directly. Loopback-only binds intentionally add nothing.
+ *
+ * @param list URL list that already contains the primary localhost/bind URL.
+ */
+static void append_additional_listen_urls(startup_url_list_t *list)
+{
+    const char *host = g_bind_address;
+
+    if (!list || bind_host_is_loopback(host))
+        return;
+    if (bind_host_is_any(host)) {
+        collect_interface_listen_urls(list, 1, 1);
+    } else if (bind_host_is_any_ipv4(host)) {
+        collect_interface_listen_urls(list, 1, 0);
+    } else if (bind_host_is_any_ipv6(host)) {
+        collect_interface_listen_urls(list, 1, 1);
+    } else {
+        startup_url_list_add_host(list, host);
+    }
 }
 
 static long long now_msec(void)
@@ -8628,21 +9289,59 @@ static const char *long_option_value(const char *arg, const char *name)
 }
 
 /**
- * @brief Print the browser URL in an ASCII-only terminal banner.
+ * @brief Print one ASCII border for the startup banner.
+ *
+ * @param width Inner text width in characters.
+ */
+static void print_banner_border(size_t width)
+{
+    putchar('+');
+    for (size_t i = 0; i < width + 2; i++)
+        putchar('-');
+    printf("+\n");
+}
+
+/**
+ * @brief Print one left-aligned row in the startup banner.
+ *
+ * @param text Row text.
+ * @param width Inner text width in characters.
+ */
+static void print_banner_row(const char *text, size_t width)
+{
+    printf("| %-*s |\n", (int)width, text ? text : "");
+}
+
+/**
+ * @brief Print browser URLs in an ASCII-only terminal banner.
  *
  * Windows consoles do not reliably render UTF-8 box-drawing characters unless
  * the active code page and font are configured. ASCII keeps release binaries
  * readable in cmd.exe, PowerShell, Windows Terminal, and POSIX terminals.
  *
- * @param url Browser URL served by the local HTTP backend.
+ * @param urls Browser URLs served by the HTTP backend.
  */
-static void print_startup_banner(const char *url)
+static void print_startup_banner(const startup_url_list_t *urls)
 {
+    size_t width = 46;
+
+    if (strlen(PROGRAM_TITLE) > width)
+        width = strlen(PROGRAM_TITLE);
+    if (urls) {
+        for (size_t i = 0; i < urls->count; i++) {
+            size_t n = strlen(urls->urls[i]);
+            if (n > width)
+                width = n;
+        }
+    }
     printf("\n");
-    printf("+------------------------------------------------+\n");
-    printf("| %-46s |\n", PROGRAM_TITLE);
-    printf("| %-46s |\n", url ? url : "");
-    printf("+------------------------------------------------+\n");
+    print_banner_border(width);
+    print_banner_row(PROGRAM_TITLE, width);
+    if (urls && urls->count > 0) {
+        for (size_t i = 0; i < urls->count; i++)
+            print_banner_row(urls->urls[i], width);
+    }
+    print_banner_border(width);
     printf("\n");
 }
 
@@ -8651,6 +9350,7 @@ int main(int argc, char **argv)
     char cli_uri[128] = {0};
     char normalized_uri[128];
     char url[192];
+    startup_url_list_t startup_urls;
     chdir_to_executable_dir(argv ? argv[0] : NULL);
 
     for (int i = 1; i < argc; i++) {
@@ -8757,8 +9457,11 @@ int main(int argc, char **argv)
         return 1;
     }
 
+    startup_url_list_init(&startup_urls);
     format_listen_url(url, sizeof(url));
-    print_startup_banner(url);
+    startup_url_list_add_url(&startup_urls, url);
+    append_additional_listen_urls(&startup_urls);
+    print_startup_banner(&startup_urls);
     printf("[SDR] HTTP listening on %s:%d\n", g_bind_address, g_http_port);
 
     printf("[SDR] Waiting for scan start from web UI\n");
