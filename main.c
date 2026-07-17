@@ -19,6 +19,11 @@
 #ifndef _DEFAULT_SOURCE
 #define _DEFAULT_SOURCE
 #endif
+#ifdef __APPLE__
+#ifndef _DARWIN_C_SOURCE
+#define _DARWIN_C_SOURCE
+#endif
+#endif
 #define _POSIX_C_SOURCE 200809L
 #include <stdio.h>
 #include <stdlib.h>
@@ -79,6 +84,16 @@ static int win32_nanosleep(const struct timespec *req, struct timespec *rem)
 #include <errno.h>
 #include <limits.h>
 #include <iio.h>
+
+#ifndef NI_MAXHOST
+#define NI_MAXHOST 1025
+#endif
+#ifndef IFF_UP
+#define IFF_UP 0x1
+#endif
+#ifndef IFF_LOOPBACK
+#define IFF_LOOPBACK 0x8
+#endif
 
 #ifndef M_PI
 #define M_PI 3.14159265358979323846
