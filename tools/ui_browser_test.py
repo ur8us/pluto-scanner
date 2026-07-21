@@ -130,7 +130,14 @@ def main():
         )
         assert driver.find_element(By.ID, "gainMode").is_displayed()
         assert driver.find_element(By.ID, "vgaGain").is_displayed()
-        assert driver.find_element(By.ID, "rfPort").is_displayed()
+        rf_port = driver.find_element(By.ID, "rfPort")
+        assert rf_port.is_displayed()
+        if rf_port.is_enabled():
+            raise RuntimeError("single-channel Input selector is not disabled")
+        if [option.get_attribute("value") for option in Select(rf_port).options] != [
+            "A_BALANCED"
+        ]:
+            raise RuntimeError("Input selector exposes unsupported receiver channels")
         scale_format = driver.execute_script(
             "return window.__plutoTestHooks.scaleFormatting();"
         )
@@ -195,7 +202,11 @@ def main():
             raise RuntimeError(f"unexpected URL/typed-band precedence: {hash_conflicts}")
 
         api_stop(driver)
-        time.sleep(1.0)
+        driver.refresh()
+        WebDriverWait(driver, 10).until(
+            lambda d: d.find_element(By.ID, "statusText").text == "idle"
+            and d.find_element(By.ID, "freqStart").is_enabled()
+        )
 
         driver.set_script_timeout(5)
         cadence_probe = driver.execute_async_script(
@@ -226,12 +237,29 @@ def main():
                 f"early live row did not supersede queued previews smoothly: {cadence_probe}"
             )
 
+        visibility_probe = driver.execute_async_script(
+            "const done=arguments[0];"
+            "window.__plutoTestHooks.visibilityPresentationProbe()"
+            ".then(done).catch((error)=>done({error:String(error)}));"
+        )
+        if visibility_probe.get("error"):
+            raise RuntimeError(
+                f"hidden-window presentation probe failed: {visibility_probe}"
+            )
+        if visibility_probe != {
+            "while_hidden": 0,
+            "rendered": [3],
+            "ordered_timestamps": [1000, 1000, 1100],
+        }:
+            raise RuntimeError(
+                f"hidden-window rows or time marks are not ordered: {visibility_probe}"
+            )
+
         for element_id, value in [("freqStart", "430"), ("freqEnd", "470"), ("converterFreq", "0")]:
             el = driver.find_element(By.ID, element_id)
             el.clear()
             el.send_keys(value)
         Select(driver.find_element(By.ID, "gainMode")).select_by_value("manual")
-        Select(driver.find_element(By.ID, "rfPort")).select_by_value("A_BALANCED")
         driver.execute_script(
             "const el=document.getElementById('vgaGain');"
             "el.value='20'; el.dispatchEvent(new Event('input',{bubbles:true}));"
@@ -282,19 +310,9 @@ def main():
         first_rf_status = api_status(driver)
         if first_rf_status.get("rf_port") != "A_BALANCED":
             raise RuntimeError("selected Pluto RX input was not sent to the backend")
-        rf_port_select = Select(driver.find_element(By.ID, "rfPort"))
-        if not driver.find_element(By.ID, "rfPort").is_enabled():
-            raise RuntimeError("Pluto RX input selector is disabled while scanning")
-        available_rf_ports = first_rf_status.get("rf_ports") or ["A_BALANCED"]
-        alternate_rf_port = next(
-            (port for port in available_rf_ports if port != "A_BALANCED"),
-            None,
-        )
-        if alternate_rf_port:
-            rf_port_select.select_by_value(alternate_rf_port)
-            WebDriverWait(driver, 10).until(
-                lambda d: api_status(d).get("rf_port") == alternate_rf_port
-            )
+        rf_port = driver.find_element(By.ID, "rfPort")
+        if rf_port.is_enabled() or rf_port.get_attribute("value") != "A_BALANCED":
+            raise RuntimeError("single-channel Input state changed while scanning")
         WebDriverWait(driver, 15).until(
             lambda d: "steps" in d.find_element(By.ID, "infoScan").text.lower()
         )
@@ -303,6 +321,27 @@ def main():
             in d.find_element(By.ID, "infoRange").text
         )
         wait_nonblank_waterfall(driver)
+
+        receiver_window = driver.current_window_handle
+        driver.switch_to.new_window("tab")
+        time.sleep(3.0)
+        driver.close()
+        driver.switch_to.window(receiver_window)
+        WebDriverWait(driver, 5).until(
+            lambda d: not d.execute_script("return document.hidden;")
+        )
+        time.sleep(0.6)
+        time_mark_diag = driver.execute_script(
+            "return window.__plutoTestHooks.timeMarkDiagnostics();"
+        )
+        if (
+            time_mark_diag.get("backward_pairs") != 0
+            or time_mark_diag.get("suspended")
+            or time_mark_diag.get("hidden_pending")
+        ):
+            raise RuntimeError(
+                f"time marks did not recover cleanly after tab switch: {time_mark_diag}"
+            )
 
         # CSS layout zoom exercises the same resize path as browser Ctrl+/-
         # without relying on host-specific browser zoom automation. It must not

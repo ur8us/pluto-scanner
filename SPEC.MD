@@ -76,6 +76,9 @@ no bundled dependencies. No external HTTP, UI, or JS framework is used.
   - Retunes and discards stale buffers during scan hops.
   - Uses only the standard IIO/AD936x control surface, so stock Pluto firmware
     and DATV firmware variants do not need to be reflashed for this program.
+  - Consumes one complex RX channel (`cf-ad9361-lpc` I/Q) and currently fixes
+    its RF port to `A_BALANCED`. Additional receiver channels/port routing are
+    deferred.
 - **FFT engine** — radix-2 complex-to-complex in-place transform, Hann window.
 - **CIC decimator** — 3-stage CIC response for narrow-span views, implemented
   as bounded moving sums to avoid unbounded numeric state.
@@ -360,7 +363,7 @@ CORS headers. `OPTIONS` preflight is answered with `204 No Content`.
 | POST | `/api/view` | JSON | Update visible viewport (`visible_start_hz`, `visible_end_hz`, `display_bins`); restart scan if changed |
 | POST | `/api/fft` | JSON | Set `fft_size` (`1024..65536`, power of two) |
 | POST | `/api/gain` | JSON | Set `gain_mode` + `hardwaregain_db` |
-| POST | `/api/rf-port` | JSON | Set Pluto RX `rf_port_select` (`A_BALANCED`, `B_BALANCED`, `C_BALANCED`) |
+| POST | `/api/rf-port` | JSON | Reserved backend RF-port plumbing; the current frontend is fixed to `A_BALANCED` |
 | POST | `/api/rate` | JSON | Set `rate_limit_lps` (max waterfall line rate) |
 | POST | `/api/min-rate` | JSON | Set `min_rate_lps` (min waterfall line rate) |
 | POST | `/api/goto` | JSON | Persist Go To target (`goto_freq_hz`, `goto_target_zoom`, `goto_animate`, `goto_delay_s`) |
@@ -408,8 +411,8 @@ ordinary user-editable controls.
 | `fft_size`, `effective_fft_size` | Selected vs planner-chosen FFT |
 | `decim_factor`, `decim_hop`, `overlap_factor` | CIC decimation params |
 | `effective_input_samples` | Samples consumed per published line |
-| `gain_mode`, `hardwaregain_db`, `rf_port` | Gain and active RX input settings |
-| `rf_ports` | Backend-verified RX input list accepted by the connected Pluto |
+| `gain_mode`, `hardwaregain_db`, `rf_port` | Gain and backend RF-port state; the supported UI value is `A_BALANCED` |
+| `rf_ports` | Backend-probed RF-port capability list reserved for later channel/port work |
 | `rssi_db`, `input_peak`, `clipped_samples` | Live readbacks |
 | `goto_freq_hz`, `goto_target_zoom`, `goto_animate`, `goto_delay_s` | Go To state |
 | `sample_rates` | JSON array of supported rates |
@@ -421,11 +424,11 @@ ordinary user-editable controls.
 `fft_size`, `display_bins`, `min_rate_lps`, `rate_limit_lps`,
 `visible_start_hz`, `visible_end_hz`. (*forced to auto profile, see §3.8.)
 
-`rf_port` is one of `A_BALANCED`, `B_BALANCED`, or `C_BALANCED`, selected by
-the `Input` control as Pluto RX input 1, 2, or 3. It is written to the standard
-AD936x `rf_port_select` attribute immediately before a stream starts and can be
-changed during an active stream through `/api/rf-port` without retuning or
-clearing the waterfall.
+The current frontend always sends `rf_port="A_BALANCED"`. Its `Input` control
+contains only `1 (A balanced)` and is disabled because the current scanner
+supports one complex receiver channel. The backend retains probing and
+`/api/rf-port` plumbing for development and future channel/port support; those
+alternate values are not part of the supported frontend workflow.
 
 `freq_start`/`freq_end` are air-frequency values in MHz. Receiver limits are
 validated after applying `converter_freq`; invalid converted bands return
@@ -538,6 +541,12 @@ manual dual slider); auto levels use robust percentiles (8 % noise floor,
   use `line_interval_ms`, and the next presentation deadline survives a
   temporarily empty queue until the next row or view change. An early live row
   replaces unrendered cached rows rather than accumulating display latency.
+- When the document is hidden, paced presentation is suspended and only the
+  newest pending SSE row is retained. After the document becomes visible, a
+  short settle interval collapses delayed EventSource callbacks before that row
+  is rendered. Retained row timestamps are clamped to nondecreasing order, and
+  time-mark boundaries ignore backward pairs. This prevents background-tab
+  timer throttling from creating bursts or reordered wall-clock labels.
 
 On stall (no line for 6× the expected line interval, clamped `5–30 s`) the
 client reconnects. Heartbeat shows `disconnected` / `idle` / `scanning`.

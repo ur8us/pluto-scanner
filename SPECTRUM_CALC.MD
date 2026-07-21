@@ -11,6 +11,11 @@ Waterfall-rate budget used for this layout: minimum `10` lines/s, maximum
 
 ## Pluto RF Constraints
 
+All calculations currently describe one complex Pluto RX channel using the
+`A_BALANCED` RF port. The frontend input selector is disabled; additional
+receiver channels and RF-port routing are deferred. The `cf-ad9361-lpc`
+`voltage0` and `voltage1` samples are I and Q for this one channel.
+
 Official Pluto documentation lists the ADALM-Pluto as an AD9363 radio with
 variable output data rates up to `61.44 MSPS` and tunable channel bandwidth
 from `200 kHz` to `20 MHz`.

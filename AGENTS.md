@@ -47,6 +47,12 @@ After a Pluto connection opens, the backend reads the AD936x RX LO
 fallback is `46,875,001 Hz..6 GHz`. Keep frontend frequencies as air/signal
 frequencies and enforce receiver limits after converter conversion.
 
+The supported signal path currently uses one complex receiver channel on
+`A_BALANCED`. Keep the frontend `Input` selector visible but disabled with only
+`1 (A balanced)`. `cf-ad9361-lpc` `voltage0`/`voltage1` are its I/Q components,
+not separate receivers. Backend RF-port probing is reserved for later channel
+and port-routing work; do not expose alternate ports until that work is scoped.
+
 The scanner must not require Pluto reflashing. It is expected to work with the
 original Analog Devices stock firmware and DATV firmware variants that expose
 the normal libiio devices and AD936x attributes.
@@ -123,6 +129,12 @@ blue scale-spacing label belongs between the second and third major ticks. It
 uses the longest of `<- 10Hz ->`, `<-10Hz->`, `<10Hz>`, or `10Hz` that fits in
 the measured rendered-label gap; it is not a zero-IF, hop, or physical
 passband gap.
+
+Background-tab timer throttling must not accumulate paced waterfall rows.
+While `document.hidden`, retain only the newest pending row; after visibility
+returns, allow delayed EventSource callbacks to settle before rendering it.
+Retained waterfall timestamps must be nondecreasing so time-mark labels cannot
+run backward after a tab/window switch.
 
 RF bandwidth must be strictly lower than sample rate for all Pluto profiles:
 

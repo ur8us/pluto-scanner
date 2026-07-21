@@ -75,6 +75,10 @@ Multiple simultaneous receivers and multi-user operation are also not planned
 for the current program; the UI and backend are designed around one local
 operator controlling one Pluto.
 
+The current receiver path supports one complex RX channel, fixed to Pluto
+`A_BALANCED` (shown as input 1). The `Input` selector is intentionally disabled.
+Additional receiver channels and RF-port routing may be added later.
+
 Demodulators and decoders are also out of scope for now. This includes SSB, FM,
 AM, and digital-mode decoding. The program is intended as a spectrum/waterfall
 scanner and high-zoom inspection tool, not as a general audio or data receiver.
@@ -314,10 +318,13 @@ http://localhost:8080
 
 ## UI Controls
 
-- Start/end frequency and converter are air-frequency settings. Receiver limits are checked after converter conversion; the frontend normalizes typed fields into the active valid interval, and the backend remains authoritative. The adjacent `Input` control selects a backend-verified Pluto RX input through `rf_port_select` and can be changed while scanning without retuning.
+- Start/end frequency and converter are air-frequency settings. Receiver limits are checked after converter conversion; the frontend normalizes typed fields into the active valid interval, and the backend remains authoritative. The adjacent disabled `Input` control shows the currently supported single receiver channel, input 1 (`A_BALANCED`); additional channels are deferred.
 - Sample rate, RF bandwidth, and passband usage are auto-profiled for Pluto performance and shown read-only in the UI.
 - RF bandwidth is kept strictly below sample rate in every auto profile.
 - Waterfall rows are published as exactly one processed output bin per screen pixel; raw FFT/CIC bin counts are kept as debug metadata.
+- Waterfall time marks follow monotonically ordered row timestamps. While the
+  page is hidden, the frontend retains only the newest pending row so browser
+  timer throttling cannot produce a burst of reordered time marks on return.
 - Waterfall row samples are transported over SSE as packed `uint8` base64
   (`encoding:"u8b64"`) instead of JSON number arrays. This keeps the simple
   EventSource stream but removes most of the avoidable per-bin text overhead.

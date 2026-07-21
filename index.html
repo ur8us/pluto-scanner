@@ -716,10 +716,12 @@
                 </div>
                 <div class="ctrl-group">
                     <label>Input</label>
-                    <select id="rfPort">
+                    <select
+                        id="rfPort"
+                        disabled
+                        title="Only one receiver channel is currently supported"
+                    >
                         <option value="A_BALANCED" selected>1 (A balanced)</option>
-                        <option value="B_BALANCED">2 (B balanced)</option>
-                        <option value="C_BALANCED">3 (C balanced)</option>
                     </select>
                 </div>
                 <div class="ctrl-group">
@@ -1005,6 +1007,9 @@
             let waterfallPresentationNextMs = 0;
             let waterfallPresentationViewId = 0;
             let waterfallPresentationHistory = [];
+            let waterfallPresentationSuspended = document.hidden;
+            let waterfallHiddenLatestItem = null;
+            let waterfallVisibilityResumeTimer = 0;
             let waterfallSecondsPerLine = null;
             let redrawFrame = 0;
             let waterfallRenderToken = 0;
@@ -1072,11 +1077,7 @@
             const RATE_LIMIT_MIN_INDEX = 2;
             const RATE_LIMIT_MAX_INDEX = 7;
             const RATE_LIMIT_DEFAULT_INDEX = 5;
-            const RF_PORT_LABELS = {
-                A_BALANCED: "1 (A balanced)",
-                B_BALANCED: "2 (B balanced)",
-                C_BALANCED: "3 (C balanced)",
-            };
+            const WATERFALL_VISIBILITY_SETTLE_MS = 250;
             const AUTO_RESTART_DELAY_MS = 900;
             const SSE_STALL_MIN_MS = 5000;
             const SSE_STALL_MAX_MS = 30000;
@@ -1342,6 +1343,29 @@
             }
 
             /**
+             * Keep retained waterfall row times in the same order as the rows.
+             *
+             * Cached previews can describe samples older than a row already on
+             * screen. Browser background throttling can also delay callbacks.
+             * Time marks need a monotonic display timeline even in those cases.
+             *
+             * @param {number} timestampMs Candidate Unix timestamp in milliseconds.
+             * @param {number} previousTimestampMs Previous retained row timestamp.
+             * @returns {number} Finite timestamp no earlier than the previous row.
+             */
+            function normalizeWaterfallRowTimestamp(
+                timestampMs,
+                previousTimestampMs,
+            ) {
+                let timestamp = Number(timestampMs);
+                if (!Number.isFinite(timestamp)) timestamp = Date.now();
+                const previous = Number(previousTimestampMs);
+                if (Number.isFinite(previous) && timestamp < previous)
+                    timestamp = previous;
+                return timestamp;
+            }
+
+            /**
              * Estimate current row cadence for SSE stall detection. Live line
              * arrivals win; before that, the selected max waterfall rate gives
              * a conservative expected cadence.
@@ -1553,7 +1577,9 @@
                 document.getElementById("freqStart").disabled = locked;
                 document.getElementById("freqEnd").disabled = locked;
                 document.getElementById("converterFreq").disabled = locked;
-                document.getElementById("rfPort").disabled = !connected;
+                /* The current product has one complex RX channel on A_BALANCED.
+                 * Keep the placeholder visible for later channel support. */
+                document.getElementById("rfPort").disabled = true;
                 document.getElementById("directSampling").disabled = locked;
                 document.getElementById("clockIn").disabled = locked;
                 document.getElementById("btnStart").disabled =
@@ -4183,6 +4209,7 @@
                     ) {
                         continue;
                     }
+                    if (newerTime < olderTime) continue;
                     const newerBucket = Math.floor(newerTime / intervalMs);
                     const olderBucket = Math.floor(olderTime / intervalMs);
                     if (newerBucket === olderBucket) continue;
@@ -4488,7 +4515,19 @@
                 const pix = wfImageData.data;
                 const w = wfImageData.width;
 
-                wfRows.push({ data, f0: freqStart, f1: freqEnd, t: timestampMs });
+                const previousTimestamp = wfRows.length
+                    ? wfRows[wfRows.length - 1].t
+                    : NaN;
+                const rowTimestamp = normalizeWaterfallRowTimestamp(
+                    timestampMs,
+                    previousTimestamp,
+                );
+                wfRows.push({
+                    data,
+                    f0: freqStart,
+                    f1: freqEnd,
+                    t: rowTimestamp,
+                });
                 trimWaterfallHistory(data.length);
 
                 // Scroll down by 1 pixel; newest scan line is written at the top.
@@ -4780,7 +4819,53 @@
                 waterfallPresentationQueue = [];
                 waterfallPresentationNextMs = 0;
                 waterfallPresentationViewId = 0;
+                waterfallHiddenLatestItem = null;
             }
+
+            /**
+             * Suspend paced waterfall presentation while the page is hidden.
+             *
+             * Browsers heavily throttle background timers. Retaining every row
+             * would therefore create a burst with misleading time marks when the
+             * tab becomes visible. Keep only the newest payload and release it
+             * after delayed EventSource callbacks have had a short time to settle.
+             *
+             * @param {boolean} hidden Whether presentation should be suspended.
+             * @param {number} resumeDelayMs Visible-state settle delay for tests/UI.
+             * @returns {void}
+             */
+            function setWaterfallPresentationVisibility(
+                hidden,
+                resumeDelayMs = WATERFALL_VISIBILITY_SETTLE_MS,
+            ) {
+                if (waterfallVisibilityResumeTimer) {
+                    clearTimeout(waterfallVisibilityResumeTimer);
+                    waterfallVisibilityResumeTimer = 0;
+                }
+                if (hidden) {
+                    waterfallPresentationSuspended = true;
+                    clearWaterfallPresentationQueue();
+                    return;
+                }
+                if (!waterfallPresentationSuspended) return;
+                waterfallVisibilityResumeTimer = setTimeout(() => {
+                    waterfallVisibilityResumeTimer = 0;
+                    const latest = waterfallHiddenLatestItem;
+                    waterfallHiddenLatestItem = null;
+                    waterfallPresentationSuspended = false;
+                    waterfallPresentationNextMs = 0;
+                    if (latest)
+                        enqueueWaterfallPresentation(
+                            latest.data,
+                            latest.render,
+                        );
+                    if (wfImageData) presentWaterfallImage();
+                }, Math.max(0, Number(resumeDelayMs) || 0));
+            }
+
+            document.addEventListener("visibilitychange", () => {
+                setWaterfallPresentationVisibility(document.hidden);
+            });
 
             /**
              * Return the backend-planned cadence for preview playback.
@@ -4858,6 +4943,10 @@
                 data,
                 render = renderWaterfallPayload,
             ) {
+                if (waterfallPresentationSuspended || document.hidden) {
+                    waterfallHiddenLatestItem = { data, render };
+                    return;
+                }
                 const preview = Number(data && data.preview) !== 0;
                 const rowView = Number(data && data.view);
                 const now = performance.now();
@@ -6545,46 +6634,21 @@
                 updateRateRangeDisplay();
             }
 
-            /**
-             * Rebuild the Pluto RX input selector from backend availability.
-             *
-             * @param {string[]|undefined} ports Supported `rf_port_select` names.
-             * @param {string|undefined} selected Backend-confirmed active port.
-             * @returns {void}
-             */
-            function syncRfPortOptions(ports, selected) {
+            /** Keep the placeholder selector fixed to the supported RX channel. */
+            function syncRfPortOptions() {
                 const select = document.getElementById("rfPort");
-                if (!select || !Array.isArray(ports)) return;
-                const normalized = ports.filter((port, index) => {
-                    return (
-                        RF_PORT_LABELS[port] &&
-                        ports.indexOf(port) === index
-                    );
-                });
-                if (!normalized.length) normalized.push("A_BALANCED");
-                const currentValues = Array.from(select.options).map(
-                    (option) => option.value,
-                );
-                const same =
-                    currentValues.length === normalized.length &&
-                    currentValues.every((value, index) => {
-                        return value === normalized[index];
-                    });
-                if (!same) {
-                    select.replaceChildren(
-                        ...normalized.map((port) => {
-                            const option = document.createElement("option");
-                            option.value = port;
-                            option.textContent = RF_PORT_LABELS[port];
-                            return option;
-                        }),
-                    );
+                if (!select) return;
+                if (
+                    select.options.length !== 1 ||
+                    select.options[0].value !== "A_BALANCED"
+                ) {
+                    const option = document.createElement("option");
+                    option.value = "A_BALANCED";
+                    option.textContent = "1 (A balanced)";
+                    select.replaceChildren(option);
                 }
-                const next =
-                    selected && normalized.includes(selected)
-                        ? selected
-                        : normalized[0];
-                select.value = next;
+                select.value = "A_BALANCED";
+                select.disabled = true;
             }
 
             /**
@@ -6636,18 +6700,7 @@
                     const gainMode = document.getElementById("gainMode");
                     if (gainMode) gainMode.value = String(plan.gain_mode);
                 }
-                syncRfPortOptions(plan.rf_ports, plan.rf_port);
-                if (plan.rf_port !== undefined) {
-                    const port = document.getElementById("rfPort");
-                    if (
-                        port &&
-                        Array.from(port.options).some((option) => {
-                            return option.value === String(plan.rf_port);
-                        })
-                    ) {
-                        port.value = String(plan.rf_port);
-                    }
-                }
+                syncRfPortOptions();
                 if (plan.hardwaregain_db !== undefined) {
                     const gain = Number(plan.hardwaregain_db);
                     const gainEl = document.getElementById("vgaGain");
@@ -7081,30 +7134,6 @@
                 }, 80);
             }
 
-            /**
-             * Send the selected Pluto RX input to the backend immediately.
-             *
-             * Unlike frequency and converter edits, changing `rf_port_select`
-             * does not alter spectrum coordinates, so the running waterfall does
-             * not need a view restart.
-             *
-             * @returns {Promise<void>}
-             */
-            async function updateBackendRfPort() {
-                const port = document.getElementById("rfPort");
-                if (!port) return;
-                const result = await apiPost("/api/rf-port", {
-                    rf_port: port.value,
-                });
-                if (result && result.status === "ok") {
-                    syncPlutoControls(result);
-                } else if (result && result.rf_port !== undefined) {
-                    syncPlutoControls(result);
-                } else {
-                    updateUI(scanRunning, false);
-                }
-            }
-
             async function updateBackendWaterfallRate() {
                 /* Rate changes affect display pacing and may restart only
                  * single-frequency plans whose overlap geometry changed. They
@@ -7196,10 +7225,6 @@
                 .addEventListener("change", function () {
                     scheduleGainUpdate();
                 });
-            document
-                .getElementById("rfPort")
-                .addEventListener("change", updateBackendRfPort);
-
             function handleRateSliderInput(changed) {
                 const changes = syncRateRangeFromSliders(changed);
                 rateMinDirty = rateMinDirty || changes.minChanged;
@@ -7633,6 +7658,39 @@
                     clearWaterfallPresentationQueue();
                     return { normal, early };
                 },
+                async visibilityPresentationProbe() {
+                    clearWaterfallPresentationQueue();
+                    const rendered = [];
+                    const present = (data) => rendered.push(Number(data.id));
+                    setWaterfallPresentationVisibility(true, 0);
+                    enqueueWaterfallPresentation(
+                        { id: 1, preview: 0 },
+                        present,
+                    );
+                    enqueueWaterfallPresentation(
+                        { id: 2, preview: 0 },
+                        present,
+                    );
+                    enqueueWaterfallPresentation(
+                        { id: 3, preview: 0 },
+                        present,
+                    );
+                    const whileHidden = rendered.length;
+                    setWaterfallPresentationVisibility(false, 10);
+                    await new Promise((resolve) => setTimeout(resolve, 40));
+                    const result = {
+                        while_hidden: whileHidden,
+                        rendered,
+                        ordered_timestamps: [
+                            normalizeWaterfallRowTimestamp(1000, NaN),
+                            normalizeWaterfallRowTimestamp(900, 1000),
+                            normalizeWaterfallRowTimestamp(1100, 1000),
+                        ],
+                    };
+                    clearWaterfallPresentationQueue();
+                    waterfallPresentationSuspended = document.hidden;
+                    return result;
+                },
                 viewState() {
                     return {
                         start_hz: currentFreq0,
@@ -7661,6 +7719,28 @@
                         canvas_width: wfCanvas.width,
                         canvas_height: wfCanvas.height,
                         presentation_rows: waterfallPresentationHistory.length,
+                    };
+                },
+                /** Return time-order diagnostics for real tab-visibility tests. */
+                timeMarkDiagnostics() {
+                    let backwardPairs = 0;
+                    let previous = NaN;
+                    for (const row of wfRows) {
+                        const timestamp = Number(row && row.t);
+                        if (
+                            Number.isFinite(previous) &&
+                            Number.isFinite(timestamp) &&
+                            timestamp < previous
+                        ) {
+                            backwardPairs++;
+                        }
+                        if (Number.isFinite(timestamp)) previous = timestamp;
+                    }
+                    return {
+                        rows: wfRows.length,
+                        backward_pairs: backwardPairs,
+                        suspended: waterfallPresentationSuspended,
+                        hidden_pending: waterfallHiddenLatestItem !== null,
                     };
                 },
             };

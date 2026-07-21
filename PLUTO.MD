@@ -139,6 +139,12 @@ int n = iio_device_attr_write(dev->phy, "attr_name", buf);
 | `rssi` | double | Received signal strength (dB) |
 | `rf_port_select` | string | `A_BALANCED`, `B_BALANCED`, `C_BALANCED` |
 
+The attribute can describe multiple AD936x RF port routes, but this scanner
+currently processes one complex RX channel and fixes it to `A_BALANCED` (input
+1). The frontend selector is disabled. Additional receiver channels and RF-port
+routing are deferred; `voltage0`/`voltage1` on `cf-ad9361-lpc` are the I and Q
+components of this one complex stream, not separate receiver channels.
+
 **`altvoltage0` (RX LO channel):**
 
 | Attribute | Type | Description |
