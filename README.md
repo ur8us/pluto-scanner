@@ -124,7 +124,11 @@ frequency to `422-442 MHz` receiver tuning.
 
 No Pluto reflashing is required for this program. It works with the original
 Analog Devices stock firmware and DATV firmware variants, as long as the normal
-libiio devices and AD936x attributes remain available.
+libiio devices and AD936x attributes remain available. A Pluto that still
+advertises the nominal `325 MHz..3.8 GHz` range can optionally be switched to
+the AD9364-compatible `70 MHz..6 GHz` profile through persistent U-Boot
+environment settings; this is configuration, not reflashing. See
+[Optional: Enable the Extended RF Range](PLUTO.MD#optional-enable-the-extended-rf-range).
 
 ## Build
 

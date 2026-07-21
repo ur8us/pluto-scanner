@@ -11,6 +11,57 @@ Devices stock firmware and DATV firmware variants are supported as long as the
 standard libiio devices (`ad9361-phy`, `cf-ad9361-lpc`) and AD936x attributes
 are available.
 
+### Optional: Enable the Extended RF Range
+
+Some Pluto configurations identify the transceiver as an AD9363 and advertise
+only the nominal `325 MHz..3.8 GHz` LO range and `20 MHz` maximum RF bandwidth.
+The firmware can instead boot with the AD9364-compatible profile, which exposes
+the extended `70 MHz..6 GHz` LO range and a hardware bandwidth limit up to
+`56 MHz`. This changes persistent U-Boot environment settings; it does not
+reflash the Pluto or replace its firmware.
+
+Connect over SSH or a serial terminal. The stock SSH credentials are
+`root` / `analog`:
+
+```sh
+ssh root@pluto.local
+fw_setenv attr_name compatible
+fw_setenv attr_val ad9364
+# Required by Pluto firmware v0.32 and newer:
+fw_setenv compatible ad9364
+reboot
+```
+
+`fw_setenv` writes the persistent environment directly, so a separate
+`saveenv` command is not required. After reboot, verify the settings:
+
+```sh
+fw_printenv attr_name
+fw_printenv attr_val
+fw_printenv compatible
+```
+
+Expected values are `compatible`, `ad9364`, and `ad9364`, respectively. The
+scanner reads the resulting `frequency_available` attribute whenever it opens
+the Pluto and uses the advertised limits automatically.
+
+This setting does not change the installed RF silicon, and performance outside
+the AD9363-rated range is not guaranteed. The scanner also deliberately keeps
+its current RF-bandwidth profiles at or below `20 MHz`; enabling the extended
+profile does not make it select a `56 MHz` RF bandwidth.
+
+To restore the default compatibility settings, delete the variables and
+reboot:
+
+```sh
+fw_setenv attr_name
+fw_setenv attr_val
+fw_setenv compatible
+reboot
+```
+
+Reference: [Analog Devices, Customizing the Pluto configuration](https://wiki.analog.com/university/tools/pluto/users/customizing).
+
 ---
 
 ## IIO API (libiio)

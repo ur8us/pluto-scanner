@@ -2666,7 +2666,7 @@ static void probe_rf_ports_available(pluto_sdr_dev_t *dev)
         if (!rf_port_is_known(token))
             continue;
         if (iio_channel_attr_write(dev->phy_rx0,
-                                   "rf_port_select", token) == 0)
+                                   "rf_port_select", token) >= 0)
             rf_port_list_append(accepted, sizeof(accepted), token);
     }
     if (accepted[0] == 0)
