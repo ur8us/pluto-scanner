@@ -4,8 +4,9 @@
 
 A browser-based real-time spectrum analyser and waterfall display for the
 ADALM-Pluto software-defined radio. The application covers the extended
-`70 MHz – 6 GHz` receiver range, displays the full configured band at once,
-and supports continuous zoom up to **1,000,000×** (hertz-per-pixel detail).
+receiver range advertised by the connected Pluto, displays the full configured
+band at once, and supports continuous zoom up to **1,000,000×**
+(hertz-per-pixel detail).
 It does not require custom Pluto firmware: the original Analog Devices stock
 firmware and DATV firmware variants are supported when the standard libiio
 devices and AD936x attributes are present.
@@ -111,8 +112,8 @@ the waterfall.
 | `SCANNER_SAMPLE_RATE_HZ` | 61.44 MHz | Pluto default rate |
 | `DEFAULT_RF_BANDWIDTH_HZ` | 20 MHz | RF bandwidth |
 | `DEFAULT_BW_RATIO` | 0.85 | Passband usage per hop |
-| `RF_RECEIVER_MIN_HZ` | 70 MHz | Extended Pluto low end |
-| `RF_RECEIVER_MAX_HZ` | 6000 MHz | Extended Pluto high end |
+| `RF_RECEIVER_FALLBACK_MIN_HZ` | 46,875,001 Hz | Default receiver low end until Pluto reports `frequency_available` |
+| `RF_RECEIVER_FALLBACK_MAX_HZ` | 6000 MHz | Default receiver high end until Pluto reports `frequency_available` |
 | `SCAN_BUF_LEN` | 1024 | Short hop buffer (complex samples) |
 | `PLUTO_SCAN_KERNEL_BUFFERS` | 1 | Low-latency libiio queue depth for retuned scan/hop captures |
 | `PLUTO_CONTINUOUS_KERNEL_BUFFERS` | 4 | Queued libiio blocks for uninterrupted single-frequency capture |
@@ -201,8 +202,12 @@ rates, level normalization) is fully specified in **`SPECTRUM_CALC.MD`**.
 ### 3.4.1 Air-frequency and converter contract
 
 All frontend controls, API request fields, persisted config fields, SSE row
-frequencies, and planner spans are **air/signal frequencies**. The Pluto
-receiver range (`70 MHz..6000 MHz`) is enforced only after converter math:
+frequencies, and planner spans are **air/signal frequencies**. The backend
+reads the AD936x RX LO `frequency_available` attribute once after opening the
+Pluto and exposes the active receiver limits as `receiver_min_hz` and
+`receiver_max_hz`. If that attribute is missing or malformed, the fallback is
+`46,875,001 Hz..6,000,000,000 Hz`. The Pluto receiver range is enforced only
+after converter math:
 
 ```text
 rx_hz = air_hz - converter_hz          when converter_hz >= 0
@@ -213,19 +218,19 @@ Valid configured air-frequency intervals are therefore:
 
 ```text
 converter_hz >= 0:
-  [converter_hz + 70e6, converter_hz + 6000e6]
+  [converter_hz + receiver_min_hz, converter_hz + receiver_max_hz]
 
 converter_hz < 0, conv_hz = -converter_hz:
-  [max(0, conv_hz - 6000e6), conv_hz - 70e6]
-  [conv_hz + 70e6, conv_hz + 6000e6]
+  [max(0, conv_hz - receiver_max_hz), conv_hz - receiver_min_hz]
+  [conv_hz + receiver_min_hz, conv_hz + receiver_max_hz]
 ```
 
-The frontend must not clamp air/signal inputs to `6000 MHz`; converter-mapped
+The frontend may normalize typed Start/End fields into the active valid
+air-frequency interval for the current converter, but it must not clamp
+air/signal inputs to raw `6000 MHz` without converter math; converter-mapped
 air frequencies may legitimately be above `6 GHz`. `/api/start` must reject a
 configured band that is not wholly inside one valid converted receiver interval
 with HTTP `400`, and it must do so before mutating `g_freq_start`/`g_freq_end`.
-It must not silently move the user's configured air band to a nearby valid
-receiver interval.
 
 ### 3.4.2 RFPLL coordinate correction
 
@@ -379,8 +384,9 @@ ordinary user-editable controls.
 |---|---|
 | `device`, `sw_version` | Fixed device string; build date (`__DATE__`+`__TIME__`) |
 | `hardware`, `firmware`, `serial`, `manufacturer`, `product` | Pluto identity (from IIO / USB serial) |
-| `receiver_min_hz`, `receiver_max_hz` | `70e6`, `6e9` (extended range) |
-| `receiver_range_note` | `"unofficial extended Pluto range"` |
+| `receiver_min_hz`, `receiver_max_hz` | Active Pluto RX LO limits in integer hertz |
+| `receiver_range_source` | `"frequency_available"` or `"fallback"` |
+| `receiver_range_note` | `"active Pluto receiver range"` |
 | `scanning`, `device_present` | Run state flags |
 | `freq_start`, `freq_end` | Configured full band (Hz) |
 | `configured_start_hz`, `configured_end_hz` | Alias of full band |
@@ -448,6 +454,7 @@ data: {"view":<id>,"n":<line#>,"b":<total_steps>,"mode":"scan|single",
        "minimum_rate_overlap":<0|1>,"minimum_rate_achieved":<0|1>,
        "true_line_rate":<lines_per_second>,
        "preview_interval_ms":<planned_playback_interval>,
+       "line_interval_ms":<planned_steady_state_interval>,
        "waterfall_noise_scale":<enbw_display_factor>,
        "preview":<0|1>,"preview_age_ms":<ms>,
        "preview_sequence":<i>,"preview_count":<n>,
@@ -475,10 +482,15 @@ data: {"view":<id>,"n":<line#>,"b":<total_steps>,"mode":"scan|single",
 - `preview=1` rows are compatible historical samples processed through the same
   CIC/Hann/FFT path for low-latency high-resolution changes. They provide the
   first waterfall rows from memory while the live stream fills the larger FFT
-  window. When previews exist, `preview_interval_ms` is exactly the estimated
-  fresh-line wait divided by `preview_count`, not the prior raw FFT cadence.
-  The frontend queues previews and following live rows in arrival order, so
-  cached rows do not burst and then leave an empty pause. Animated Go To
+  window. On preview rows, `preview_interval_ms` is exactly the estimated
+  fresh-line wait divided by the number of previews produced; it is zero on
+  live rows. `line_interval_ms` is the planned steady-state published cadence
+  after min-rate overlap and max-rate limiting. The frontend queues previews
+  and following live rows in arrival order against one retained monotonic
+  deadline for the active view, so temporary gaps between SSE deliveries do
+  not turn cached rows into a burst or create a preview-to-live pause. If the
+  first live row arrives earlier than estimated, it supersedes cached rows
+  still waiting in the presentation queue and takes the next deadline. Animated Go To
   accepts a matching current-resolution preview row and does not stretch an
   older row into the new viewport.
 
@@ -523,7 +535,9 @@ manual dual slider); auto levels use robust percentiles (8 % noise floor,
   must be a length-`display_bins` array of integers `0..255`.
 - `f0 < f1` and finite.
 - Cached previews are queued and rendered at `preview_interval_ms`; live rows
-  arriving behind that queue retain chronological order.
+  use `line_interval_ms`, and the next presentation deadline survives a
+  temporarily empty queue until the next row or view change. An early live row
+  replaces unrendered cached rows rather than accumulating display latency.
 
 On stall (no line for 6× the expected line interval, clamped `5–30 s`) the
 client reconnects. Heartbeat shows `disconnected` / `idle` / `scanning`.
@@ -546,8 +560,9 @@ client reconnects. Heartbeat shows `disconnected` / `idle` / `scanning`.
   for a matching current-resolution FFT/CIC row (a compatible preview or live
   row) so each step does not stretch the previous lower-resolution image.
 - **Persistence** — the visible viewport is saved to `localStorage` and the URL
-  hash (`#view=start-end`); restored on page load. A saved scan is **not**
-  auto-started if the backend was idle.
+  hash (`#view=start-end`); restored on page load. Stop then Run preserves a
+  valid URL hash viewport when it fits inside the typed Start/End band. A saved
+  scan is **not** auto-started if the backend was idle.
 
 ### 4.5 Rulers, markers, bands
 
@@ -644,7 +659,7 @@ Backend planner:
 Backend configures Pluto (LO, samplerate, bw, gain) ── converter math:
     rx_lo = air − f_conv        (f_conv ≥ 0)
     rx_lo = |−f_conv − air|     (f_conv < 0, e.g. −530 MHz for FM band)
-    reject before changing config if rx_lo would leave 70 MHz..6000 MHz
+    reject before changing config if rx_lo would leave receiver_min_hz..receiver_max_hz
         │
         ▼
 Acquisition:
@@ -699,7 +714,8 @@ Frontend: validate row → update scope → scroll waterfall → relabel → aut
 - Scan is stopped automatically after `FRONTEND_IDLE_STOP_MS = 20 s` of no
   frontend activity.
 - The device is polled for reconnect every 5 s; an idle backend does not
-  auto-start a saved scan.
+  auto-start a saved scan. The browser action button is labeled `Run`; the API
+  endpoint remains `/api/start`.
 
 ---
 

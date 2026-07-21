@@ -63,7 +63,7 @@ I want this project to explore new principles for SDR tools (click to watch vide
 4. [Seamless merging of scan/hop mode and single-frequency reception, hidden from the user.](https://www.youtube.com/watch?v=KnPlvGlBu_s)
 5. [Waterfall speed limits expressed as a range FROM and TO lines per second instead of tying behavior directly to FFT size. The program should do its best to satisfy the user's desired behavior.](https://www.youtube.com/watch?v=GDP-NtIiRhI)
 6. [Persistent waterfall history: when zooming or moving through frequencies, the waterfall is not cleared. It shows all recorded data that still applies, even when stretched. This is a known SDR UI principle, but it still needs better implementation so history remains useful across large zoom and frequency changes.](https://www.youtube.com/watch?v=wFkcWrQWWDI)
-7. Low-latency resolution changes: very fine frequency resolution needs FFTs built from many seconds of samples. Traditional SDR programs can make the user wait several seconds after switching resolution before the first new waterfall line appears. This scanner reuses compatible samples already held in memory for the first preview lines, so the display responds quickly while live acquisition catches up.
+7. Low-latency, smooth resolution changes: very fine frequency resolution needs FFTs built from many seconds of samples. Traditional SDR programs can make the user wait several seconds after switching resolution. This scanner reuses compatible samples already held in memory and paces those preview lines into the live stream, so the display responds immediately without a preview burst followed by a pause.
 8. Exact frequency tuning: deterministic compensation for PLL and DDS-style rounding errors keeps received signals plotted at their true frequencies.
 
 
@@ -111,7 +111,16 @@ keep continuous capture running while userspace extracts I/Q, converts samples,
 and copies the preceding refill into the worker queue. Scan/hop mode retains
 one block for low stale-data latency after each retune.
 
-The scanner now accepts the unofficial extended Pluto tuning range of `70 MHz` to `6 GHz` for receiver-side frequency validation. Start/end controls are air-frequency values, not receiver-frequency limits; values above `6 GHz` are valid when `converter_freq` maps them into the Pluto receiver range. FM broadcast-band testing still needs a converter mapping when the air frequency lies outside that direct tuning envelope. With this app's converter convention, the stable hardware test setup used `converter_freq = -530 MHz`, mapping `88-108 MHz` air frequency to `422-442 MHz` receiver tuning.
+After connecting to Pluto, the backend reads the AD936x RX LO
+`frequency_available` range and uses those values for receiver-side frequency
+validation. If the attribute is unavailable, the fallback receiver range is
+`46.875001 MHz` to `6 GHz`. Start/end controls are air-frequency values, not
+raw receiver-frequency limits; values above `6 GHz` are valid when
+`converter_freq` maps them into the Pluto receiver range. FM broadcast-band
+testing still needs a converter mapping when the air frequency lies outside
+that direct tuning envelope. With this app's converter convention, the stable
+hardware test setup used `converter_freq = -530 MHz`, mapping `88-108 MHz` air
+frequency to `422-442 MHz` receiver tuning.
 
 No Pluto reflashing is required for this program. It works with the original
 Analog Devices stock firmware and DATV firmware variants, as long as the normal
@@ -301,14 +310,17 @@ http://localhost:8080
 
 ## UI Controls
 
-- Start/end frequency and converter are air-frequency settings. Receiver limits are checked after converter conversion, so invalid bands are rejected instead of silently rewritten. The adjacent `Input` control selects a backend-verified Pluto RX input through `rf_port_select` and can be changed while scanning without retuning.
+- Start/end frequency and converter are air-frequency settings. Receiver limits are checked after converter conversion; the frontend normalizes typed fields into the active valid interval, and the backend remains authoritative. The adjacent `Input` control selects a backend-verified Pluto RX input through `rf_port_select` and can be changed while scanning without retuning.
 - Sample rate, RF bandwidth, and passband usage are auto-profiled for Pluto performance and shown read-only in the UI.
 - RF bandwidth is kept strictly below sample rate in every auto profile.
 - Waterfall rows are published as exactly one processed output bin per screen pixel; raw FFT/CIC bin counts are kept as debug metadata.
 - Waterfall row samples are transported over SSE as packed `uint8` base64
   (`encoding:"u8b64"`) instead of JSON number arrays. This keeps the simple
   EventSource stream but removes most of the avoidable per-bin text overhead.
-- The frontend sends `display_bins` with deliberate view/start requests so backend rows match the selected canvas width. Browser page zoom and responsive layout resample already received rows locally; they do not restart the Pluto stream.
+- The frontend sends `display_bins` with deliberate view/Run requests so backend rows match the selected canvas width. Browser page zoom and responsive layout resample already received rows locally; they do not restart the Pluto stream.
+- The main action button is labeled `Run`. Stop then Run preserves a valid
+  `#view=start-end` URL viewport when it still fits inside the typed Start/End
+  band.
 - Passband usage still defines hop spacing internally as `rf_bandwidth * ratio`.
 - Gain mode and hardware gain map to AD936x `gain_control_mode` and `hardwaregain`.
 - FFT/CIC status shows the active backend plan used for the current zoom.
@@ -408,7 +420,7 @@ Firefox binary with `FIREFOX_BIN=/path/to/firefox` when needed.
 
 `tools/zoom_sweep.py` measures actual SSE waterfall line cadence over the regular `1, 2, 5` zoom ladder. `tools/browser_zoom_matrix.py` repeats the same ladder through the browser in manual and animated Go To paths.
 
-`tools/frontend_random_validation.py` randomly exercises zoom, pan, Go To, sliders, ruler/marker dialog paths, stop/start, waterfall rendering, and verifies scan/hop plus single-frequency FFT/CIC/line-rate planning through `/api/status`.
+`tools/frontend_random_validation.py` randomly exercises zoom, pan, Go To, sliders, ruler/marker dialog paths, stop/run, waterfall rendering, and verifies scan/hop plus single-frequency FFT/CIC/line-rate planning through `/api/status`.
 
 `tools/cic_synthetic_signal_check.py` builds a separate no-hardware test binary
 and sends a continuous bin-centred complex tone through the production queue,

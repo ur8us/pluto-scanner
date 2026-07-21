@@ -46,22 +46,27 @@ rx_hz = abs(-converter_hz - air_hz)    when converter_hz < 0
 For a non-negative converter, the valid air interval is:
 
 ```text
-[converter_hz + 70e6, converter_hz + 6000e6]
+[converter_hz + receiver_min_hz, converter_hz + receiver_max_hz]
 ```
 
 For a negative converter (`conv_hz = -converter_hz`), the valid air intervals
 are:
 
 ```text
-[max(0, conv_hz - 6000e6), conv_hz - 70e6]
-[conv_hz + 70e6, conv_hz + 6000e6]
+[max(0, conv_hz - receiver_max_hz), conv_hz - receiver_min_hz]
+[conv_hz + receiver_min_hz, conv_hz + receiver_max_hz]
 ```
+
+`receiver_min_hz` and `receiver_max_hz` come from the connected Pluto RX LO
+`frequency_available` attribute. The fallback used before a successful read is
+`46,875,001 Hz..6 GHz`.
 
 The configured air band must be wholly inside one valid interval before the
 planner runs. Invalid converted bands are rejected; the planner must not clamp
 or translate the user's configured air band to a nearby valid receiver range.
-The frontend must also avoid using `6000 MHz` as a maximum air-frequency input
-limit, because converter-mapped air frequencies can be above `6 GHz`.
+The frontend must also avoid using raw `6000 MHz` as a maximum air-frequency
+input limit without converter math, because converter-mapped air frequencies
+can be above `6 GHz`.
 
 Sources consulted:
 
@@ -404,7 +409,8 @@ source_center_hz =
   visible_center_hz +/- second_if_hz
 
 Choose the sign that keeps source_start/source_end covering the visible span
-and keeps the converted Pluto receiver LO inside the valid 70..6000 MHz range.
+and keeps the converted Pluto receiver LO inside
+`receiver_min_hz..receiver_max_hz`.
 ```
 
 Estimated single timing:
@@ -578,9 +584,14 @@ they are marked `preview=1` and are never joined to post-restart live samples.
 Live CIC state is reset after preview processing, and the first live row is
 marked `preview=0`. The backend chooses enough preview rows to cover the
 estimated fresh-frame wait where cached history permits and includes
-`preview_interval_ms = estimated_first_line_ms / preview_count` in every SSE
-row. The frontend queues those previews and releases them at that cadence while
-live acquisition fills independently. This
+`preview_interval_ms = estimated_first_line_ms / preview_count` on cached SSE
+rows. Live rows carry `preview_interval_ms = 0`; all rows carry
+`line_interval_ms = 1000 / published_line_rate` for the steady-state cadence.
+The frontend queues those previews and releases them against one monotonic
+per-view deadline while live acquisition fills independently. It retains the
+deadline even when the queue is briefly empty between SSE deliveries. If live
+data arrives before the conservative estimate, the first live row replaces
+cached rows that are still queued and uses the next presentation slot. This
 avoids both an immediate preview burst and a subsequent empty pause, without
 ever forming an FFT from a mixture of pre-restart and post-restart samples.
 

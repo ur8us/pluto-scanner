@@ -64,6 +64,29 @@ fetch('/api/status').then(r => r.json()).then(done)
     return driver.execute_async_script(script)
 
 
+def api_view(driver, visible_start_hz, visible_end_hz):
+    """Apply one backend viewport through the browser origin."""
+    script = """
+const done = arguments[arguments.length - 1];
+fetch('/api/view', {
+  method: 'POST',
+  headers: {'Content-Type': 'application/json'},
+  body: JSON.stringify({
+    visible_start_hz: arguments[0],
+    visible_end_hz: arguments[1],
+    display_bins: 1024
+  })
+}).then(r => r.json()).then(done)
+  .catch(e => done({status: 'error', message: String(e)}));
+"""
+    result = driver.execute_async_script(
+        script, visible_start_hz, visible_end_hz
+    )
+    if result.get("status") != "ok":
+        raise RuntimeError(result)
+    return result
+
+
 def main():
     os.environ["NO_PROXY"] = "localhost,127.0.0.1"
     os.environ["no_proxy"] = "localhost,127.0.0.1"
@@ -97,6 +120,9 @@ def main():
         assert driver.find_element(By.ID, "infoSampleRate").is_displayed()
         assert driver.find_element(By.ID, "infoRfBandwidth").is_displayed()
         assert driver.find_element(By.ID, "infoBwUsage").is_displayed()
+        assert driver.find_element(By.ID, "infoReceiverRange").is_displayed()
+        if driver.find_element(By.ID, "btnStart").text.strip().lower() != "run":
+            raise RuntimeError("main scan action button is not labeled Run")
         Select(driver.find_element(By.ID, "timeMarks")).select_by_value("15")
         assert (
             driver.execute_script("return localStorage.getItem('timeMarksSeconds');")
@@ -139,9 +165,66 @@ def main():
             "sub_tenth": " (0.014 lines/s)",
         }:
             raise RuntimeError(f"unexpected FFT rate formatting: {rate_format}")
+        zoom_format = driver.execute_script(
+            "return window.__plutoTestHooks.zoomFormatting();"
+        )
+        if zoom_format != {
+            "one": "1.00x",
+            "ten": "10.0x",
+            "hundred": "100.0x",
+            "over_hundred": "101x",
+            "max": "1000000x",
+        }:
+            raise RuntimeError(f"unexpected zoom formatting: {zoom_format}")
+        receiver_clamp = driver.execute_script(
+            "return window.__plutoTestHooks.receiverClampCheck();"
+        )
+        if receiver_clamp != {
+            "direct": {"start": "46.875001", "end": "6000"},
+            "converter": {"start": "88", "end": "108"},
+        }:
+            raise RuntimeError(f"unexpected receiver clamp: {receiver_clamp}")
+        hash_conflicts = driver.execute_script(
+            "return window.__plutoTestHooks.hashViewConflictCheck();"
+        )
+        if hash_conflicts != {
+            "contained": {"left": 434800000, "right": 435200000},
+            "excluded": None,
+            "malformed": None,
+        }:
+            raise RuntimeError(f"unexpected URL/typed-band precedence: {hash_conflicts}")
 
         api_stop(driver)
         time.sleep(1.0)
+
+        driver.set_script_timeout(5)
+        cadence_probe = driver.execute_async_script(
+            "const done=arguments[0];"
+            "window.__plutoTestHooks.presentationCadenceProbe()"
+            ".then(done).catch((error)=>done({error:String(error)}));"
+        )
+        if cadence_probe.get("error"):
+            raise RuntimeError(f"presentation cadence probe failed: {cadence_probe}")
+        normal_cadence = cadence_probe.get("normal", {})
+        if normal_cadence.get("previews") != 3 or normal_cadence.get("live") != 1:
+            raise RuntimeError(f"presentation cadence lost rows: {cadence_probe}")
+        normal_gaps = [float(value) for value in normal_cadence.get("gaps_ms", [])]
+        if len(normal_gaps) != 3 or any(
+            value < 25.0 or value > 100.0 for value in normal_gaps
+        ):
+            raise RuntimeError(f"preview/live pacing was uneven: {cadence_probe}")
+        early_cadence = cadence_probe.get("early", {})
+        early_gaps = [float(value) for value in early_cadence.get("gaps_ms", [])]
+        if (
+            early_cadence.get("previews") != 1
+            or early_cadence.get("live") != 1
+            or len(early_gaps) != 1
+            or early_gaps[0] < 25.0
+            or early_gaps[0] > 100.0
+        ):
+            raise RuntimeError(
+                f"early live row did not supersede queued previews smoothly: {cadence_probe}"
+            )
 
         for element_id, value in [("freqStart", "430"), ("freqEnd", "470"), ("converterFreq", "0")]:
             el = driver.find_element(By.ID, element_id)
@@ -152,6 +235,45 @@ def main():
         driver.execute_script(
             "const el=document.getElementById('vgaGain');"
             "el.value='20'; el.dispatchEvent(new Event('input',{bubbles:true}));"
+        )
+        driver.execute_script(
+            "history.replaceState(null, '', '#view=434800000-435200000');"
+        )
+        driver.find_element(By.ID, "btnStart").click()
+        WebDriverWait(driver, 12).until(
+            lambda d: d.find_element(By.ID, "statusText").text == "scanning"
+        )
+        hash_status = api_status(driver)
+        if (
+            abs(float(hash_status.get("visible_start_hz", 0)) - 434_800_000) > 5
+            or abs(float(hash_status.get("visible_end_hz", 0)) - 435_200_000)
+            > 5
+        ):
+            raise RuntimeError(f"URL hash view was not used on Run: {hash_status}")
+        driver.find_element(By.ID, "btnStop").click()
+        WebDriverWait(driver, 15).until(
+            lambda d: d.find_element(By.ID, "statusText").text == "idle"
+        )
+        driver.find_element(By.ID, "btnStart").click()
+        WebDriverWait(driver, 12).until(
+            lambda d: d.find_element(By.ID, "statusText").text == "scanning"
+        )
+        hash_restart_status = api_status(driver)
+        if (
+            abs(float(hash_restart_status.get("visible_start_hz", 0)) - 434_800_000)
+            > 5
+            or abs(float(hash_restart_status.get("visible_end_hz", 0)) - 435_200_000)
+            > 5
+        ):
+            raise RuntimeError(
+                f"URL hash view was not preserved after Stop/Run: {hash_restart_status}"
+            )
+        driver.find_element(By.ID, "btnStop").click()
+        WebDriverWait(driver, 15).until(
+            lambda d: d.find_element(By.ID, "statusText").text == "idle"
+        )
+        driver.execute_script(
+            "history.replaceState(null, '', location.pathname + location.search);"
         )
         driver.find_element(By.ID, "btnStart").click()
         WebDriverWait(driver, 12).until(
@@ -361,6 +483,91 @@ fetch('/api/status')
         ):
             raise RuntimeError(f"animated Go To did not finish at target: {goto_state}")
 
+        # Exercise Principle 7 at a true fresh-FFT cadence below 0.5 lines/s.
+        # The first target warms a compatible raw cache; the shifted target
+        # must then present cached and live rows without a burst/pause handoff.
+        deep_span_hz = 4096.0e6 / 3_000_000.0
+        deep_center_hz = 435_000_000.0
+        deep_payload = {
+            "freq_start": 430,
+            "freq_end": 470,
+            "visible_start_hz": deep_center_hz - deep_span_hz * 0.5,
+            "visible_end_hz": deep_center_hz + deep_span_hz * 0.5,
+            "converter_freq": 0,
+            "samplerate": 61440000,
+            "rf_bandwidth": 20000000,
+            "bw_ratio": 0.85,
+            "gain_mode": "manual",
+            "hardwaregain_db": 20,
+            "fft_size": 1024,
+            "display_bins": 1024,
+            "rate_limit_lps": 100,
+            "min_rate_lps": 20,
+        }
+        deep_plan = api_start(driver, deep_payload)
+        if (
+            int(deep_plan.get("decim_factor", 0)) != 64
+            or float(deep_plan.get("true_line_rate", 1)) > 0.5
+        ):
+            raise RuntimeError(f"deep cadence test did not select x64: {deep_plan}")
+        driver.execute_script(
+            "window.__plutoTestHooks.clearPresentationHistory();"
+        )
+        WebDriverWait(driver, 12).until(
+            lambda d: len(
+                [
+                    row
+                    for row in d.execute_script(
+                        "return window.__plutoTestHooks.presentationHistory();"
+                    )
+                    if int(row.get("preview", 0)) == 0
+                ]
+            )
+            >= 6
+        )
+        time.sleep(4.0)
+
+        driver.execute_script(
+            "window.__plutoTestHooks.clearPresentationHistory();"
+        )
+        shifted_center_hz = deep_center_hz + 25.0
+        deep_view_plan = api_view(
+            driver,
+            shifted_center_hz - deep_span_hz * 0.5,
+            shifted_center_hz + deep_span_hz * 0.5,
+        )
+        deep_view_id = int(deep_view_plan.get("view_id", 0))
+
+        def deep_transition_rows(active_driver):
+            return [
+                row
+                for row in active_driver.execute_script(
+                    "return window.__plutoTestHooks.presentationHistory();"
+                )
+                if int(row.get("view", 0)) == deep_view_id
+            ]
+
+        WebDriverWait(driver, 12).until(
+            lambda d: (
+                (rows := deep_transition_rows(d))
+                and any(int(row.get("preview", 0)) != 0 for row in rows)
+                and sum(int(row.get("preview", 0)) == 0 for row in rows) >= 5
+            )
+        )
+        deep_rows = deep_transition_rows(driver)
+        deep_gaps_ms = [
+            float(deep_rows[index]["at_ms"])
+            - float(deep_rows[index - 1]["at_ms"])
+            for index in range(1, len(deep_rows))
+        ]
+        if not deep_gaps_ms:
+            raise RuntimeError("deep transition produced no measurable row gaps")
+        if min(deep_gaps_ms) < 8.0 or max(deep_gaps_ms) > 300.0:
+            raise RuntimeError(
+                "deep preview/live transition contained a burst or pause: "
+                f"gaps={deep_gaps_ms}, rows={deep_rows}"
+            )
+
         driver.execute_script(
             "const el=arguments[0]; const r=el.getBoundingClientRect();"
             "el.dispatchEvent(new MouseEvent('mousedown',{clientX:r.left+200,clientY:r.top+200,ctrlKey:true,bubbles:true}));"
@@ -400,6 +607,9 @@ fetch('/api/status')
                     "zoom_before": before_zoom,
                     "zoom_after": after_zoom,
                     "info_scan": driver.find_element(By.ID, "infoScan").text,
+                    "deep_transition_rows": len(deep_rows),
+                    "deep_gap_min_ms": min(deep_gaps_ms),
+                    "deep_gap_max_ms": max(deep_gaps_ms),
                     "screenshot": screenshot,
                 },
                 indent=2,

@@ -74,7 +74,15 @@ if content_lengths[-1] != len(body):
     )
 
 payload = json.loads(body.decode("utf-8"))
-for key in ("device", "mode", "steps", "sample_rates"):
+for key in (
+    "device",
+    "mode",
+    "steps",
+    "sample_rates",
+    "receiver_min_hz",
+    "receiver_max_hz",
+    "receiver_range_source",
+):
     if key not in payload:
         raise SystemExit(f"GET /api/status missing JSON key: {key}")
 PY

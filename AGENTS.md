@@ -42,7 +42,10 @@ float conversion, and queue copying delay the next refill. Scan/hop mode keeps
 one block because continuity between retuned centers is irrelevant and stale
 latency is undesirable.
 
-The app now supports the unofficial extended Pluto receiver range of `70 MHz..6 GHz`. Keep frontend frequencies as air/signal frequencies and enforce the receiver limits after converter conversion.
+After a Pluto connection opens, the backend reads the AD936x RX LO
+`frequency_available` range and uses it as the active receiver limit. The
+fallback is `46,875,001 Hz..6 GHz`. Keep frontend frequencies as air/signal
+frequencies and enforce receiver limits after converter conversion.
 
 The scanner must not require Pluto reflashing. It is expected to work with the
 original Analog Devices stock firmware and DATV firmware variants that expose
@@ -94,8 +97,11 @@ Agents must preserve these two Pluto operating modes. Do not port Fobos assumpti
      reset all CIC state before live acquisition resumes. The backend may send
      multiple preview rows immediately, but the frontend must release them at
      `preview_interval_ms = first_line_ms / preview_count` while the independent
-     live stream fills; never retain the old raw-line cadence here or join
-     pre-restart cache samples to post-restart live samples in an FFT.
+     live stream fills. Keep the per-view presentation deadline when the queue
+     is briefly empty between SSE events, then hand live rows to
+     `line_interval_ms`. An early live row may replace previews that have not
+     reached the canvas yet; never join pre-restart cache samples to
+     post-restart live samples in an FFT.
 
 ## FFT, CIC, and RF Planning Rules
 
@@ -233,14 +239,14 @@ The scanner must gracefully handle sudden Pluto disconnection (USB cable unplugg
 - The backend tracks a flag `g_auto_restart_on_reconnect` that is set to `1` whenever a scan is running and a device error forces the scan to stop.
 - After `poll_device_reconnect()` successfully opens the device, check `g_auto_restart_on_reconnect`:
   - If `1`, call `start_scan()` to automatically resume scanning with the current frontend frequency/view settings. Log `Auto-restarting scan after reconnect`.
-  - If `0`, just leave the device open and idle, waiting for a manual Start from the frontend.
+  - If `0`, just leave the device open and idle, waiting for a manual Run from the frontend.
 - The frontend heartbeat status line should reflect the auto-reconnect state (`reconnecting...`, `scanning`).
-- The frontend does NOT need to send a Start request; the backend handles it transparently.
+- The frontend does NOT need to send a Run request; the backend handles it transparently.
 
 ### Safety and Debouncing
 
 - After a reconnect and scan restart, suppress further auto-reconnect for at least 3 seconds to avoid rapid retry loops if the device is flapping.
-- If the scan fails again within 3 seconds of an auto-restart, clear `g_auto_restart_on_reconnect` so the backend does not loop forever. The frontend can still manually Start.
+- If the scan fails again within 3 seconds of an auto-restart, clear `g_auto_restart_on_reconnect` so the backend does not loop forever. The frontend can still manually Run.
 - The poll interval (5 seconds) already prevents tight retry loops for the open step.
 
 ### Diagnostics
@@ -422,7 +428,7 @@ cic_runtime = bounded moving sums with CIC_STAGES * decim complex delay entries
 cic_frequency_weight = min(1 / max(abs(sin(decim*pi*f/fs) / (decim*sin(pi*f/fs)))^CIC_STAGES, 0.05), 8)
 ```
 
-Do not auto-start a saved scan when the backend is idle. The page may restore saved fields and view state, but actual scanning should require Start unless the backend was already scanning before the browser attached.
+Do not auto-start a saved scan when the backend is idle. The page may restore saved fields and view state, but actual scanning should require Run unless the backend was already scanning before the browser attached. Stop then Run should preserve a valid `#view=start-end` URL viewport when it still fits inside the typed Start/End band. The browser button label is `Run`, while the backend API endpoint remains `/api/start`.
 
 ## Tests
 

@@ -237,6 +237,7 @@ def run_check():
             reader = SSEReader()
             reader.start()
             time.sleep(0.2)
+            view_request_at = time.monotonic()
             view_plan = http_json(
                 "POST",
                 "/api/view",
@@ -269,13 +270,20 @@ def run_check():
             sequences = [int(row.get("preview_sequence", 0)) for row in preview_rows]
             if sequences != list(range(1, len(sequences) + 1)):
                 raise RuntimeError(f"preview sequences were not contiguous: {sequences}")
-            if len(preview_rows) > expected_count:
+            if len(preview_rows) != expected_count:
                 raise RuntimeError(
-                    f"captured {len(preview_rows)} previews but preview_count was {expected_count}"
+                    f"produced {len(preview_rows)} previews but preview_count was {expected_count}"
                 )
             preview_interval_ms = float(preview_rows[0].get("preview_interval_ms", 0))
             if preview_interval_ms <= 0:
                 raise RuntimeError(f"missing preview interval metadata: {preview_rows[0]}")
+            line_interval_ms = float(preview_rows[0].get("line_interval_ms", 0))
+            if line_interval_ms <= 0:
+                raise RuntimeError(f"missing steady line interval: {preview_rows[0]}")
+            if any(float(row.get("preview_interval_ms", -1)) != 0 for row in live_rows):
+                raise RuntimeError("live rows still carry preview-only pacing metadata")
+            if any(float(row.get("line_interval_ms", 0)) <= 0 for row in live_rows):
+                raise RuntimeError("live rows lack steady-state pacing metadata")
             first_line_ms = float(view_plan.get("first_line_ms", 0))
             if expected_count * preview_interval_ms + preview_interval_ms < first_line_ms:
                 raise RuntimeError(
@@ -331,6 +339,12 @@ def run_check():
                 raise RuntimeError(
                     "rate-change preview coverage does not hide the planned live fill"
                 )
+            if len(rate_preview_rows) != int(
+                rate_preview_rows[0].get("preview_count", 0)
+            ):
+                raise RuntimeError("rate-change preview count was not exact")
+            if any(float(row.get("preview_interval_ms", -1)) != 0 for row in rate_live_rows):
+                raise RuntimeError("rate-change live rows carry preview pacing")
 
             http_json("POST", "/api/stop", {})
             stop_backend_process(process)
@@ -350,8 +364,18 @@ def run_check():
         "rate_preview_rows": len(rate_preview_rows),
         "rate_live_rows": len(rate_live_rows),
         "preview_interval_ms": preview_interval_ms,
+        "line_interval_ms": line_interval_ms,
         "rate_preview_interval_ms": rate_interval_ms,
         "first_line_ms": float(view_plan.get("first_line_ms", 0.0)),
+        "preview_arrival_span_ms": (
+            preview_rows[-1]["_arrival_monotonic"]
+            - preview_rows[0]["_arrival_monotonic"]
+        )
+        * 1000.0,
+        "first_live_arrival_ms": (
+            live_rows[0]["_arrival_monotonic"] - view_request_at
+        )
+        * 1000.0,
         "log_tail": output[-1000:],
     }
 

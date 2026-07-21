@@ -93,6 +93,7 @@ int n = iio_device_attr_write(dev->phy, "attr_name", buf);
 | Attribute | Type | Description |
 |---|---|---|
 | `frequency` | long long | RX LO frequency (Hz) |
+| `frequency_available` | string | Firmware-advertised RX LO range. The scanner reads this once per device connection and falls back to `46875001..6000000000` Hz if it is absent or malformed. |
 
 **Device attributes (`ad9361-phy`):**
 

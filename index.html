@@ -637,6 +637,7 @@
 
             <div class="info-bar">
                 <span>SW: <span class="val" id="infoSw">---</span></span>
+                <span>RX: <span class="val" id="infoReceiverRange">---</span></span>
                 <span
                     >Markers (SHIFT+click):
                     <span class="val" id="infoMarkers">0</span></span
@@ -745,7 +746,7 @@
                     <input type="checkbox" id="clockIn" />
                 </div>
                 <div class="btn-group">
-                    <button class="btn btn-start" id="btnStart">Start</button>
+                    <button class="btn btn-start" id="btnStart">Run</button>
                     <button class="btn btn-stop" id="btnStop" disabled>
                         Stop
                     </button>
@@ -973,6 +974,9 @@
             let currentFreq1 = 0;
             let currentSteps = 0;
             let currentConverterFreq = 0;
+            let activeReceiverMinHz = 46875001;
+            let activeReceiverMaxHz = 6000000000;
+            let activeReceiverRangeSource = "fallback";
             let currentDirectSamplingMaxHz = 0;
             let currentViewId = 0;
             let viewRequestSerial = 0;
@@ -999,6 +1003,7 @@
             let waterfallPresentationQueue = [];
             let waterfallPresentationTimer = 0;
             let waterfallPresentationNextMs = 0;
+            let waterfallPresentationViewId = 0;
             let waterfallPresentationHistory = [];
             let waterfallSecondsPerLine = null;
             let redrawFrame = 0;
@@ -1031,6 +1036,8 @@
             let sseReconnectTimer = 0;
             let sseFailureCount = 0;
             const MAX_ZOOM_FACTOR = 1000000;
+            const RECEIVER_FALLBACK_MIN_HZ = 46875001;
+            const RECEIVER_FALLBACK_MAX_HZ = 6000000000;
             const TIME_MARK_VALUES = [
                 0, 10, 15, 30, 60, 300, 600, 1200, 1800, 3600,
             ];
@@ -1124,7 +1131,7 @@
              * This function must not request a backend view update. A browser
              * page zoom or responsive layout change changes only presentation;
              * already received rows are resampled locally until a deliberate
-             * scanner zoom, pan, or Start request selects a new stream width.
+             * scanner zoom, pan, or Run request selects a new stream width.
              *
              * @returns {void}
              */
@@ -1480,6 +1487,7 @@
                 if (status.sw_version !== undefined)
                     document.getElementById("infoSw").textContent =
                         status.sw_version || "---";
+                updateReceiverRangeFromPlan(status);
             }
 
             function syncRateRangeFromSliders(changed) {
@@ -1575,8 +1583,8 @@
             /**
              * Normalize air-frequency input boxes before sending a scan request.
              *
-             * Receiver limits are validated after converter math by the backend;
-             * air/signal frequencies may legitimately exceed 6000 MHz.
+             * Receiver limits are first clamped through the active converter
+             * mapping for the user's convenience, then validated by the backend.
              *
              * @returns {void}
              */
@@ -1585,8 +1593,12 @@
 
                 const startEl = document.getElementById("freqStart");
                 const endEl = document.getElementById("freqEnd");
+                const converterHz = inputMhzToHz("converterFreq");
                 let startMhz = parseFloat(startEl.value);
                 let endMhz = parseFloat(endEl.value);
+                let startHz;
+                let endHz;
+                let band;
 
                 if (
                     !Number.isFinite(startMhz) ||
@@ -1599,8 +1611,15 @@
                 )
                     endMhz = startMhz + MIN_SCAN_SPAN_MHZ;
 
-                startEl.value = mhzInputValue(startMhz * 1e6);
-                endEl.value = mhzInputValue(endMhz * 1e6);
+                startHz = startMhz * 1e6;
+                endHz = endMhz * 1e6;
+                band = clampAirBandToReceiverLimits(
+                    startHz,
+                    endHz,
+                    converterHz,
+                );
+                startEl.value = mhzInputValue(band.left);
+                endEl.value = mhzInputValue(band.right);
             }
 
             function handleDirectSamplingChanged() {
@@ -1614,6 +1633,179 @@
             function inputMhzToHz(id) {
                 const value = parseFloat(document.getElementById(id).value);
                 return Number.isFinite(value) ? value * 1e6 : NaN;
+            }
+
+            /**
+             * Format an integer hertz value for the receiver range readout.
+             *
+             * @param {number} freqHz Frequency in hertz.
+             * @returns {string} Compact display text.
+             */
+            function formatReceiverRangeBound(freqHz) {
+                const value = Math.round(Number(freqHz));
+                if (!Number.isFinite(value)) return "---";
+                if (Math.abs(value) >= 1e9 && value % 1e9 === 0)
+                    return value / 1e9 + " GHz";
+                if (Math.abs(value) >= 1e6 && value % 1e6 === 0)
+                    return value / 1e6 + " MHz";
+                return (
+                    String(value).replace(/\B(?=(\d{3})+(?!\d))/g, ",") +
+                    " Hz"
+                );
+            }
+
+            /**
+             * Refresh active receiver bounds from backend metadata.
+             *
+             * @param {Object} plan Backend status/start/view payload.
+             * @returns {void}
+             */
+            function updateReceiverRangeFromPlan(plan) {
+                if (!plan) return;
+                if (
+                    plan.receiver_min_hz === undefined &&
+                    plan.receiver_max_hz === undefined
+                )
+                    return;
+                const minHz = Number(plan.receiver_min_hz);
+                const maxHz = Number(plan.receiver_max_hz);
+                if (
+                    Number.isFinite(minHz) &&
+                    Number.isFinite(maxHz) &&
+                    minHz > 0 &&
+                    maxHz > minHz
+                ) {
+                    activeReceiverMinHz = minHz;
+                    activeReceiverMaxHz = maxHz;
+                    activeReceiverRangeSource =
+                        plan.receiver_range_source || "fallback";
+                } else {
+                    activeReceiverMinHz = RECEIVER_FALLBACK_MIN_HZ;
+                    activeReceiverMaxHz = RECEIVER_FALLBACK_MAX_HZ;
+                    activeReceiverRangeSource = "fallback";
+                }
+                const el = document.getElementById("infoReceiverRange");
+                if (el) {
+                    const suffix =
+                        activeReceiverRangeSource === "fallback"
+                            ? " fallback"
+                            : "";
+                    el.textContent =
+                        formatReceiverRangeBound(activeReceiverMinHz) +
+                        " - " +
+                        formatReceiverRangeBound(activeReceiverMaxHz) +
+                        suffix;
+                }
+            }
+
+            /**
+             * Append one valid air-frequency interval when it has positive width.
+             *
+             * @param {Array<Object>} intervals Mutable interval list.
+             * @param {number} left Start frequency in hertz.
+             * @param {number} right End frequency in hertz.
+             * @returns {void}
+             */
+            function appendReceiverAirInterval(intervals, left, right) {
+                if (!Number.isFinite(left) || !Number.isFinite(right)) return;
+                left = Math.max(MIN_AIR_FREQ_START_MHZ * 1e6, left);
+                if (right > left) intervals.push({ left, right });
+            }
+
+            /**
+             * Build valid air-frequency intervals for the active converter.
+             *
+             * @param {number} converterHz Converter frequency in hertz.
+             * @returns {Array<Object>} Valid air-frequency intervals in hertz.
+             */
+            function receiverAirIntervalsForConverter(converterHz) {
+                const intervals = [];
+                const converter = Number.isFinite(converterHz)
+                    ? converterHz
+                    : 0;
+                if (converter >= 0) {
+                    appendReceiverAirInterval(
+                        intervals,
+                        converter + activeReceiverMinHz,
+                        converter + activeReceiverMaxHz,
+                    );
+                } else {
+                    const conv = -converter;
+                    appendReceiverAirInterval(
+                        intervals,
+                        conv - activeReceiverMaxHz,
+                        conv - activeReceiverMinHz,
+                    );
+                    appendReceiverAirInterval(
+                        intervals,
+                        conv + activeReceiverMinHz,
+                        conv + activeReceiverMaxHz,
+                    );
+                }
+                if (!intervals.length) {
+                    intervals.push({
+                        left: activeReceiverMinHz,
+                        right: activeReceiverMaxHz,
+                    });
+                }
+                return intervals;
+            }
+
+            /**
+             * Clamp a requested air band into the active receiver/converter range.
+             *
+             * @param {number} startHz Requested start frequency in hertz.
+             * @param {number} endHz Requested end frequency in hertz.
+             * @param {number} converterHz Converter frequency in hertz.
+             * @returns {{left:number,right:number}} Clamped air band in hertz.
+             */
+            function clampAirBandToReceiverLimits(startHz, endHz, converterHz) {
+                const intervals = receiverAirIntervalsForConverter(converterHz);
+                let reqStart = Number(startHz);
+                let reqEnd = Number(endHz);
+                let reqSpan;
+                let reqCenter;
+                let best = null;
+                let bestOverlap = -Infinity;
+
+                if (!Number.isFinite(reqStart))
+                    reqStart = intervals[0].left;
+                if (!Number.isFinite(reqEnd) || reqEnd <= reqStart)
+                    reqEnd = reqStart + MIN_SCAN_SPAN_MHZ * 1e6;
+                reqSpan = reqEnd - reqStart;
+                reqCenter = (reqStart + reqEnd) * 0.5;
+
+                for (const interval of intervals) {
+                    const overlap =
+                        Math.min(reqEnd, interval.right) -
+                        Math.max(reqStart, interval.left);
+                    if (overlap > bestOverlap) {
+                        bestOverlap = overlap;
+                        best = interval;
+                    }
+                }
+
+                if (!best) best = intervals[0];
+                if (bestOverlap > 0) {
+                    reqStart = Math.max(reqStart, best.left);
+                    reqEnd = Math.min(reqEnd, best.right);
+                    if (reqEnd > reqStart)
+                        return { left: reqStart, right: reqEnd };
+                }
+
+                reqSpan = Math.min(Math.max(reqSpan, 1), best.right - best.left);
+                reqCenter = clampNumber(reqCenter, best.left, best.right);
+                reqStart = reqCenter - reqSpan * 0.5;
+                reqEnd = reqStart + reqSpan;
+                if (reqStart < best.left) {
+                    reqStart = best.left;
+                    reqEnd = reqStart + reqSpan;
+                }
+                if (reqEnd > best.right) {
+                    reqEnd = best.right;
+                    reqStart = reqEnd - reqSpan;
+                }
+                return { left: reqStart, right: reqEnd };
             }
 
             function clampVisibleWindow(left, right, fullStart, fullEnd) {
@@ -1664,14 +1856,47 @@
                 }
             }
 
-            function loadHashViewForConfig(fullStart, fullEnd) {
+            /**
+             * Parse the URL hash viewport without clamping it to any band.
+             *
+             * @returns {{left:number,right:number}|null} Hash viewport in hertz.
+             */
+            function parseHashView() {
                 const match = window.location.hash.match(
                     /^#view=([0-9.+-]+)-([0-9.+-]+)$/,
                 );
                 if (!match) return null;
+                return {
+                    left: Number(match[1]),
+                    right: Number(match[2]),
+                };
+            }
+
+            /**
+             * Load a URL hash viewport for one configured full band.
+             *
+             * @param {number} fullStart Configured full-band start in hertz.
+             * @param {number} fullEnd Configured full-band end in hertz.
+             * @param {boolean} requireContained Require full containment.
+             * @returns {{left:number,right:number}|null} Clamped visible window.
+             */
+            function loadHashViewForConfig(
+                fullStart,
+                fullEnd,
+                requireContained = false,
+            ) {
+                const view = parseHashView();
+                if (!view) return null;
+                if (
+                    requireContained &&
+                    (view.left < fullStart ||
+                        view.right > fullEnd ||
+                        view.right <= view.left)
+                )
+                    return null;
                 return clampVisibleWindow(
-                    Number(match[1]),
-                    Number(match[2]),
+                    view.left,
+                    view.right,
                     fullStart,
                     fullEnd,
                 );
@@ -2348,6 +2573,20 @@
                     formatScanRange(currentFreq0, currentFreq1);
                 updateZoomIndicator();
                 return true;
+            }
+
+            /**
+             * Format the current zoom value for the title readout.
+             *
+             * @param {number} zoom Zoom factor.
+             * @returns {string} Display text with `x` suffix.
+             */
+            function formatZoomIndicatorValue(zoom) {
+                const value = Number(zoom);
+                if (!Number.isFinite(value) || value <= 0) return "1.00x";
+                if (value > 100) return Math.round(value) + "x";
+                if (value < 10) return value.toFixed(2) + "x";
+                return value.toFixed(1) + "x";
             }
 
             function gotoLineMatches(
@@ -3665,7 +3904,7 @@
                 if (Math.abs(zoom - MAX_ZOOM_FACTOR) <= MAX_ZOOM_FACTOR * 1e-3)
                     zoom = MAX_ZOOM_FACTOR;
                 document.getElementById("infoZoom").textContent =
-                    zoom < 10 ? zoom.toFixed(2) + "x" : zoom.toFixed(1) + "x";
+                    formatZoomIndicatorValue(zoom);
             }
 
             /**
@@ -4540,6 +4779,7 @@
                 }
                 waterfallPresentationQueue = [];
                 waterfallPresentationNextMs = 0;
+                waterfallPresentationViewId = 0;
             }
 
             /**
@@ -4549,10 +4789,36 @@
              * @returns {number} Delay in milliseconds before the next queued row.
              */
             function previewPresentationIntervalMs(data) {
+                if (Number(data && data.preview) === 0) return 0;
                 const interval = Number(data && data.preview_interval_ms);
                 if (Number.isFinite(interval) && interval > 0)
                     return Math.max(10, Math.min(60000, interval));
                 return 0;
+            }
+
+            /**
+             * Return the planned steady-state interval for one live row.
+             *
+             * Legacy backends used `preview_interval_ms` for every row, so it
+             * remains a fallback when the dedicated field is absent.
+             *
+             * @param {Object} data Parsed SSE waterfall row.
+             * @returns {number} Planned live presentation interval in milliseconds.
+             */
+            function linePresentationIntervalMs(data) {
+                let interval = Number(data && data.line_interval_ms);
+                if (!Number.isFinite(interval) || interval <= 0)
+                    interval = Number(data && data.preview_interval_ms);
+                if (Number.isFinite(interval) && interval > 0)
+                    return Math.max(10, Math.min(60000, interval));
+                return 0;
+            }
+
+            /** Return the presentation interval appropriate for one row type. */
+            function rowPresentationIntervalMs(data) {
+                return Number(data && data.preview) !== 0
+                    ? previewPresentationIntervalMs(data)
+                    : linePresentationIntervalMs(data);
             }
 
             /**
@@ -4570,15 +4836,14 @@
                 const now = performance.now();
                 const due = Math.max(now, waterfallPresentationNextMs);
                 waterfallPresentationTimer = setTimeout(() => {
-                    const data = waterfallPresentationQueue.shift();
+                    const item = waterfallPresentationQueue.shift();
                     waterfallPresentationTimer = 0;
-                    if (!data) return;
-                    renderWaterfallPayload(data);
-                    const interval = previewPresentationIntervalMs(data);
-                    waterfallPresentationNextMs =
-                        performance.now() + interval;
-                    if (!waterfallPresentationQueue.length)
-                        waterfallPresentationNextMs = 0;
+                    if (!item) return;
+                    item.render(item.data);
+                    const interval = rowPresentationIntervalMs(item.data);
+                    waterfallPresentationNextMs = interval > 0
+                        ? Math.max(due, performance.now()) + interval
+                        : 0;
                     drainWaterfallPresentationQueue();
                 }, Math.max(0, due - now));
             }
@@ -4589,18 +4854,58 @@
              * @param {Object} data Parsed SSE waterfall row.
              * @returns {void}
              */
-            function enqueueWaterfallPayload(data) {
+            function enqueueWaterfallPresentation(
+                data,
+                render = renderWaterfallPayload,
+            ) {
                 const preview = Number(data && data.preview) !== 0;
+                const rowView = Number(data && data.view);
+                const now = performance.now();
+                const interval = rowPresentationIntervalMs(data);
+                if (
+                    Number.isFinite(rowView) &&
+                    rowView > 0 &&
+                    waterfallPresentationViewId > 0 &&
+                    rowView !== waterfallPresentationViewId
+                ) {
+                    clearWaterfallPresentationQueue();
+                }
+                if (Number.isFinite(rowView) && rowView > 0)
+                    waterfallPresentationViewId = rowView;
+                if (!preview && waterfallPresentationQueue.length) {
+                    /* Fresh data supersedes historical rows that have not yet
+                     * reached the canvas. Keep the next monotonic deadline so
+                     * the handoff is smooth, but do not build display latency
+                     * behind a conservative first-live estimate. */
+                    waterfallPresentationQueue =
+                        waterfallPresentationQueue.filter((item) => {
+                            return Number(item.data && item.data.preview) === 0;
+                        });
+                }
                 if (
                     preview ||
                     waterfallPresentationQueue.length ||
-                    waterfallPresentationTimer
+                    waterfallPresentationTimer ||
+                    (interval > 0 && waterfallPresentationNextMs > now)
                 ) {
-                    waterfallPresentationQueue.push(data);
+                    waterfallPresentationQueue.push({ data, render });
                     drainWaterfallPresentationQueue();
                     return;
                 }
-                renderWaterfallPayload(data);
+                render(data);
+                waterfallPresentationNextMs = interval > 0
+                    ? performance.now() + interval
+                    : 0;
+            }
+
+            /**
+             * Queue one backend waterfall row for ordered presentation.
+             *
+             * @param {Object} data Parsed SSE waterfall row.
+             * @returns {void}
+             */
+            function enqueueWaterfallPayload(data) {
+                enqueueWaterfallPresentation(data, renderWaterfallPayload);
             }
 
             /**
@@ -4619,6 +4924,8 @@
                     preview: Number(data && data.preview) !== 0 ? 1 : 0,
                     at_ms: performance.now(),
                     interval_ms: previewPresentationIntervalMs(data),
+                    line_interval_ms: linePresentationIntervalMs(data),
+                    scheduled_interval_ms: rowPresentationIntervalMs(data),
                     server_capture_age_ms: Number(
                         data && data.live_capture_age_ms,
                     ),
@@ -4808,9 +5115,9 @@
              * Return whether automatic scan restarts are temporarily suppressed.
              *
              * Explicit Stop must win over late SSE reconnect/status-poll recovery
-             * work. A later user Start clears the suppression immediately.
+             * work. A later user Run clears the suppression immediately.
              *
-             * @returns {boolean} True when only user Start may start scanning.
+             * @returns {boolean} True when only user Run may start scanning.
              */
             function manualStopRestartSuppressed() {
                 return Date.now() < manualStopSuppressUntilMs;
@@ -6489,6 +6796,7 @@
 
                 zoomLeft = 0;
                 zoomRight = 1;
+                updateReceiverRangeFromPlan(plan);
 
                 if (plan.configured_start_hz !== undefined)
                     configuredFreq0 = Number(plan.configured_start_hz);
@@ -6572,9 +6880,9 @@
              * A preserved visible range is only valid when it belongs to the
              * same configured air-frequency band being submitted. This prevents
              * stale saved views such as 70-1000 MHz from overriding a newly
-             * typed converter band on manual Start.
+             * typed converter band on manual Run.
              *
-             * @param {Object} options Start options.
+             * @param {Object} options Run options.
              * @param {boolean} options.preserveView Include current visible range.
              * @returns {Object} JSON request for `/api/start`.
              */
@@ -6676,6 +6984,27 @@
                 ) {
                     options.resetView = false;
                     options.preserveView = true;
+                }
+                if (userInitiated && options.resetView !== false) {
+                    if (selectedDirectSampling() !== 0)
+                        syncDirectSamplingFields(true);
+                    else
+                        sanitizeScanFrequencyInputs();
+                    const typedStartHz = inputMhzToHz("freqStart");
+                    const typedEndHz = inputMhzToHz("freqEnd");
+                    const hashView = loadHashViewForConfig(
+                        typedStartHz,
+                        typedEndHz,
+                        true,
+                    );
+                    if (hashView) {
+                        configuredFreq0 = typedStartHz;
+                        configuredFreq1 = typedEndHz;
+                        currentFreq0 = hashView.left;
+                        currentFreq1 = hashView.right;
+                        options.resetView = false;
+                        options.preserveView = true;
+                    }
                 }
                 clearAutoRestartTimer();
                 const serial = ++scanRequestSerial;
@@ -7174,6 +7503,84 @@
                         }),
                     };
                 },
+                zoomFormatting() {
+                    return {
+                        one: formatZoomIndicatorValue(1),
+                        ten: formatZoomIndicatorValue(10),
+                        hundred: formatZoomIndicatorValue(100),
+                        over_hundred: formatZoomIndicatorValue(100.6),
+                        max: formatZoomIndicatorValue(MAX_ZOOM_FACTOR),
+                    };
+                },
+                receiverClampCheck() {
+                    const previousMin = activeReceiverMinHz;
+                    const previousMax = activeReceiverMaxHz;
+                    const previousSource = activeReceiverRangeSource;
+                    const previousStart =
+                        document.getElementById("freqStart").value;
+                    const previousEnd =
+                        document.getElementById("freqEnd").value;
+                    const previousConverter =
+                        document.getElementById("converterFreq").value;
+                    activeReceiverMinHz = 46875001;
+                    activeReceiverMaxHz = 6000000000;
+                    activeReceiverRangeSource = "test";
+                    document.getElementById("converterFreq").value = "0";
+                    document.getElementById("freqStart").value = "1";
+                    document.getElementById("freqEnd").value = "7000";
+                    sanitizeScanFrequencyInputs();
+                    const direct = {
+                        start: document.getElementById("freqStart").value,
+                        end: document.getElementById("freqEnd").value,
+                    };
+                    document.getElementById("converterFreq").value = "-530";
+                    document.getElementById("freqStart").value = "88";
+                    document.getElementById("freqEnd").value = "108";
+                    sanitizeScanFrequencyInputs();
+                    const converter = {
+                        start: document.getElementById("freqStart").value,
+                        end: document.getElementById("freqEnd").value,
+                    };
+                    activeReceiverMinHz = previousMin;
+                    activeReceiverMaxHz = previousMax;
+                    activeReceiverRangeSource = previousSource;
+                    document.getElementById("freqStart").value =
+                        previousStart;
+                    document.getElementById("freqEnd").value = previousEnd;
+                    document.getElementById("converterFreq").value =
+                        previousConverter;
+                    return { direct, converter };
+                },
+                hashViewConflictCheck() {
+                    const previousHash = window.location.hash;
+                    history.replaceState(
+                        null,
+                        "",
+                        "#view=434800000-435200000",
+                    );
+                    const contained = loadHashViewForConfig(
+                        430000000,
+                        470000000,
+                        true,
+                    );
+                    const excluded = loadHashViewForConfig(
+                        450000000,
+                        460000000,
+                        true,
+                    );
+                    history.replaceState(null, "", "#view=invalid");
+                    const malformed = loadHashViewForConfig(
+                        430000000,
+                        470000000,
+                        true,
+                    );
+                    history.replaceState(
+                        null,
+                        "",
+                        previousHash || location.pathname + location.search,
+                    );
+                    return { contained, excluded, malformed };
+                },
                 clearPresentationHistory() {
                     waterfallPresentationHistory = [];
                 },
@@ -7181,6 +7588,50 @@
                     return waterfallPresentationHistory.map((item) => ({
                         ...item,
                     }));
+                },
+                async presentationCadenceProbe() {
+                    const run = async (view, earlyLive) => {
+                        clearWaterfallPresentationQueue();
+                        const rendered = [];
+                        const row = (preview) => ({
+                            view,
+                            preview,
+                            preview_interval_ms: preview ? 40 : 0,
+                            line_interval_ms: 40,
+                        });
+                        const present = (data) => {
+                            rendered.push({
+                                preview: Number(data.preview),
+                                at_ms: performance.now(),
+                            });
+                        };
+                        enqueueWaterfallPresentation(row(1), present);
+                        await new Promise((resolve) => setTimeout(resolve, 12));
+                        enqueueWaterfallPresentation(row(1), present);
+                        await new Promise((resolve) => setTimeout(resolve, 12));
+                        enqueueWaterfallPresentation(row(1), present);
+                        await new Promise((resolve) =>
+                            setTimeout(resolve, earlyLive ? 12 : 90),
+                        );
+                        enqueueWaterfallPresentation(row(0), present);
+                        await new Promise((resolve) => setTimeout(resolve, 150));
+                        const gaps = [];
+                        for (let i = 1; i < rendered.length; i++)
+                            gaps.push(
+                                rendered[i].at_ms - rendered[i - 1].at_ms,
+                            );
+                        return {
+                            previews: rendered.filter((item) => item.preview)
+                                .length,
+                            live: rendered.filter((item) => !item.preview)
+                                .length,
+                            gaps_ms: gaps,
+                        };
+                    };
+                    const normal = await run(900000001, false);
+                    const early = await run(900000002, true);
+                    clearWaterfallPresentationQueue();
+                    return { normal, early };
                 },
                 viewState() {
                     return {

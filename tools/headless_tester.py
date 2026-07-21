@@ -54,6 +54,8 @@ def run_case(name, payload, expect_mode):
         raise RuntimeError(
             f"{name}: published source bins {row.get('source_bins')} != display bins {row.get('display_bins')}"
         )
+    if float(row.get("line_interval_ms", 0)) <= 0:
+        raise RuntimeError(f"{name}: missing steady presentation interval")
     if float(status.get("rf_bandwidth", 0)) >= float(status.get("samplerate", 1)):
         raise RuntimeError(
             f"{name}: RF bandwidth {status.get('rf_bandwidth')} must be less than sample rate {status.get('samplerate')}"

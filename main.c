@@ -120,8 +120,8 @@ static int win32_nanosleep(const struct timespec *req, struct timespec *rem)
 #define GOTO_TARGET_ZOOM_MIN 1.0
 #define GOTO_TARGET_ZOOM_MAX 1000000.0
 #define MIN_FREQ_START_HZ   0.0
-#define RF_RECEIVER_MIN_HZ  70.0e6
-#define RF_RECEIVER_MAX_HZ  6000.0e6
+#define RF_RECEIVER_FALLBACK_MIN_HZ 46875001LL
+#define RF_RECEIVER_FALLBACK_MAX_HZ 6000000000LL
 #define SCANNER_SAMPLE_RATE_HZ 61.44e6
 #define DEFAULT_RF_BANDWIDTH_HZ 20.0e6
 #define DEFAULT_BW_RATIO    0.85
@@ -349,6 +349,9 @@ static char g_manufacturer[64] = "unknown";
 static char g_product[64]   = "unknown";
 static double g_sample_rates[MAX_SAMPLE_RATES];
 static unsigned int g_sample_rate_count = 0;
+static long long g_receiver_min_hz = RF_RECEIVER_FALLBACK_MIN_HZ;
+static long long g_receiver_max_hz = RF_RECEIVER_FALLBACK_MAX_HZ;
+static char g_receiver_range_source[32] = "fallback";
 static long long g_last_frontend_activity_msec = 0;
 static volatile int g_auto_restart_on_reconnect = 0;
 static long long g_last_auto_restart_msec = 0;
@@ -1612,6 +1615,199 @@ static void pluto_read_device_string(struct iio_device *dev, const char *attr,
     trim_iio_string(dst);
 }
 
+/**
+ * @brief Reset active receiver LO limits to the documented fallback range.
+ *
+ * The values are integer hertz and are used when no Pluto is connected or when
+ * the device's `frequency_available` attribute cannot be read safely.
+ */
+static void reset_receiver_limits_to_fallback(void)
+{
+    g_receiver_min_hz = RF_RECEIVER_FALLBACK_MIN_HZ;
+    g_receiver_max_hz = RF_RECEIVER_FALLBACK_MAX_HZ;
+    copy_cstr(g_receiver_range_source, sizeof(g_receiver_range_source),
+              "fallback");
+}
+
+/**
+ * @brief Return the active receiver minimum LO in hertz.
+ *
+ * @return Minimum RX LO, as a double for RF planner math.
+ */
+static double receiver_min_hz_double(void)
+{
+    return (double)g_receiver_min_hz;
+}
+
+/**
+ * @brief Return the active receiver maximum LO in hertz.
+ *
+ * @return Maximum RX LO, as a double for RF planner math.
+ */
+static double receiver_max_hz_double(void)
+{
+    return (double)g_receiver_max_hz;
+}
+
+/**
+ * @brief Parse an IIO frequency range attribute into integer hertz bounds.
+ *
+ * The AD936x `frequency_available` representation is firmware/libiio text.
+ * This parser accepts bracketed ranges, `..` punctuation, scientific notation,
+ * and optional step values by using the first and last finite numeric tokens.
+ *
+ * @param text Attribute text read from IIO.
+ * @param out_min Receiver minimum in hertz.
+ * @param out_max Receiver maximum in hertz.
+ * @return 0 on a valid increasing positive range, otherwise -1.
+ */
+static int parse_receiver_frequency_available(const char *text,
+                                              long long *out_min,
+                                              long long *out_max)
+{
+    const char *p = text;
+    double first = 0.0;
+    double last = 0.0;
+    int count = 0;
+
+    if (!text || !out_min || !out_max)
+        return -1;
+
+    while (*p) {
+        char *end = NULL;
+        double value;
+
+        while (*p && !isdigit((unsigned char)*p) && *p != '+' &&
+               *p != '-' && *p != '.')
+            p++;
+        if (!*p)
+            break;
+
+        errno = 0;
+        value = strtod(p, &end);
+        if (end == p) {
+            p++;
+            continue;
+        }
+        if (errno == ERANGE || !isfinite(value))
+            return -1;
+        if (count == 0)
+            first = value;
+        last = value;
+        count++;
+        p = end;
+    }
+
+    if (count < 2 || first <= 0.0 || last <= 0.0 || first >= last ||
+        first > (double)LLONG_MAX || last > (double)LLONG_MAX)
+        return -1;
+
+    *out_min = llround(first);
+    *out_max = llround(last);
+    if (*out_min <= 0 || *out_max <= *out_min)
+        return -1;
+    return 0;
+}
+
+#if PSEUDO_RANDOM_SAMPLE_SOURCE
+/**
+ * @brief Verify receiver-range parsing in developer sample-source builds.
+ *
+ * @return 0 when all accepted and rejected examples behave as documented.
+ */
+static int receiver_frequency_available_parser_self_check(void)
+{
+    static const struct {
+        const char *text;
+        long long min_hz;
+        long long max_hz;
+    } valid[] = {
+        {"[46875001 .. 6e9]", 46875001LL, 6000000000LL},
+        {"[46875001 1 6000000000]", 46875001LL, 6000000000LL},
+        {"  [7.0e7   1   6.0e9]  ", 70000000LL, 6000000000LL},
+    };
+    static const char *invalid[] = {
+        "", "not-a-range", "[1 1]", "[6e9 1 70e6]",
+        "[-1 .. 6e9]", "[0 .. 6e9]", "[1e309 .. 6e9]",
+        "[nan .. inf]",
+    };
+
+    for (size_t i = 0; i < sizeof(valid) / sizeof(valid[0]); i++) {
+        long long min_hz = 0;
+        long long max_hz = 0;
+        if (parse_receiver_frequency_available(valid[i].text, &min_hz,
+                                               &max_hz) != 0 ||
+            min_hz != valid[i].min_hz || max_hz != valid[i].max_hz) {
+            fprintf(stderr,
+                    "[TEST] frequency_available parser rejected valid case: %s\n",
+                    valid[i].text);
+            return -1;
+        }
+    }
+    for (size_t i = 0; i < sizeof(invalid) / sizeof(invalid[0]); i++) {
+        long long min_hz = 0;
+        long long max_hz = 0;
+        if (parse_receiver_frequency_available(invalid[i], &min_hz,
+                                               &max_hz) == 0) {
+            fprintf(stderr,
+                    "[TEST] frequency_available parser accepted invalid case: %s\n",
+                    invalid[i]);
+            return -1;
+        }
+    }
+    return 0;
+}
+#endif
+
+/**
+ * @brief Load receiver LO capability from an opened Pluto device.
+ *
+ * Reads `frequency_available` from the AD936x RX LO channel once for the
+ * current device connection. Invalid or missing data keeps the fallback limits.
+ *
+ * @param dev Open Pluto device with `rx_lo` populated.
+ */
+static void load_receiver_limits_from_device(pluto_sdr_dev_t *dev)
+{
+    char raw[256];
+    long long min_hz = 0;
+    long long max_hz = 0;
+    ssize_t n;
+
+    reset_receiver_limits_to_fallback();
+    if (!dev || !dev->rx_lo) {
+        printf("[SDR] Receiver range fallback: %lld - %lld Hz\n",
+               g_receiver_min_hz, g_receiver_max_hz);
+        return;
+    }
+
+    raw[0] = 0;
+    n = iio_channel_attr_read(dev->rx_lo, "frequency_available",
+                              raw, sizeof(raw) - 1);
+    if (n < 0) {
+        printf("[SDR] Receiver range fallback: frequency_available unreadable (%zd), %lld - %lld Hz\n",
+               n, g_receiver_min_hz, g_receiver_max_hz);
+        return;
+    }
+    if ((size_t)n >= sizeof(raw))
+        n = (ssize_t)sizeof(raw) - 1;
+    raw[n] = 0;
+    trim_iio_string(raw);
+
+    if (parse_receiver_frequency_available(raw, &min_hz, &max_hz) != 0) {
+        printf("[SDR] Receiver range fallback: could not parse frequency_available=\"%s\", %lld - %lld Hz\n",
+               raw, g_receiver_min_hz, g_receiver_max_hz);
+        return;
+    }
+
+    g_receiver_min_hz = min_hz;
+    g_receiver_max_hz = max_hz;
+    copy_cstr(g_receiver_range_source, sizeof(g_receiver_range_source),
+              "frequency_available");
+    printf("[SDR] Receiver range from frequency_available=\"%s\": %lld - %lld Hz\n",
+           raw, g_receiver_min_hz, g_receiver_max_hz);
+}
+
 static int rf_port_list_contains(const char *list, const char *port);
 static void normalize_rf_ports_available(char *dst, size_t dst_len,
                                          const char *src);
@@ -1711,6 +1907,7 @@ static int pluto_sdr_open(pluto_sdr_dev_t **out, int index)
     if (!dev->phy_rx0 || !dev->rx_lo || !dev->rx_i || !dev->rx_q)
         goto fail;
 
+    load_receiver_limits_from_device(dev);
     pluto_update_readbacks(dev);
     *out = dev;
     return PLUTO_ERR_OK;
@@ -2632,6 +2829,7 @@ static void reset_device_info(void)
     copy_cstr(g_manufacturer, sizeof(g_manufacturer), "unknown");
     copy_cstr(g_product, sizeof(g_product), "unknown");
     g_sample_rate_count = 0;
+    reset_receiver_limits_to_fallback();
 }
 
 static void close_device(void)
@@ -2646,7 +2844,13 @@ static void close_device(void)
 static int open_first_device(int verbose)
 {
 #if PSEUDO_RANDOM_SAMPLE_SOURCE
+    static int parser_checked = 0;
     (void)verbose;
+    if (!parser_checked) {
+        if (receiver_frequency_available_parser_self_check() != 0)
+            return -1;
+        parser_checked = 1;
+    }
     copy_cstr(g_hw_rev, sizeof(g_hw_rev), "pseudo");
     copy_cstr(g_fw_ver, sizeof(g_fw_ver),
               PSEUDO_RANDOM_SAMPLE_SOURCE == SYNTHETIC_TONE_SAMPLE_SOURCE ?
@@ -2658,6 +2862,7 @@ static int open_first_device(int verbose)
               "synthetic tone source" : "pseudo-random source");
     g_sample_rates[0] = SCANNER_SAMPLE_RATE_HZ;
     g_sample_rate_count = 1;
+    reset_receiver_limits_to_fallback();
     copy_cstr(g_rf_ports_available, sizeof(g_rf_ports_available),
               "A_BALANCED B_BALANCED C_BALANCED");
     if (verbose)
@@ -2671,6 +2876,7 @@ static int open_first_device(int verbose)
 
     if (g_dev)
         return PLUTO_ERR_OK;
+    reset_receiver_limits_to_fallback();
 
     count = pluto_sdr_get_device_count();
     if (verbose)
@@ -2811,6 +3017,8 @@ typedef struct {
     int preview_count;
     /* Planned display pacing for cached preview rows, in milliseconds. */
     double preview_interval_ms;
+    /* Planned steady-state published-row cadence, in milliseconds. */
+    double line_interval_ms;
     /* Monotonic live-capture timing, used only for transition diagnostics. */
     long long live_capture_started_msec;
     long long live_first_input_msec;
@@ -3190,7 +3398,8 @@ static double receiver_frequency_from_radio(double air_freq)
 
 static int receiver_frequency_valid(double rx_freq)
 {
-    return rx_freq >= RF_RECEIVER_MIN_HZ && rx_freq <= RF_RECEIVER_MAX_HZ;
+    return rx_freq >= receiver_min_hz_double() &&
+        rx_freq <= receiver_max_hz_double();
 }
 
 /**
@@ -3341,19 +3550,19 @@ static int air_intervals_for_converter(freq_interval_t *intervals,
 {
     if (converter_freq >= 0.0) {
         return append_air_interval(intervals, 0,
-                                   converter_freq + RF_RECEIVER_MIN_HZ,
-                                   converter_freq + RF_RECEIVER_MAX_HZ);
+                                   converter_freq + receiver_min_hz_double(),
+                                   converter_freq + receiver_max_hz_double());
     }
 
     {
         double conv = -converter_freq;
         int count = 0;
         count = append_air_interval(intervals, count,
-                                    conv - RF_RECEIVER_MAX_HZ,
-                                    conv - RF_RECEIVER_MIN_HZ);
+                                    conv - receiver_max_hz_double(),
+                                    conv - receiver_min_hz_double());
         count = append_air_interval(intervals, count,
-                                    conv + RF_RECEIVER_MIN_HZ,
-                                    conv + RF_RECEIVER_MAX_HZ);
+                                    conv + receiver_min_hz_double(),
+                                    conv + receiver_max_hz_double());
         return count;
     }
 }
@@ -5436,7 +5645,7 @@ static void publish_scan_line(scan_ctx_t *ctx)
         "\"minimum_rate_overlap\":%d,\"minimum_rate_limited\":%d,"
         "\"minimum_rate_achieved\":%d,"
         "\"true_line_rate\":%.3f,"
-        "\"preview_interval_ms\":%.3f,"
+        "\"preview_interval_ms\":%.3f,\"line_interval_ms\":%.3f,"
         "\"waterfall_noise_scale\":%.6f,"
         "\"visible_raw_bins\":%.3f,\"visible_bins_per_pixel\":%.6f,"
         "\"preview\":%d,\"preview_age_ms\":%lld,"
@@ -5506,7 +5715,8 @@ static void publish_scan_line(scan_ctx_t *ctx)
         ctx->minimum_rate_limited, ctx->minimum_rate_limited,
         ctx->minimum_rate_achieved,
         ctx_true_line_rate(ctx),
-        ctx->preview_interval_ms, ctx->waterfall_noise_scale,
+        ctx->preview_mode ? ctx->preview_interval_ms : 0.0,
+        ctx->line_interval_ms, ctx->waterfall_noise_scale,
         ctx->visible_raw_bins, ctx->visible_bins_per_pixel,
         ctx->preview_mode, ctx->preview_age_ms,
         ctx->preview_sequence, ctx->preview_count);
@@ -5538,7 +5748,8 @@ static void publish_scan_line(scan_ctx_t *ctx)
         ctx->minimum_rate_limited, ctx->minimum_rate_limited,
         ctx->minimum_rate_achieved,
         ctx_true_line_rate(ctx),
-        ctx->preview_interval_ms, ctx->waterfall_noise_scale,
+        ctx->preview_mode ? ctx->preview_interval_ms : 0.0,
+        ctx->line_interval_ms, ctx->waterfall_noise_scale,
         ctx->visible_raw_bins, ctx->visible_bins_per_pixel,
         ctx->preview_mode, ctx->preview_age_ms,
         ctx->preview_sequence, ctx->preview_count);
@@ -6401,8 +6612,9 @@ static void *scan_thread_func(void *arg)
             single_plan.source_span * 0.5;
         device_center = direct_sampling_enabled() ? 0.0 : receiver_frequency_from_radio(center);
         if (!direct_sampling_enabled() && !receiver_frequency_valid(device_center)) {
-            fprintf(stderr, "[SDR] Converter frequency puts receiver center outside %.0f - %.0f Hz\n",
-                    RF_RECEIVER_MIN_HZ, RF_RECEIVER_MAX_HZ);
+            fprintf(stderr, "[SDR] Converter frequency puts receiver center outside %lld - %lld Hz (%s)\n",
+                    g_receiver_min_hz, g_receiver_max_hz,
+                    g_receiver_range_source);
             g_scanning = 0;
             return NULL;
         }
@@ -6417,8 +6629,9 @@ static void *scan_thread_func(void *arg)
         }
 
         if (build_device_scan_frequencies(air_freqs, total_steps, device_freqs) != 0) {
-            fprintf(stderr, "[SDR] Converter frequency puts hardware scan outside %.0f - %.0f Hz\n",
-                    RF_RECEIVER_MIN_HZ, RF_RECEIVER_MAX_HZ);
+            fprintf(stderr, "[SDR] Converter frequency puts hardware scan outside %lld - %lld Hz (%s)\n",
+                    g_receiver_min_hz, g_receiver_max_hz,
+                    g_receiver_range_source);
             g_scanning = 0;
             return NULL;
         }
@@ -6478,10 +6691,11 @@ static void *scan_thread_func(void *arg)
     ctx.rate_keep_credit = 1.0;
     {
         double published_rate = ctx_published_line_rate(&ctx);
-        ctx.preview_interval_ms = published_rate > 0.0 ?
+        ctx.line_interval_ms = published_rate > 0.0 ?
             1000.0 / published_rate : 0.0;
-        if (ctx.preview_interval_ms > 0.0 && ctx.preview_interval_ms < 10.0)
-            ctx.preview_interval_ms = 10.0;
+        if (ctx.line_interval_ms > 0.0 && ctx.line_interval_ms < 10.0)
+            ctx.line_interval_ms = 10.0;
+        ctx.preview_interval_ms = ctx.line_interval_ms;
     }
 
     if (ctx.single_mode && !ctx.direct_sampling) {
@@ -6492,7 +6706,7 @@ static void *scan_thread_func(void *arg)
                 ctx.total_steps, ctx.decim_factor);
             if (ctx.preview_interval_ms > 0.0)
                 max_preview_lines = (int)ceil(preview_first_line_ms /
-                                              ctx.preview_interval_ms) + 1;
+                                              ctx.preview_interval_ms);
             if (max_preview_lines < 1)
                 max_preview_lines = 1;
             if (max_preview_lines > (int)CACHED_PREVIEW_MAX_LINES)
@@ -6549,6 +6763,17 @@ static void *scan_thread_func(void *arg)
             ctx.preview_sequence = 1;
             ctx.preview_count = preview_line_count;
             process_scan_buffer(&ctx, preview_samples, preview_sample_count, 0, 0);
+            {
+                int produced = ctx.preview_sequence - 1;
+                fprintf(stderr,
+                        "[SDR] Cached preview bridge: requested %d, produced %d, interval %.3f ms, first live estimate %.3f ms\n",
+                        preview_line_count, produced, ctx.preview_interval_ms,
+                        preview_first_line_ms);
+                if (produced != preview_line_count) {
+                    fprintf(stderr,
+                            "[SDR] Cached preview count mismatch; live capture will continue without reusing the missing rows\n");
+                }
+            }
             ctx.preview_mode = 0;
             ctx.preview_age_ms = 0;
             ctx.preview_sequence = 0;
@@ -6628,10 +6853,11 @@ static void *scan_thread_func(void *arg)
                    async_len, line_sample_count, kernel_buffers,
                    ctx.estimated_line_rate, ctx.rate_limit_lps, ctx.rate_drop_factor);
         } else {
-            printf("[SDR] Single stream: visible %.0f - %.0f Hz, source %.0f - %.0f Hz, second IF %.0f Hz, converter %.0f Hz, SDR center %.0f Hz, receiver %.0f - %.0f Hz extended, SR %.0f Hz, RF BW %.0f Hz, fft %d effective %d, decim %d, hop %d, overlap %.2f, async %u, line samples %u, kernel buffers %u, %.1f lines/s raw, min %u, limit %u, drop %d\n",
+            printf("[SDR] Single stream: visible %.0f - %.0f Hz, source %.0f - %.0f Hz, second IF %.0f Hz, converter %.0f Hz, SDR center %.0f Hz, receiver %lld - %lld Hz %s, SR %.0f Hz, RF BW %.0f Hz, fft %d effective %d, decim %d, hop %d, overlap %.2f, async %u, line samples %u, kernel buffers %u, %.1f lines/s raw, min %u, limit %u, drop %d\n",
                    ctx.visible_start, ctx.visible_end,
                    ctx.scan_start, ctx.scan_end, ctx.second_if_hz, g_converter_freq,
-                   device_center, RF_RECEIVER_MIN_HZ, RF_RECEIVER_MAX_HZ,
+                   device_center, g_receiver_min_hz, g_receiver_max_hz,
+                   g_receiver_range_source,
                    ctx.raw_samplerate, single_plan.hardware_rf_bandwidth,
                    ctx.selected_fft_size, ctx.fft_size, ctx.decim_factor,
                    ctx.decim_hop, ctx.overlap_factor,
@@ -6639,10 +6865,11 @@ static void *scan_thread_func(void *arg)
                    ctx.estimated_line_rate, g_min_rate_lps, ctx.rate_limit_lps, ctx.rate_drop_factor);
         }
     } else {
-        printf("[SDR] Pluto hop scan: air band %.0f - %.0f Hz, converter %.0f Hz, SDR centers %.0f - %.0f Hz, receiver %.0f - %.0f Hz extended, step %.0f Hz (%d freqs, max %d), SR %.0f Hz, RF BW %.0f Hz, gain %s %.1f dB, %.1f lines/s raw, limit %u, drop %d\n",
+        printf("[SDR] Pluto hop scan: air band %.0f - %.0f Hz, converter %.0f Hz, SDR centers %.0f - %.0f Hz, receiver %lld - %lld Hz %s, step %.0f Hz (%d freqs, max %d), SR %.0f Hz, RF BW %.0f Hz, gain %s %.1f dB, %.1f lines/s raw, limit %u, drop %d\n",
                ctx.scan_start, ctx.scan_end, g_converter_freq,
                device_freqs[0], device_freqs[total_steps - 1],
-               RF_RECEIVER_MIN_HZ, RF_RECEIVER_MAX_HZ,
+               g_receiver_min_hz, g_receiver_max_hz,
+               g_receiver_range_source,
                step, total_steps, MAX_FREQS,
                g_samplerate, g_rf_bandwidth, g_gain_mode, g_hardwaregain_db,
                ctx.estimated_line_rate, ctx.rate_limit_lps, ctx.rate_drop_factor);
@@ -6780,7 +7007,7 @@ static void *scan_thread_func(void *arg)
             g_auto_restart_suppress_until_msec =
                 now + PLUTO_AUTO_RESTART_SUPPRESS_MS;
             fprintf(stderr,
-                    "[SDR] Auto-restarted scan failed quickly; manual Start required\n");
+                    "[SDR] Auto-restarted scan failed quickly; manual Run required\n");
         } else {
             g_auto_restart_on_reconnect = 1;
         }
@@ -6792,12 +7019,12 @@ static void *scan_thread_func(void *arg)
 }
 
 /* ------------------------------------------------------------------ */
-/* Start / Stop scan                                                  */
+/* Run / Stop scan                                                    */
 /* ------------------------------------------------------------------ */
 /**
  * @brief Clear pending reconnect auto-start state after explicit user action.
  *
- * Manual Stop and manual Start must take precedence over stale reconnect
+ * Manual Stop and manual Run must take precedence over stale reconnect
  * requests. The suppress window avoids a reconnect poll racing immediately
  * after the frontend has explicitly stopped the stream.
  *
@@ -7772,8 +7999,9 @@ static void handle_request(int client_fd, const char *req, size_t req_len,
             "\"sw_version\":\"%s\","
             "\"hardware\":\"%s\",\"firmware\":\"%s\",\"serial\":\"%s\","
             "\"manufacturer\":\"%s\",\"product\":\"%s\","
-            "\"receiver_min_hz\":%.0f,\"receiver_max_hz\":%.0f,"
-            "\"receiver_range_note\":\"unofficial extended Pluto range\","
+            "\"receiver_min_hz\":%lld,\"receiver_max_hz\":%lld,"
+            "\"receiver_range_source\":\"%s\","
+            "\"receiver_range_note\":\"active Pluto receiver range\","
             "\"scanning\":%d,\"device_present\":%d,"
             "\"auto_restart_on_reconnect\":%d,"
             "\"freq_start\":" JSON_COORD_FMT ",\"freq_end\":" JSON_COORD_FMT ","
@@ -7815,7 +8043,7 @@ static void handle_request(int client_fd, const char *req, size_t req_len,
             build_sw_version(),
             g_hw_rev, g_fw_ver, g_serial,
             g_manufacturer, g_product,
-            RF_RECEIVER_MIN_HZ, RF_RECEIVER_MAX_HZ,
+            g_receiver_min_hz, g_receiver_max_hz, g_receiver_range_source,
             g_scanning, g_dev != NULL || PSEUDO_RANDOM_SAMPLE_SOURCE,
             g_auto_restart_on_reconnect,
             g_freq_start, g_freq_end, g_converter_freq,
@@ -8048,6 +8276,8 @@ static void handle_request(int client_fd, const char *req, size_t req_len,
             close(client_fd);
             return;
         }
+        if (!g_dev)
+            (void)open_first_device(0);
         if (fft_tmp < FFT_SIZE_MIN || fft_tmp > FFT_SIZE_MAX) {
             send_json_error(client_fd, 400, "Bad Request", cors,
                             "fft_size is out of range");
@@ -8171,8 +8401,9 @@ static void handle_request(int client_fd, const char *req, size_t req_len,
             "\"sw_version\":\"%s\",\"hardware\":\"%s\","
             "\"firmware\":\"%s\",\"serial\":\"%s\","
             "\"manufacturer\":\"%s\",\"product\":\"%s\","
-            "\"receiver_min_hz\":%.0f,\"receiver_max_hz\":%.0f,"
-            "\"receiver_range_note\":\"unofficial extended Pluto range\","
+            "\"receiver_min_hz\":%lld,\"receiver_max_hz\":%lld,"
+            "\"receiver_range_source\":\"%s\","
+            "\"receiver_range_note\":\"active Pluto receiver range\","
             "\"freq_start\":" JSON_COORD_FMT ",\"freq_end\":" JSON_COORD_FMT ","
             "\"configured_start_hz\":" JSON_COORD_FMT ",\"configured_end_hz\":" JSON_COORD_FMT ","
             "\"visible_start_hz\":" JSON_COORD_FMT ",\"visible_end_hz\":" JSON_COORD_FMT ","
@@ -8201,7 +8432,7 @@ static void handle_request(int client_fd, const char *req, size_t req_len,
             status,
             build_sw_version(), g_hw_rev, g_fw_ver, g_serial,
             g_manufacturer, g_product,
-            RF_RECEIVER_MIN_HZ, RF_RECEIVER_MAX_HZ,
+            g_receiver_min_hz, g_receiver_max_hz, g_receiver_range_source,
             g_freq_start, g_freq_end,
             g_freq_start, g_freq_end,
             g_visible_start, g_visible_end,
@@ -9213,7 +9444,7 @@ static void poll_device_reconnect(void)
             } else {
                 g_auto_restart_on_reconnect = 0;
                 fprintf(stderr,
-                        "[SDR] Auto-restart after reconnect failed; manual Start required\n");
+                        "[SDR] Auto-restart after reconnect failed; manual Run required\n");
             }
         }
     }
@@ -9454,7 +9685,7 @@ int main(int argc, char **argv)
     init_window();
     memset(g_sse_fds, 0, sizeof(g_sse_fds));
 
-    /* Print libiio info. Pluto hardware is opened lazily on Start so the
+    /* Print libiio info. Pluto hardware is opened lazily on Run so the
        browser UI remains reachable even when the default network URI is down. */
     {
         char lib_ver[64], drv_ver[64];
