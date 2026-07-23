@@ -100,9 +100,9 @@ def stop_backend_process(process):
 
 
 def start_payload(min_rate_lps=0):
-    """Build a deep x64 single-frequency request centered at 435 MHz."""
+    """Build a minimum-work x64 single-frequency request at 435 MHz."""
     center = 435_000_000.0
-    span_hz = 4096.0e6 / 3_000_000.0
+    span_hz = 31_250.0
     return {
         "freq_start": 430,
         "freq_end": 440,
@@ -184,11 +184,11 @@ def run_check():
 
             cases = [
                 (0, 1),
-                (1, 4),
-                (2, 8),
-                (5, 16),
-                (10, 32),
-                (20, 64),
+                (1, 1),
+                (2, 1),
+                (5, 1),
+                (10, 1),
+                (20, 2),
             ]
             results = []
             for min_rate, expected_overlap in cases:

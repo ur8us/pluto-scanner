@@ -175,7 +175,7 @@ Single-frequency mode uses conservative displayed passband profiles:
 ## Desired Zoom Table
 
 `Output bins` is always exactly `display_bins`: one processed output value per
-screen pixel. `Raw source bins` is the number of FFT/CIC bins in the source
+visible CSS pixel. `Raw source bins` is the number of FFT/CIC bins in the source
 line before the exact display-bin reducer. `visible raw bins/px` is the raw
 FFT/CIC-bin density across the visible slice; it should stay at or above `1.0`
 where hardware limits allow it.
@@ -184,39 +184,43 @@ The SSE transport sends those `display_bins` values as packed `uint8` bytes
 base64 encoded in `encoding:"u8b64"` / `db`. This reduces wire text overhead
 but does not change any FFT, CIC, weighting, or line-rate formula below.
 
-`2nd IF kHz` is the effective LO/source-center offset from the visible center.
-It moves the zero-IF/DC artifact away from the middle of the screen. When the
-source span is wide enough, zero IF is outside the visible span by the listed
-`Zero guard kHz`. At the deepest CIC zooms, the source span is too narrow for a
-full `50 kHz` guard, so the offset becomes the largest possible value while
-still covering the visible span.
+The physical Pluto LO and the post-NCO DSP center are separate coordinates.
+The LO uses the analog RF bandwidth to keep zero IF outside the visible span by
+`50 kHz`; a phase-continuous complex NCO then moves the captured stream to the
+visible center before CIC. Deep CIC source spans can therefore be only hundreds
+of hertz wide without moving the hardware DC artifact back on screen.
 
 `FFT weight` is the Hann coherent-gain correction, `1 / sum(window)`.
 `CIC DC scale` is `1 / decim^3`. `CIC edge weight` is the maximum CIC droop
 compensation expected at the visible edge for that row. The coherent path is
 kept independent from the display-only waterfall noise factor below.
 
-| Zoom | Span MHz | Mode | SR MSPS | RF/display BW MHz | PB | Hops | 2nd IF kHz | Zero guard kHz | Decim | FFT | Raw source bins | Output bins | visible raw bins/px | FFT weight | CIC DC scale | CIC edge weight | line ms | first/raw ms |
-| ---: | ---: | :--- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| 1 | 930 | scan | 61.44 | 20.00 | 0.85 | 55 | 0.0 | 0.0 | 1 | 1024 | 15482 | 1920 | 8.06 | 0.0019550342 | 1 | 1.000 | 187 | 187 |
-| 2 | 465 | scan | 61.44 | 20.00 | 0.85 | 28 | 0.0 | 0.0 | 1 | 1024 | 7741 | 1920 | 4.03 | 0.0019550342 | 1 | 1.000 | 95 | 95 |
-| 5 | 186 | scan | 61.44 | 20.00 | 0.85 | 11 | 0.0 | 0.0 | 1 | 1024 | 3097 | 1920 | 1.61 | 0.0019550342 | 1 | 1.000 | 59 | 37 |
-| 10 | 93 | scan | 61.44 | 20.00 | 0.85 | 6 | 0.0 | 0.0 | 1 | 2048 | 3102 | 1920 | 1.62 | 0.00097703957 | 1 | 1.000 | 59 | 29 |
-| 20 | 46.5 | scan | 61.44 | 20.00 | 0.85 | 3 | 0.0 | 0.0 | 1 | 4096 | 3099 | 1920 | 1.61 | 0.00048840049 | 1 | 1.000 | 59 | 18 |
-| 50 | 18.6 | scan | 61.44 | 20.00 | 0.85 | 2 | 0.0 | 0.0 | 1 | 8192 | 2480 | 1920 | 1.29 | 0.00024417043 | 1 | 1.000 | 59 | 18 |
-| 100 | 9.3 | single | 20.00 | 10.00 | 0.50 | 1 | 350.0 | 50.0 | 1 | 8192 | 4096 | 1920 | 1.98 | 0.00024417043 | 1 | 1.000 | 59 | 4 |
-| 200 | 4.65 | single | 16.00 | 8.00 | 0.50 | 1 | 1675.0 | 50.0 | 1 | 8192 | 4096 | 1920 | 1.24 | 0.00024417043 | 1 | 1.000 | 59 | 4 |
-| 500 | 1.86 | single | 4.00 | 2.00 | 0.50 | 1 | 70.0 | 50.0 | 1 | 8192 | 4096 | 1920 | 1.98 | 0.00024417043 | 1 | 1.000 | 59 | 4 |
-| 1000 | 0.93 | single | 4.00 | 2.00 | 0.50 | 1 | 515.0 | 50.0 | 1 | 16384 | 8192 | 1920 | 1.98 | 0.00012207776 | 1 | 1.000 | 59 | 8 |
-| 2000 | 0.465 | single | 4.00 | 2.00 | 0.50 | 1 | 282.5 | 50.0 | 1 | 32768 | 16384 | 1920 | 1.98 | 0.000061037019 | 1 | 1.000 | 59 | 16 |
-| 5000 | 0.186 | single | 4.00 | 2.00 | 0.50 | 1 | 143.0 | 50.0 | 1 | 65536 | 32768 | 1920 | 1.59 | 0.000030518044 | 1 | 1.000 | 59 | 31 |
-| 10000 | 0.093 | single | 4.00 | 2.00 | 0.50 | 1 | 96.5 | 50.0 | 2 | 65536 | 65536 | 1920 | 1.59 | 0.000030518044 | 0.125 | 1.019 | 71 | 71 |
-| 20000 | 0.0465 | single | 4.00 | 2.00 | 0.50 | 1 | 73.2 | 50.0 | 4 | 65536 | 65536 | 1920 | 1.59 | 0.000030518044 | 0.015625 | 1.044 | 100 | 142 |
-| 50000 | 0.0186 | single | 4.00 | 2.00 | 0.50 | 1 | 59.3 | 50.0 | 8 | 65536 | 65536 | 1920 | 1.27 | 0.000030518044 | 0.001953125 | 1.096 | 100 | 283 |
-| 100000 | 0.0093 | single | 4.00 | 2.00 | 0.50 | 1 | 54.6 | 50.0 | 16 | 65536 | 65536 | 1920 | 1.27 | 0.000030518044 | 0.00024414062 | 1.326 | 100 | 567 |
-| 200000 | 0.00465 | single | 4.00 | 2.00 | 0.50 | 1 | 52.3 | 50.0 | 32 | 65536 | 65536 | 1920 | 1.27 | 0.000030518044 | 0.000030517578 | 2.745 | 100 | 1134 |
-| 500000 | 0.00186 | single | 4.00 | 2.00 | 0.50 | 1 | 30.3 | 50.0 | 64 | 65536 | 65536 | 1920 | 1.02 | 0.000030518044 | 0.0000038146973 | 3.875 | 100 | 2267 |
-| 1000000 | 0.00093 | single | 4.00 | 2.00 | 0.50 | 1 | 15.2 | 50.0 | 128 | 65536 | 65536 | 1920 | 1.02 | 0.000030518044 | 0.00000047683716 | 3.875 | 100 | 4534 |
+The following table is generated from the current planner for a `70..1000 MHz`
+configured band, `display_bins=1920`, minimum rate `10`, and maximum rate `20`
+lines/s. `True lps` is the non-overlapped FFT cadence; `Raw lps` includes
+minimum-rate overlap. `Cold ms` is the empirical host-side first-frame estimate.
+
+| Zoom | Span MHz | Mode | SR/RF BW MSPS/MHz | Hops | FFT | CIC | Overlap | True lps | Raw lps | Cold ms |
+| ---: | ---: | :--- | :--- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 1 | 930 | scan | 61.44/20 | 55 | 1024 | 1 | 1 | 5.348 | 5.348 | 187.0 |
+| 2 | 465 | scan | 61.44/20 | 28 | 1024 | 1 | 1 | 10.504 | 10.504 | 95.2 |
+| 5 | 186 | scan | 61.44/20 | 11 | 1024 | 1 | 1 | 26.738 | 26.738 | 37.4 |
+| 10 | 93 | scan | 61.44/20 | 6 | 2048 | 1 | 1 | 34.722 | 34.722 | 28.8 |
+| 20 | 46.5 | scan | 61.44/20 | 3 | 4096 | 1 | 1 | 55.556 | 55.556 | 18.0 |
+| 50 | 18.6 | scan | 61.44/20 | 2 | 8192 | 1 | 1 | 56.180 | 56.180 | 17.8 |
+| 100 | 9.3 | single | 20/10 | 1 | 4096 | 2 | 1 | 225.830 | 225.830 | 4.431 |
+| 200 | 4.65 | single | 16/8 | 1 | 4096 | 2 | 1 | 225.830 | 225.830 | 4.431 |
+| 500 | 1.86 | single | 4/2 | 1 | 4096 | 2 | 1 | 225.830 | 225.830 | 4.431 |
+| 1000 | 0.93 | single | 4/2 | 1 | 4096 | 3 | 1 | 150.553 | 150.553 | 6.647 |
+| 2000 | 0.465 | single | 4/2 | 1 | 4096 | 5 | 1 | 90.332 | 90.332 | 11.078 |
+| 5000 | 0.186 | single | 4/2 | 1 | 4096 | 11 | 1 | 41.060 | 41.060 | 24.372 |
+| 10000 | 0.093 | single | 4/2 | 1 | 4096 | 21 | 1 | 21.508 | 21.508 | 46.529 |
+| 20000 | 0.0465 | single | 4/2 | 1 | 2048 | 81 | 1 | 11.152 | 11.152 | 89.801 |
+| 50000 | 0.0186 | single | 4/2 | 1 | 2048 | 202 | 4 | 4.472 | 17.888 | 223.947 |
+| 100000 | 0.0093 | single | 4/2 | 1 | 2048 | 404 | 8 | 2.236 | 17.888 | 447.894 |
+| 200000 | 0.00465 | single | 4/2 | 1 | 2048 | 807 | 16 | 1.119 | 17.910 | 894.679 |
+| 500000 | 0.00186 | single | 4/2 | 1 | 2048 | 2017 | 32 | 0.448 | 14.331 | 2236.144 |
+| 1000000 | 0.00093 | single | 4/2 | 1 | 2048 | 4033 | 64 | 0.224 | 14.335 | 4471.180 |
 
 ### Waterfall Noise Presentation Factor
 
@@ -224,29 +228,14 @@ The waterfall uses `90 kHz` as a common Hann ENBW reference. This factor is
 applied only while converting a completed row into packed display bytes; it
 does not alter coherent FFT amplitudes, CIC state, or the raw FFT output.
 
-| Zoom | FFT | Decim | FFT rate MSPS | Hann ENBW Hz | WF noise scale |
-| ---: | ---: | ---: | ---: | ---: | ---: |
-| 1 / 2 / 5 | 1024 | 1 | 61.44 | 90087.98 | 1.000 |
-| 10 | 2048 | 1 | 61.44 | 45021.98 | 1.414 |
-| 20 | 4096 | 1 | 61.44 | 22505.49 | 1.999 |
-| 50 | 8192 | 1 | 61.44 | 11251.37 | 2.828 |
-| 100 | 8192 | 1 | 20.00 | 3662.56 | 4.957 |
-| 200 | 8192 | 1 | 16.00 | 2930.05 | 5.542 |
-| 500 | 8192 | 1 | 4.00 | 732.51 | 11.084 |
-| 1000 | 16384 | 1 | 4.00 | 366.23 | 15.676 |
-| 2000 | 32768 | 1 | 4.00 | 183.11 | 22.170 |
-| 5000 | 65536 | 1 | 4.00 | 91.55 | 31.353 |
-| 10000 | 65536 | 2 | 2.00 | 45.78 | 44.340 |
-| 20000 | 65536 | 4 | 1.00 | 22.89 | 62.706 |
-| 50000 | 65536 | 8 | 0.50 | 11.44 | 88.680 |
-| 100000 | 65536 | 16 | 0.25 | 5.72 | 125.413 |
-| 200000 | 65536 | 32 | 0.125 | 2.86 | 177.361 |
-| 500000 | 65536 | 64 | 0.0625 | 1.43 | 250.826 |
-| 1000000 | 65536 | 128 | 0.03125 | 0.715 | 354.721 |
+Because integer CIC factors now vary with CSS width and exact span, ENBW and
+the waterfall noise factor are calculated from the formulas below rather than
+assigned by zoom. They remain display-only and do not alter coherent tone
+amplitude or CIC state.
 
 ## Goals
 
-- Use exactly `1` processed output bin per screen pixel across the visible
+- Use exactly `1` processed output bin per visible CSS pixel across the visible
   span.
 - Keep enough raw FFT/CIC bins before reduction so each output bin is derived
   from real spectrum data.
@@ -255,10 +244,10 @@ does not alter coherent FFT amplitudes, CIC state, or the raw FFT output.
 - Keep RF bandwidth strictly lower than sample rate in every hardware profile.
 - Keep scan/hop mode fast at low zoom by using short FFTs, increasing scan FFT
   only where the raw-bin product would otherwise drop below the display width.
-- In single-frequency mode, reduce Pluto hardware sample rate/RF bandwidth
-  before using CIC.
-- Use CIC only when the smallest strict hardware profile (`4 MSPS / 2 MHz`) and
-  `FFT=65536` still need more raw-bin product.
+- In single-frequency mode, reduce Pluto hardware sample rate/RF bandwidth,
+  then minimize FFT work before choosing integer CIC decimation. For an 1800
+  CSS-pixel view, the normal FFT is `2048`; larger FFTs are used only when the
+  5% source-span margin makes that factor infeasible.
 - Implement the CIC response with bounded moving sums, not unbounded runtime
   integrators, so long-running captures do not lose floating-point precision.
 - Preserve raw-buffer continuity before CIC. Software queue backpressure may
@@ -266,9 +255,8 @@ does not alter coherent FFT amplitudes, CIC state, or the raw FFT output.
 - Use four queued IIO kernel blocks for continuous single-frequency capture.
   The one-block scan/hop profile does not provide enough upstream buffering for
   a stateful decimator while userspace extracts, converts, and copies a refill.
-- Place zero IF outside the visible span by `50 kHz` when the source span has
-  enough room; otherwise use the largest offset that still covers the visible
-  range.
+- Place zero IF outside the visible span by `50 kHz` using analog RF bandwidth,
+  then use a phase-continuous NCO to center the narrow CIC/FFT source digitally.
 - Normalize coherent FFT output so a bin-centred tone has the same calibrated
   magnitude across FFT size, CIC decimation, and CIC passband position.
 - Keep white-noise waterfall background at a comparable visual level across
@@ -280,10 +268,10 @@ does not alter coherent FFT amplitudes, CIC state, or the raw FFT output.
   The principle is known in SDR UIs, but the implementation should improve it
   by keeping historical rows useful instead of clearing the display whenever
   the user changes view.
-- Hide avoidable resolution-change latency. Very fine frequency resolution
-  needs FFTs built from many seconds of samples, so compatible cached samples
-  should provide the first preview rows while live acquisition fills the new
-  FFT/CIC window.
+- Hide avoidable resolution-change latency. Compatible high-zoom changes keep
+  physical capture running and initialize a new DSP generation from an indexed
+  Q15 raw-history frame. Catch-up and live queue processing must share one exact
+  sample cursor and continuity epoch.
 
 ## Formulas
 
@@ -301,7 +289,7 @@ scan_fft_min    = 1024
 scan_fft_max    = 8192
 single_fft_min  = 2048
 fft_max         = 65536
-decim_max       = 4096
+decim_max       = 65536
 single_decim_async_min_samples = 8192
 single_decim_async_max_samples = 262144
 zero_if_guard_hz = 50000
@@ -367,14 +355,22 @@ hardware profile =
 required_product =
   ceil(display_bins * hardware_sample_rate_hz / visible_span_hz)
 
-decim =
-  clamp_pow2(ceil(required_product / fft_max), 1, decim_max)
-
-while decim > 1 and hardware_sample_rate_hz / decim < visible_span_hz * 1.05:
-  decim = decim / 2
-
 fft =
-  clamp_pow2(ceil(required_product / decim), single_fft_min, fft_max)
+  next_power_of_two(max(single_fft_min, display_bins))
+
+repeat:
+  needed_decim = ceil(required_product / fft)
+  covering_decim =
+    max(1, floor(hardware_sample_rate_hz /
+                 (visible_span_hz * 1.05)))
+  maximum_decim = min(covering_decim, decim_max)
+  if needed_decim <= maximum_decim:
+    decim = max(1, needed_decim)
+    stop
+  if fft == fft_max:
+    decim = maximum_decim
+    stop
+  fft = min(fft * 2, fft_max)
 
 fft_sample_rate_hz =
   hardware_sample_rate_hz / decim
@@ -395,7 +391,7 @@ visible_raw_bins_per_pixel =
   visible_raw_bins / display_bins
 ```
 
-Effective second-IF placement:
+Physical LO and digital-center placement:
 
 ```text
 visible_center_hz =
@@ -405,17 +401,30 @@ outside_zero_if_shift_hz =
   visible_span_hz / 2 + zero_if_guard_hz
 
 max_covering_shift_hz =
-  max(0, (source_span_hz - visible_span_hz) / 2)
+  max(0, (hardware_rf_bandwidth_hz - visible_span_hz) / 2)
 
 second_if_hz =
   min(outside_zero_if_shift_hz, max_covering_shift_hz)
 
-source_center_hz =
+physical_center_hz =
   visible_center_hz +/- second_if_hz
 
-Choose the sign that keeps source_start/source_end covering the visible span
+dsp_center_hz =
+  visible_center_hz                    when decim > 1
+  physical_center_hz                   otherwise
+
+digital_mix_hz =
+  physical_center_hz - dsp_center_hz
+
+mixed_sample[n] =
+  raw_sample[n] * exp(j * 2*pi * digital_mix_hz * n /
+                      hardware_sample_rate_hz)
+
+Choose the sign that keeps the analog RF interval covering the visible span
 and keeps the converted Pluto receiver LO inside
-`receiver_min_hz..receiver_max_hz`.
+`receiver_min_hz..receiver_max_hz`. The recursive double-precision NCO is
+renormalized every 4096 raw samples and remains phase-continuous across IIO
+refills.
 ```
 
 Estimated single timing:
@@ -564,58 +573,75 @@ intentionally reuse already-decimated samples.
 
 For ordinary decimated single-frequency plans, the Pluto async refill is sized
 to `line_samples`, so overlap-active plans request one hop worth of new raw
-samples per callback when possible. With min rate disabled, the common
-`FFT=65536 x2` case uses `async_samples = 131072` and one hardware refill
-supplies one displayed FFT line. Extremely large decimated line advances are capped by
-`single_decim_async_max_samples`; logs must expose capped cases as
-`async < line samples` for diagnosis.
+samples per callback when possible. Extremely large decimated line advances are
+capped by `single_decim_async_max_samples`; logs expose those cases as
+`async < line samples`. The CIC state remains continuous across every refill.
 
-Historical preview rows reduce the first-line wait after compatible high-zoom
-view changes. Very fine frequency resolution may need many seconds of samples
-for one FFT; without a preview path, switching resolution traditionally leaves
-the user waiting for the fresh decimated stream to fill the new FFT/CIC window.
-When compatible cached samples exist, the backend may snapshot recent raw
-samples, apply the required center-frequency phase rotation, and replay them
-through the same CIC/Hann/FFT path. The required raw history for preview rows
-is:
+The raw-history ring retains up to `33,555,968` complex samples as Q15 I/Q.
+Pluto's native Q12 values round-trip exactly in this representation. Each
+append carries an absolute half-open sample range and continuity epoch. A
+compatible hot handoff uses:
 
 ```text
-preview_raw_samples =
+handoff_index = raw_history.next_sample_index
+hot_history_samples = (CIC_STAGES + fft) * decim
+history_frame = [handoff_index - hot_history_samples, handoff_index)
+frame_sample_end = handoff_index
+frame_sample_start = handoff_index - fft * decim
+```
+
+Capture remains active and appends to the ring while old worker-queue entries
+are suppressed. The worker resets only the DSP generation, processes the exact
+history frame as `preview=1`, then consumes every cached sample from
+`handoff_index` to the current ring cursor. Queue insertion resumes atomically
+at that cursor. `capture_epoch` and `physical_center_hz` therefore remain fixed;
+published frame ends advance by positive multiples of
+`decim_hop * decim_factor`. Catch-up publication obeys `line_interval_ms`, so
+CPU-speed replay cannot appear as a burst.
+
+Hot compatibility is local in DSP frequency as well as compatible in hardware:
+the old DSP center must lie inside the target decimated source and the target
+center must lie inside the old decimated source. A larger center move uses the
+restart/retune path. This prevents a strong carrier that belonged only to a
+distant old view from folding through CIC aliases into the new narrow source.
+
+If the hardware profile or analog coverage is incompatible, capture restarts
+and the older bounded preview bridge may use:
+
+```text
+restart_preview_raw_samples =
   (CIC_STAGES + fft + (preview_lines - 1) * decim_hop) * decim
 ```
 
-Preview rows are valid historical measurements for display responsiveness, but
-they are marked `preview=1` and are never joined to post-restart live samples.
-Live CIC state is reset after preview processing, and the first live row is
-marked `preview=0`. The backend chooses enough preview rows to cover the
-estimated fresh-frame wait where cached history permits and includes
-`preview_interval_ms = estimated_first_line_ms / preview_count` on cached SSE
-rows. Live rows carry `preview_interval_ms = 0`; all rows carry
-`line_interval_ms = 1000 / published_line_rate` for the steady-state cadence.
-The frontend queues those previews and releases them against one monotonic
-per-view deadline while live acquisition fills independently. It retains the
-deadline even when the queue is briefly empty between SSE deliveries. If live
-data arrives before the conservative estimate, the first live row replaces
-cached rows that are still queued and uses the next presentation slot. This
-avoids both an immediate preview burst and a subsequent empty pause, without
-ever forming an FFT from a mixture of pre-restart and post-restart samples.
+Those fallback rows are never joined to post-restart samples in one FFT. The
+frontend paces both preview forms on one monotonic per-view presentation
+deadline.
 
 `tools/cic_stability_check.py` validates the bounded-state realization with a
-tone plus DC offset for decimations `2`, `4`, `8`, `64`, and `256`. It is a numeric
-regression check for state growth and steady amplitude, not a substitute for a
-live long-run `FFT=65536 x2` hardware pass or multi-tone/noise-floor testing.
+tone plus DC offset for representative decimations. It is a numeric regression
+check for state growth and steady amplitude, not a substitute for a live
+long-run deep integer-CIC hardware pass or multi-tone/noise-floor testing.
 
 `tools/cic_synthetic_signal_check.py` passes a deterministic complex tone
-through the C queue/CIC/Hann/FFT/SSE path at x2, x64, and x256. Clean cases must
-have a Hann main lobe no wider than three bins and distant leakage below
-`-70 dBc`; periodic skip and duplicate controls must violate the spectral gate
-and produce source-range errors.
+through the C queue/NCO/CIC/Hann/FFT/SSE path at x2, x64, x256, x5581, and x7761.
+Clean cases must have a Hann main lobe no wider than three bins and distant
+leakage below `-70 dBc` when the tone is bin-centred; periodic skip and
+duplicate controls must violate the spectral gate and produce source-range
+errors. A view-center change can leave the same physical tone between new FFT
+bins. That valid off-bin case retains the peak-position and three-bin Hann
+main-lobe checks without using the bin-centred sidelobe threshold. A tone whose
+expected bin is outside the extracted source is skipped by the spectrum check.
+`tools/cached_preview_check.py` exercises the exact reported 453 Hz and 630 Hz
+views in both directions at 1800 and 1346 logical pixels and requires a prompt
+first row, one capture epoch, valid indexed frame ranges, and no scan-thread
+restart. `tools/live_principle7_check.py` validates those invariants and
+sub-second following-row gaps over a five-minute live Pluto run.
 
-For the table's `CIC edge weight`, use:
+For visible-edge CIC compensation, use:
 
 ```text
 edge_frequency_hz =
-  min(source_span_hz / 2, second_if_hz + visible_span_hz / 2)
+  min(source_span_hz / 2, visible_span_hz / 2)
 
 cic_edge_weight =
   cic_frequency_weight(edge_frequency_hz)

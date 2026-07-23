@@ -63,8 +63,9 @@ I want this project to explore new principles for SDR tools (click to watch vide
 4. [Seamless merging of scan/hop mode and single-frequency reception, hidden from the user.](https://www.youtube.com/watch?v=KnPlvGlBu_s)
 5. [Waterfall speed limits expressed as a range FROM and TO lines per second instead of tying behavior directly to FFT size. The program should do its best to satisfy the user's desired behavior.](https://www.youtube.com/watch?v=GDP-NtIiRhI)
 6. [Persistent waterfall history: when zooming or moving through frequencies, the waterfall is not cleared. It shows all recorded data that still applies, even when stretched. This is a known SDR UI principle, but it still needs better implementation so history remains useful across large zoom and frequency changes.](https://www.youtube.com/watch?v=wFkcWrQWWDI)
-7. Low-latency, smooth resolution changes: very fine frequency resolution needs FFTs built from many seconds of samples. Traditional SDR programs can make the user wait several seconds after switching resolution. This scanner reuses compatible samples already held in memory and paces those preview lines into the live stream, so the display responds immediately without a preview burst followed by a pause.
+7. Low-latency, smooth resolution changes: very fine frequency resolution needs several seconds of samples. For compatible high-zoom changes, this scanner keeps capture running and moves the CIC/FFT handoff through indexed raw-sample history, so the first new row appears promptly and the live waterfall continues without a preview burst followed by a pause. FFT size is kept to the smallest power of two that covers the visible CSS pixels; integer CIC decimation supplies any deeper resolution.
 8. Exact frequency tuning: deterministic compensation for PLL and DDS-style rounding errors keeps received signals plotted at their true frequencies.
+9. Automatic device recovery: the physical receiver can be unplugged and reconnected at any time. The backend detects the disconnection, polls for the device to reappear, and resumes scanning automatically — no restart button, no page reload, no user intervention.
 
 
 ## Project Scope
@@ -321,7 +322,7 @@ http://localhost:8080
 - Start/end frequency and converter are air-frequency settings. Receiver limits are checked after converter conversion; the frontend normalizes typed fields into the active valid interval, and the backend remains authoritative. The adjacent disabled `Input` control shows the currently supported single receiver channel, input 1 (`A_BALANCED`); additional channels are deferred.
 - Sample rate, RF bandwidth, and passband usage are auto-profiled for Pluto performance and shown read-only in the UI.
 - RF bandwidth is kept strictly below sample rate in every auto profile.
-- Waterfall rows are published as exactly one processed output bin per screen pixel; raw FFT/CIC bin counts are kept as debug metadata.
+- Waterfall rows are published as exactly one processed output bin per visible CSS pixel; high-DPI canvas backing pixels are a local rendering detail. Raw FFT/CIC bin counts are kept as debug metadata.
 - Waterfall time marks follow monotonically ordered row timestamps. While the
   page is hidden, the frontend retains only the newest pending row so browser
   timer throttling cannot produce a burst of reordered time marks on return.
@@ -337,28 +338,32 @@ http://localhost:8080
 - FFT/CIC status shows the active backend plan used for the current zoom.
 - The FFT/CIC status also shows the true base waterfall cadence before
   minimum-rate overlap boosting, for example
-  `FFT: 65536 x64 (0.44 lines/s)`.
+  `FFT: 2048 x7761 x128 (0.116 lines/s)`.
 - The traffic readout is measured as compressed SSE bytes for one frontend
   stream, not as raw FFT bins and not multiplied by extra debugging clients.
 - Narrow single-frequency CIC mode preserves raw-buffer continuity before the
   decimator; throttling happens after complete FFT lines so the filter state is
   not corrupted by dropped raw buffers.
-- Decimated single-frequency mode normally requests one Pluto refill per
-  displayed line, so `FFT=65536 x2` should log matching `async` and
-  `line samples` counts.
+- Decimated single-frequency mode normally requests one Pluto refill per FFT
+  hop. The log's `async` and `line samples` values match unless the raw hop is
+  capped at `262144` samples.
 - In CIC mode the minimum waterfall-rate control preserves the FFT size and
   CIC decimation, then uses integer overlap on the decimated stream to increase
   line cadence. The status line shows this as `FFT=<size> x<decim>` plus an
   overlap factor when active.
 - In scan/hop mode, changing only the maximum waterfall rate updates the active
   rate limiter in place. It does not restart the scan or retune Pluto.
-- Compatible high-zoom view changes can draw cached historical preview rows
-  before the first new live row arrives. Preview rows use the same CIC/Hann/FFT
-  path and are not mixed with post-restart samples. This is especially useful
-  when very fine resolution needs many seconds of samples for the next FFT and
-  the new decimated stream has not filled that window yet. The browser releases
-  cached rows at the planned line cadence while live capture fills, avoiding an
-  immediate preview burst followed by a blank pause.
+- Compatible high-zoom view changes do not restart the Pluto stream. Capture
+  callbacks continue assigning absolute sample indexes while the worker warms
+  the new integer-CIC/Hann/FFT generation from Q15 raw history ending at an
+  exact handoff index. It then consumes every sample captured after that index
+  and resumes the live queue on the same timeline. The first historical row is
+  marked `preview=1`; subsequent `preview=0` rows continue at the planned
+  cadence. Hot handoffs are intentionally local: the old and new DSP centers
+  must remain inside each other's decimated source spans. Larger moves and
+  incompatible hardware-profile changes retain the bounded restart preview
+  fallback so a distant old-view carrier is not aliased into a narrow new CIC
+  source.
 - The `Shown` status reports the visible interval in MHz and selects MHz, kHz,
   or Hz for `Span`; this is presentation-only and never feeds back into tuning
   or coordinate calculations. Rulers also use Hz below 1 kHz. The light-blue
@@ -414,6 +419,7 @@ tools/zoom_sweep.py --use-existing --freq-start-mhz 70 --freq-end-mhz 6000 --min
 tools/browser_zoom_matrix.py --output browser-zoom-matrix.json --freq-start-mhz 70 --freq-end-mhz 6000 --min-rate-lps 10 --rate-limit-lps 20 --settle-seconds 4
 tools/fm_screenshot.py --output images/fm-broadcast-waterfall.png --wait-seconds 60
 tools/frontend_random_validation.py --output frontend-random-validation.json
+tools/live_principle7_check.py --duration-seconds 300 --output live-principle7.json
 ```
 
 The browser tools require Firefox, geckodriver, and Selenium. Override the
@@ -435,17 +441,31 @@ Firefox binary with `FIREFOX_BIN=/path/to/firefox` when needed.
 
 `tools/cic_synthetic_signal_check.py` builds a separate no-hardware test binary
 and sends a continuous bin-centred complex tone through the production queue,
-CIC, Hann, FFT, display-reduction, and SSE path at x2, x64, and x256. Periodic
-skip and duplicate controls must be reported as sample-order errors and widened
-spectra. The normal `pluto-scanner` binary always uses Pluto input.
+CIC, Hann, FFT, display-reduction, and SSE path at x2, x64, x256, x5581, and
+x7761. Periodic skip and duplicate controls must be reported as sample-order
+errors and widened spectra. `tools/cached_preview_check.py` exercises the exact
+453 Hz/630 Hz Principle 7 views in both directions at 1800- and 1346-pixel
+logical widths. It verifies one capture epoch, indexed FFT sample ranges,
+prompt first rows, smooth cadence, and no scan restart. A bin-centred tone must
+also pass the strict sidelobe gate; an unchanged physical tone that becomes
+off-bin after a view change is judged by peak position and Hann main-lobe width.
+Tones whose expected bins are outside the extracted source are skipped by that
+diagnostic rather than treated as in-view continuity failures.
+The normal `pluto-scanner` binary always uses Pluto input.
 
-For CIC changes, also run a live narrow-span `FFT=65536 x2` session for several
-minutes when Pluto hardware is available, and a deeper `x64` span when testing
-carrier continuity. Watch the backend log for `CIC queue waited ...`,
+For CIC changes, also run live integer-CIC spans for several minutes when Pluto
+hardware is available, including the deepest zoom used in practice. Watch the
+backend log for `CIC queue waited ...`,
 `CIC samples:`, `CIC sample-order errors`, repeated read retries, watchdog
 cancels, or hard reconnect
 messages; the bounded CIC and continuity unit checks do not replace that
 long-run hardware pass.
+
+`tools/live_principle7_check.py` automates that hardware pass for the reported
+453 Hz and 630 Hz views. Its default five-minute run alternates the views every
+15 seconds and requires a hot transition, fixed capture epoch and physical LO,
+exact indexed FFT frame ranges, a first reused row below two seconds, and no
+following SSE gap of one second or more.
 
 ## Files
 

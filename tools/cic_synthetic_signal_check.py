@@ -276,19 +276,22 @@ def main():
             f"missing {TEST_BINARY}; run make cic-synthetic-test or make check"
         )
 
+    # With 1024 logical display pixels, the minimum-work planner selects a
+    # 2048-point FFT and lets integer CIC decimation supply deeper resolution.
+    # Keep the familiar x2/x64/x256 cases and exercise the two non-power-of-two
+    # factors used by the reported 453 Hz/630 Hz Principle 7 transition at
+    # 1800 display pixels.
     specs = [
-        ("clean_x2", 40_960.0, 2, 1, 0, None, 0, 3),
-        ("clean_x2_min20", 40_960.0, 2, 2, 20, None, 0, 3),
-        ("clean_x64", 4096.0e6 / 3_000_000.0, 64, 1, 0, None, 0, 3),
-        ("clean_x64_min1", 4096.0e6 / 3_000_000.0, 64, 4, 1, None, 0, 3),
-        ("clean_x64_min2", 4096.0e6 / 3_000_000.0, 64, 8, 2, None, 0, 3),
-        ("clean_x64_min5", 4096.0e6 / 3_000_000.0, 64, 16, 5, None, 0, 3),
-        ("clean_x64_min10", 4096.0e6 / 3_000_000.0, 64, 32, 10, None, 0, 3),
-        ("clean_x64_min20", 4096.0e6 / 3_000_000.0, 64, 64, 20, None, 0, 3),
-        ("clean_x256", 409.6, 256, 1, 0, None, 0, 1),
-        ("clean_x256_min20", 409.6, 256, 256, 20, None, 0, 2),
-        ("periodic_skip_x64", 4096.0e6 / 3_000_000.0, 64, 1, 0, "skip", 1000, 2),
-        ("periodic_duplicate_x64", 4096.0e6 / 3_000_000.0, 64, 1, 0, "duplicate", 1000, 2),
+        ("clean_x2", 1_000_000.0, 2, 1, 0, None, 0, 3),
+        ("clean_x2_min20", 1_000_000.0, 2, 1, 20, None, 0, 3),
+        ("clean_x64", 31_250.0, 64, 1, 0, None, 0, 3),
+        ("clean_x64_min20", 31_250.0, 64, 2, 20, None, 0, 3),
+        ("clean_x256", 7_812.5, 256, 1, 0, None, 0, 3),
+        ("clean_x256_min20", 7_812.5, 256, 8, 20, None, 0, 3),
+        ("clean_x5581_min10", 2_000_000.0 / 5580.5, 5581, 64, 10, None, 0, 2),
+        ("clean_x7761_min10", 2_000_000.0 / 7760.5, 7761, 128, 10, None, 0, 2),
+        ("periodic_skip_x64", 31_250.0, 64, 1, 0, "skip", 1000, 2),
+        ("periodic_duplicate_x64", 31_250.0, 64, 1, 0, "duplicate", 1000, 2),
     ]
     cases = []
     for spec in specs:

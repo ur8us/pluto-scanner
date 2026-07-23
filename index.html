@@ -1208,8 +1208,21 @@
             }
             resizeCanvases();
 
+            /**
+             * Return the logical waterfall width used for backend resolution.
+             *
+             * FFT planning follows visible CSS pixels. The higher-resolution
+             * canvas backing store is a presentation detail and rows are
+             * resampled onto it locally.
+             *
+             * @returns {number} Visible waterfall width in CSS pixels.
+             */
             function displayBins() {
-                return Math.max(1, Math.floor(wfCanvas.width || 1));
+                const rect = wfCanvas.getBoundingClientRect();
+                const width = Number(rect && rect.width) ||
+                    Number(wfCanvas.clientWidth) ||
+                    Number(wfCanvas.width) / canvasDevicePixelRatio();
+                return Math.max(1, Math.floor(width || 1));
             }
 
             function clearRulerOverlay() {
@@ -5001,7 +5014,7 @@
              * Record rendered waterfall timing for bounded browser diagnostics.
              *
              * The trace is intentionally local-only. It verifies that paced
-             * preview rows bridge the first live row after high-zoom restarts
+             * preview rows bridge the first live row after high-zoom handoffs
              * without becoming a frontend telemetry stream.
              *
              * @param {Object} data Rendered SSE waterfall row.
@@ -5799,7 +5812,6 @@
 
             function applyZoomStepsAtCursor(canvas, clientX, signedSteps) {
                 if (!canvas || !hasFrequencyWindow()) return;
-                materializeGotoPreview();
 
                 const rect = canvas.getBoundingClientRect();
                 if (rect.width <= 0) return;
@@ -5816,6 +5828,18 @@
                 if (fullSpan <= 0) return;
 
                 const currentSpan = currentFreq1 - currentFreq0;
+                const minSpan = Math.max(1, fullSpan / MAX_ZOOM_FACTOR);
+                const boundaryEpsilon = Math.max(1e-9, fullSpan * 1e-12);
+                if (
+                    (signedSteps < 0 &&
+                        currentSpan <= minSpan + boundaryEpsilon) ||
+                    (signedSteps > 0 &&
+                        currentSpan >= fullSpan - boundaryEpsilon)
+                ) {
+                    return;
+                }
+                materializeGotoPreview();
+
                 const anchor = currentFreq0 + cursor * currentSpan;
                 const steps = Math.max(1, Math.min(8, Math.abs(signedSteps)));
                 const factorPerStep = 1.18;
@@ -5823,7 +5847,6 @@
                     signedSteps < 0
                         ? Math.pow(1 / factorPerStep, steps)
                         : Math.pow(factorPerStep, steps);
-                const minSpan = Math.max(1, fullSpan / MAX_ZOOM_FACTOR);
                 let span = Math.max(
                     minSpan,
                     Math.min(fullSpan, currentSpan * factor),
@@ -5864,6 +5887,30 @@
                     formatScanRange(currentFreq0, currentFreq1);
                 saveVisibleView();
                 scheduleViewUpdate(left, right, true);
+            }
+
+            /**
+             * Return whether a zoom request can change the current frequency span.
+             *
+             * @param {number} factor Multiplicative span change.
+             * @param {number} fullSpan Full selectable frequency span in hertz.
+             * @param {number} currentSpan Current visible span in hertz.
+             * @returns {boolean} True when the request is not at a zoom boundary.
+             */
+            function canChangeZoomSpan(factor, fullSpan, currentSpan) {
+                if (
+                    !Number.isFinite(factor) ||
+                    !Number.isFinite(fullSpan) ||
+                    !Number.isFinite(currentSpan) ||
+                    fullSpan <= 0 ||
+                    currentSpan <= 0 ||
+                    factor === 1
+                )
+                    return false;
+                const minSpan = Math.max(1, fullSpan / MAX_ZOOM_FACTOR);
+                const epsilon = Math.max(1e-9, fullSpan * 1e-12);
+                if (factor < 1) return currentSpan > minSpan + epsilon;
+                return currentSpan < fullSpan - epsilon;
             }
 
             function wheelZoomStep(evt) {
@@ -5986,10 +6033,11 @@
 
             function zoomByFactor(factor, anchorFraction = 0.5) {
                 if (!hasFrequencyWindow()) return;
-                materializeGotoPreview();
                 const full = primaryFrequencyWindow();
                 const fullSpan = full.right - full.left;
                 const currentSpan = currentFreq1 - currentFreq0;
+                if (!canChangeZoomSpan(factor, fullSpan, currentSpan)) return;
+                materializeGotoPreview();
                 const minSpan = Math.max(1, fullSpan / MAX_ZOOM_FACTOR);
                 const span = Math.max(
                     minSpan,

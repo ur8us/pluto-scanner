@@ -75,7 +75,7 @@ Agents must preserve these two Pluto operating modes. Do not port Fobos assumpti
 
 2. **Single-frequency mode for high zoom factors and narrow spans.**
    - Use this mode when one Pluto receiver center can cover the visible span.
-   - Auto-select sample rate, RF bandwidth, FFT size, and CIC decimation from the visible-span resolution product. Do not change those resolution coefficients just because the requested minimum waterfall rate changes.
+   - Auto-select sample rate, RF bandwidth, FFT size, and CIC decimation from the visible-span resolution product. Minimize FFT size first: use the smallest power of two that covers the visible CSS waterfall pixels, then use the smallest feasible integer CIC factor for deeper resolution. Do not change those resolution coefficients just because the requested minimum waterfall rate changes.
    - The minimum waterfall-rate control is implemented by integer overlapping FFT windows on the decimated CIC stream. It may reduce `decim_hop`, but it must not reduce FFT size, CIC decimation, hardware sample rate, RF bandwidth, source span, or visible raw-bin density for the same view.
    - The maximum waterfall-rate control may throttle completed FFT lines. In CIC mode it must never throttle by dropping raw buffers before the decimator.
    - Keep the scan/hop to single-frequency transition invisible to the user; Go To, zoom, pan, rulers, and waterfall history should continue to behave as one continuous spectrum tool.
@@ -85,35 +85,31 @@ Agents must preserve these two Pluto operating modes. Do not port Fobos assumpti
      before the CIC path. Raw gaps corrupt the stateful decimator and can widen
      signals in the waterfall. Throttle CIC mode only after a complete FFT line
      has been produced, or by the final publish-clock guard.
-   - Decimated single-stream mode should request one line-sized Pluto/IIO
-     refill whenever practical: `async_samples = decim_hop * decim`. This
-     keeps the common `FFT=65536 x2` case as one hardware refill per displayed
-     line. Very large line sizes may be capped by `SINGLE_DECIM_ASYNC_MAX_LEN`
-     and must remain visible in backend logs as `async < line samples`.
+   - Decimated single-stream mode should request one hop-sized Pluto/IIO refill
+     whenever practical: `async_samples = decim_hop * decim`. Very large hops
+     may be capped by `SINGLE_DECIM_ASYNC_MAX_LEN` and must remain visible in
+     backend logs as `async < line samples`.
    - Single-frequency continuous capture must use multiple queued IIO kernel
      buffers (`PLUTO_CONTINUOUS_KERNEL_BUFFERS = 4`). The scan/hop setting of
      one kernel buffer is not valid for stateful CIC streaming.
-   - On compatible high-zoom view changes, bounded historical raw samples may
-     be processed as `preview=1` rows before the first live `preview=0` row.
-     Very fine frequency resolution needs FFTs built from many seconds of
-     samples; traditional SDR programs can make the user wait several seconds
-     after a resolution change before a new waterfall line appears. Preview
-     processing reuses compatible memory-held samples for the first rows, must
-     use the same CIC/Hann/FFT path, must be marked in SSE metadata, and must
-     reset all CIC state before live acquisition resumes. The backend may send
-     multiple preview rows immediately, but the frontend must release them at
-     `preview_interval_ms = first_line_ms / preview_count` while the independent
-     live stream fills. Keep the per-view presentation deadline when the queue
-     is briefly empty between SSE events, then hand live rows to
-     `line_interval_ms`. An early live row may replace previews that have not
-     reached the canvas yet; never join pre-restart cache samples to
-     post-restart live samples in an FFT.
+   - On compatible high-zoom view changes, keep the physical IIO stream and LO
+     running. Each accepted raw sample has an absolute index and continuity
+     epoch in a bounded Q15 history ring. Warm the new CIC/Hann/FFT generation
+     from history ending at one handoff index, publish its first row as
+     `preview=1`, consume every subsequently captured sample from the same ring,
+     then resume the queue at that exact index as `preview=0`. A compatible hot
+     handoff must not lose, duplicate, or restart samples. Both the old and new
+     DSP centers must remain inside each other's decimated source spans; this
+     keeps a narrow CIC handoff local and avoids aliasing a distant old-view
+     carrier into the new source. Larger center moves, hardware-profile,
+     converter, input, or analog-coverage changes use the existing restart
+     preview fallback. The frontend paces both forms with the row metadata.
 
 ## FFT, CIC, and RF Planning Rules
 
 The planner publishes an exact display product. Every SSE waterfall row must
 contain exactly `display_bins` processed output values, one output bin per
-screen pixel. Keep raw FFT/CIC bin counts in metadata as `raw_source_bins` or
+visible CSS pixel. Device-pixel-ratio backing pixels are frontend-only. Keep raw FFT/CIC bin counts in metadata as `raw_source_bins` or
 `raw_line_bins` for debugging, but do not expose oversized raw rows as the
 frontend data model. Current SSE rows compress the display bytes as
 `encoding:"u8b64"` with `db` containing base64 packed `uint8` values; keep
@@ -164,12 +160,16 @@ Single-frequency mode:
 - Select the smallest profile whose `min(sample_rate, rf_bandwidth)` covers
   `visible_span_hz + 2 * zero_if_guard_hz`.
 - Use the resolution product
-  `display_bins * hardware_sample_rate_hz / visible_span_hz`.
-- Choose `decim = clamp_pow2(ceil(product / 65536), 1, 4096)`, then reduce it
-  while `hardware_sample_rate_hz / decim` would no longer cover the visible
-  span with a small margin. Do not force the zero-IF guard into CIC decimation
-  if doing so would reduce the visible raw-bin density below one bin/pixel.
-- Choose `fft = clamp_pow2(ceil(product / decim), 2048, 65536)`.
+  `ceil(display_bins * hardware_sample_rate_hz / visible_span_hz)`.
+- Start with `fft = next_pow2(max(2048, display_bins))`. For that FFT, choose
+  the smallest integer `decim = ceil(product / fft)` that is no greater than
+  `floor(hardware_sample_rate_hz / (visible_span_hz * 1.05))` and `65536`.
+  If it is not feasible, double FFT and retry up to `65536`.
+- CIC decimation is an arbitrary positive integer; FFT size and the minimum-rate
+  overlap factor remain powers of two.
+- Keep the hardware LO offset outside the visible band using analog RF
+  bandwidth. A phase-continuous pre-CIC NCO moves that uninterrupted physical
+  stream to the visible DSP center before integer CIC decimation.
 - Raw single/CIC bins should cover the display, then the published row is
   reduced to exactly `display_bins`.
 - CIC paths use the measured host throughput estimate `1850000` raw samples/s.
@@ -288,6 +288,8 @@ Preserve:
 - Spectrum and waterfall display.
 - Shift-wheel zoom.
 - Drag pan.
+- Zoom-in at `1,000,000x` and zoom-out at `1x` are strict no-ops; they must not
+  redraw or materialize waterfall history when the span cannot change.
 - Go To dialog.
 - Ctrl-drag rulers.
 - Markers and band overlays.
@@ -377,10 +379,13 @@ profiles = (4e6,2e6), (8e6,4e6), (16e6,8e6), (20e6,10e6), (30.72e6,15e6), (61.44
 zero_if_guard_hz = 50000
 profile = smallest profile where min(sample_rate, rf_bandwidth) >= visible_span_hz + 2 * zero_if_guard_hz
 required_product = ceil(display_bins * hardware_sample_rate_hz / visible_span_hz)
-decim = clamp_pow2(ceil(required_product / 65536), 1, 4096)
-while decim > 1 and hardware_sample_rate_hz / decim < visible_span_hz * 1.05:
-  decim = decim / 2
-fft = clamp_pow2(ceil(required_product / decim), 2048, 65536)
+fft = next_pow2(max(2048, display_bins))
+needed_decim = ceil(required_product / fft)
+covering_decim = floor(hardware_sample_rate_hz / (visible_span_hz * 1.05))
+while needed_decim > min(covering_decim, 65536) and fft < 65536:
+  fft = fft * 2
+  needed_decim = ceil(required_product / fft)
+decim = clamp(needed_decim, 1, min(covering_decim, 65536))
 decim_async_min_samples = 8192
 decim_async_max_samples = 262144
 nonoverlap_cic_lps = min(hardware_sample_rate_hz, 1.85e6) / (fft * decim)
@@ -395,7 +400,12 @@ single_async_samples = min(line_samples, decim_async_max_samples) when decim > 1
 single_async_samples = fft when decim == 1
 fft_sample_rate_hz = hardware_sample_rate_hz / decim
 source_span_hz = min(hardware_rf_bandwidth_hz, fft_sample_rate_hz)
-second_if_hz = min(visible_span_hz / 2 + zero_if_guard_hz, max(0, (source_span_hz - visible_span_hz) / 2))
+second_if_hz = min(visible_span_hz / 2 + zero_if_guard_hz,
+                   max(0, (hardware_rf_bandwidth_hz - visible_span_hz) / 2))
+physical_center_hz = offset_LO_center_using(hardware_rf_bandwidth_hz)
+dsp_center_hz = (visible_start_hz + visible_end_hz) / 2 when decim > 1
+dsp_center_hz = physical_center_hz otherwise
+digital_mix_hz = physical_center_hz - dsp_center_hz
 raw_source_bins ~= fft * source_span_hz / fft_sample_rate_hz
 visible_raw_bins ~= raw_source_bins * visible_span_hz / source_span_hz
 published_bins = display_bins
@@ -456,6 +466,8 @@ tools/http_smoke_test.sh
 tools/cic_stability_check.py
 tools/cic_continuity_check.py
 tools/cic_synthetic_signal_check.py
+tools/min_rate_overlap_check.py
+tools/cached_preview_check.py
 tools/frequency_coordinate_check.py
 tools/headless_tester.py
 tools/ui_browser_test.py
@@ -464,18 +476,24 @@ tools/zoom_sweep.py --use-existing --freq-start-mhz 70 --freq-end-mhz 6000 --min
 tools/browser_zoom_matrix.py --output browser-zoom-matrix.json --freq-start-mhz 70 --freq-end-mhz 6000 --min-rate-lps 10 --rate-limit-lps 20 --settle-seconds 4
 tools/fm_screenshot.py --output images/fm-broadcast-waterfall.png --wait-seconds 60
 tools/frontend_random_validation.py --output frontend-random-validation.json
+tools/live_principle7_check.py --duration-seconds 300 --output live-principle7.json
 ```
 
 For changes touching CIC decimation, also run `tools/cic_stability_check.py`,
 `tools/cic_continuity_check.py`, `tools/cic_synthetic_signal_check.py`,
 `tools/min_rate_overlap_check.py`, `tools/cached_preview_check.py`, and, when
-Pluto hardware is available, live `FFT=65536 x2` plus deeper `x64` runs for
-several minutes. Confirm that reception remains stable and that backend logs
+Pluto hardware is available, `tools/live_principle7_check.py` at the deepest
+practical zoom for at least five minutes. Confirm that reception remains stable and that backend logs
 show the expected `overlap`, `CIC samples:` with `accounting errors 0`, no
 `CIC sample-order errors`, no repeated read retries, watchdog cancels, hard
 reconnects, or excessive `CIC queue waited ...` backpressure. The synthetic
-test must pass clean x2, x64, and x256 tones with min-rate overlap enabled and
-reject periodic skip/duplicate controls.
+test must pass clean x2, x64, x256, x5581, and x7761 tones with min-rate overlap
+enabled and reject periodic skip/duplicate controls. The cached-history test
+must exercise the exact 453 Hz and 630 Hz views in both directions at 1800 and
+1346 logical pixels without a scan restart or capture-epoch change. The live
+test must retain one capture epoch and physical LO, preserve exact indexed FFT
+frame ranges, present the first reused row within two seconds, and keep later
+SSE gaps below one second.
 
 The browser tester expects Firefox, Selenium, and geckodriver. Override the Firefox path with:
 
@@ -498,4 +516,4 @@ Then run the browser validations in another terminal. Check the trace for:
 For FFT/CIC planning, `tools/frontend_random_validation.py` verifies:
 
 - Scan/hop mode stays in `mode=scan`, `steps>=2`, `decim_factor=1`, and uses adaptive `effective_fft_size` values from `1024` to `8192`; published bins must equal display bins.
-- Narrow single-frequency mode switches to `mode=single`, chooses the active hardware sample rate/RF bandwidth profile from the formulas above, keeps RF bandwidth less than sample rate, uses a power-of-two CIC decimation factor when required, and reports raw line rate from the empirical Pluto host-throughput model rather than the RF sampling frequency.
+- Narrow single-frequency mode switches to `mode=single`, chooses the active hardware sample rate/RF bandwidth profile from the formulas above, keeps RF bandwidth less than sample rate, uses the smallest feasible integer CIC decimation factor, and reports raw line rate from the empirical Pluto host-throughput model rather than the RF sampling frequency.

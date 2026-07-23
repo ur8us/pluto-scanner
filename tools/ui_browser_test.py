@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 import json
+import math
 import os
 import time
 
@@ -64,8 +65,14 @@ fetch('/api/status').then(r => r.json()).then(done)
     return driver.execute_async_script(script)
 
 
-def api_view(driver, visible_start_hz, visible_end_hz):
-    """Apply one backend viewport through the browser origin."""
+def api_view(driver, visible_start_hz, visible_end_hz, display_bins=None):
+    """Apply one backend viewport using the visible CSS waterfall width."""
+    if display_bins is None:
+        display_bins = int(
+            driver.execute_script(
+                "return window.__plutoTestHooks.viewState().canvas_display_bins;"
+            )
+        )
     script = """
 const done = arguments[arguments.length - 1];
 fetch('/api/view', {
@@ -74,13 +81,13 @@ fetch('/api/view', {
   body: JSON.stringify({
     visible_start_hz: arguments[0],
     visible_end_hz: arguments[1],
-    display_bins: 1024
+    display_bins: arguments[2]
   })
 }).then(r => r.json()).then(done)
   .catch(e => done({status: 'error', message: String(e)}));
 """
     result = driver.execute_async_script(
-        script, visible_start_hz, visible_end_hz
+        script, visible_start_hz, visible_end_hz, display_bins
     )
     if result.get("status") != "ok":
         raise RuntimeError(result)
@@ -322,6 +329,68 @@ def main():
         )
         wait_nonblank_waterfall(driver)
 
+        # At both zoom boundaries, repeated zoom requests must be true no-ops:
+        # they must not alter the URL viewport or materialize a new waterfall
+        # presentation when the span cannot become smaller or larger.
+        driver.execute_script("document.getElementById('gotoButton').click();")
+        driver.execute_script(
+            "document.getElementById('gotoFreq').value='435';"
+            "document.getElementById('gotoTargetZoom').value='1000000';"
+            "document.getElementById('gotoOk').click();"
+        )
+        WebDriverWait(driver, 12).until(
+            lambda d: abs(
+                d.execute_script("return window.__plutoTestHooks.viewState();")[
+                    "span_hz"
+                ]
+                - 40
+            )
+            < 0.01
+        )
+        max_zoom_state = driver.execute_script(
+            "return window.__plutoTestHooks.viewState();"
+        )
+        max_zoom_hash = driver.execute_script("return location.hash;")
+        for _ in range(3):
+            driver.find_element(By.ID, "zoomIn").click()
+        time.sleep(0.25)
+        after_max_zoom_state = driver.execute_script(
+            "return window.__plutoTestHooks.viewState();"
+        )
+        if (
+            abs(after_max_zoom_state["start_hz"] - max_zoom_state["start_hz"]) > 0.01
+            or abs(after_max_zoom_state["end_hz"] - max_zoom_state["end_hz"]) > 0.01
+            or driver.execute_script("return location.hash;") != max_zoom_hash
+        ):
+            raise RuntimeError("zoom-in past maximum changed the viewport")
+
+        driver.find_element(By.ID, "zoomReset").click()
+        WebDriverWait(driver, 12).until(
+            lambda d: abs(
+                d.execute_script("return window.__plutoTestHooks.viewState();")[
+                    "span_hz"
+                ]
+                - 40_000_000
+            )
+            < 0.01
+        )
+        min_zoom_state = driver.execute_script(
+            "return window.__plutoTestHooks.viewState();"
+        )
+        min_zoom_hash = driver.execute_script("return location.hash;")
+        for _ in range(3):
+            driver.find_element(By.ID, "zoomOut").click()
+        time.sleep(0.25)
+        after_min_zoom_state = driver.execute_script(
+            "return window.__plutoTestHooks.viewState();"
+        )
+        if (
+            abs(after_min_zoom_state["start_hz"] - min_zoom_state["start_hz"]) > 0.01
+            or abs(after_min_zoom_state["end_hz"] - min_zoom_state["end_hz"]) > 0.01
+            or driver.execute_script("return location.hash;") != min_zoom_hash
+        ):
+            raise RuntimeError("zoom-out past minimum changed the viewport")
+
         receiver_window = driver.current_window_handle
         driver.switch_to.new_window("tab")
         time.sleep(3.0)
@@ -522,16 +591,21 @@ fetch('/api/status')
         ):
             raise RuntimeError(f"animated Go To did not finish at target: {goto_state}")
 
-        # Exercise Principle 7 at a true fresh-FFT cadence below 0.5 lines/s.
-        # The first target warms a compatible raw cache; the shifted target
-        # must then present cached and live rows without a burst/pause handoff.
-        deep_span_hz = 4096.0e6 / 3_000_000.0
-        deep_center_hz = 435_000_000.0
+        # Exercise Principle 7 with the exact 453 Hz/630 Hz reported views.
+        # Backend planning follows CSS pixels, while the canvas backing store
+        # may be wider on a high-DPI display.
+        fine_view = (155_760_937.0, 155_761_390.0)
+        coarse_view = (155_760_838.0, 155_761_468.0)
+        logical_bins = int(
+            driver.execute_script(
+                "return window.__plutoTestHooks.viewState().canvas_display_bins;"
+            )
+        )
         deep_payload = {
-            "freq_start": 430,
-            "freq_end": 470,
-            "visible_start_hz": deep_center_hz - deep_span_hz * 0.5,
-            "visible_end_hz": deep_center_hz + deep_span_hz * 0.5,
+            "freq_start": 150,
+            "freq_end": 160,
+            "visible_start_hz": fine_view[0],
+            "visible_end_hz": fine_view[1],
             "converter_freq": 0,
             "samplerate": 61440000,
             "rf_bandwidth": 20000000,
@@ -539,20 +613,24 @@ fetch('/api/status')
             "gain_mode": "manual",
             "hardwaregain_db": 20,
             "fft_size": 1024,
-            "display_bins": 1024,
-            "rate_limit_lps": 100,
-            "min_rate_lps": 20,
+            "display_bins": logical_bins,
+            "rate_limit_lps": 20,
+            "min_rate_lps": 10,
         }
         deep_plan = api_start(driver, deep_payload)
+        expected_fine_decim = math.ceil(
+            logical_bins * 4_000_000.0 / (fine_view[1] - fine_view[0]) / 2048
+        )
         if (
-            int(deep_plan.get("decim_factor", 0)) != 64
+            int(deep_plan.get("effective_fft_size", 0)) != 2048
+            or int(deep_plan.get("decim_factor", 0)) != expected_fine_decim
             or float(deep_plan.get("true_line_rate", 1)) > 0.5
         ):
-            raise RuntimeError(f"deep cadence test did not select x64: {deep_plan}")
+            raise RuntimeError(f"deep cadence test did not minimize FFT work: {deep_plan}")
         driver.execute_script(
             "window.__plutoTestHooks.clearPresentationHistory();"
         )
-        WebDriverWait(driver, 12).until(
+        WebDriverWait(driver, 20).until(
             lambda d: len(
                 [
                     row
@@ -562,19 +640,32 @@ fetch('/api/status')
                     if int(row.get("preview", 0)) == 0
                 ]
             )
-            >= 6
+            >= 3
         )
-        time.sleep(4.0)
+        time.sleep(0.5)
 
         driver.execute_script(
             "window.__plutoTestHooks.clearPresentationHistory();"
         )
-        shifted_center_hz = deep_center_hz + 25.0
+        request_at_ms = float(driver.execute_script("return performance.now();"))
         deep_view_plan = api_view(
             driver,
-            shifted_center_hz - deep_span_hz * 0.5,
-            shifted_center_hz + deep_span_hz * 0.5,
+            coarse_view[0],
+            coarse_view[1],
+            logical_bins,
         )
+        expected_coarse_decim = math.ceil(
+            logical_bins * 4_000_000.0 / (coarse_view[1] - coarse_view[0]) / 2048
+        )
+        if (
+            deep_view_plan.get("transition") != "hot"
+            or int(deep_view_plan.get("effective_fft_size", 0)) != 2048
+            or int(deep_view_plan.get("decim_factor", 0))
+            != expected_coarse_decim
+        ):
+            raise RuntimeError(
+                f"compatible Principle 7 view restarted or over-sized FFT: {deep_view_plan}"
+            )
         deep_view_id = int(deep_view_plan.get("view_id", 0))
 
         def deep_transition_rows(active_driver):
@@ -594,6 +685,12 @@ fetch('/api/status')
             )
         )
         deep_rows = deep_transition_rows(driver)
+        first_row_ms = float(deep_rows[0]["at_ms"]) - request_at_ms
+        if int(deep_rows[0].get("preview", 0)) != 1 or first_row_ms >= 2000.0:
+            raise RuntimeError(
+                "deep transition did not present history promptly: "
+                f"first={first_row_ms:.1f}ms rows={deep_rows}"
+            )
         deep_gaps_ms = [
             float(deep_rows[index]["at_ms"])
             - float(deep_rows[index - 1]["at_ms"])
@@ -601,7 +698,7 @@ fetch('/api/status')
         ]
         if not deep_gaps_ms:
             raise RuntimeError("deep transition produced no measurable row gaps")
-        if min(deep_gaps_ms) < 8.0 or max(deep_gaps_ms) > 300.0:
+        if min(deep_gaps_ms) < 8.0 or max(deep_gaps_ms) > 1000.0:
             raise RuntimeError(
                 "deep preview/live transition contained a burst or pause: "
                 f"gaps={deep_gaps_ms}, rows={deep_rows}"

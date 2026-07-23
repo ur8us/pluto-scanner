@@ -22,6 +22,9 @@ SCAN_BUF_LEN = 1024.0
 PLUTO_EST_HOP_MS = 3.4
 PLUTO_EST_SINGLE_STREAM_SPS = 2_100_000.0
 PLUTO_EST_CIC_STREAM_SPS = 1_850_000.0
+SINGLE_FFT_MIN = 2048
+SINGLE_FFT_MAX = 65536
+SINGLE_DECIM_MAX = 65536
 
 
 def api(driver, path, payload=None):
@@ -318,6 +321,30 @@ def expected_single_stream_sps(line_samples):
     return PLUTO_EST_SINGLE_STREAM_SPS
 
 
+def next_power_of_two(value):
+    """Return the smallest power of two greater than or equal to value."""
+    result = 1
+    while result < value:
+        result *= 2
+    return result
+
+
+def expected_single_fft_decim(span_hz, display_bins, samplerate_hz):
+    """Mirror the minimum-FFT integer-CIC planner for one active profile."""
+    required_product = math.ceil(display_bins * samplerate_hz / span_hz)
+    fft = next_power_of_two(max(SINGLE_FFT_MIN, display_bins))
+    fft = min(fft, SINGLE_FFT_MAX)
+    while True:
+        needed_decim = max(1, math.ceil(required_product / fft))
+        covering_decim = max(1, math.floor(samplerate_hz / (span_hz * 1.05)))
+        maximum_decim = min(covering_decim, SINGLE_DECIM_MAX)
+        if needed_decim <= maximum_decim:
+            return fft, needed_decim
+        if fft >= SINGLE_FFT_MAX:
+            return fft, maximum_decim
+        fft = min(fft * 2, SINGLE_FFT_MAX)
+
+
 def assert_close(errors, label, actual, expected, rel=0.05, abs_tol=0.05):
     if not math.isfinite(float(actual)):
         errors.append(f"{label}: non-finite actual {actual}")
@@ -393,11 +420,31 @@ def validate_single_plan(status, errors):
     if second_if <= 0:
         errors.append(f"single second_if_hz expected >0, got {second_if}")
     decim = int(status.get("decim_factor", 0))
-    if decim < 1 or decim & (decim - 1):
-        errors.append(f"single decim expected power-of-two >=1, got {decim}")
+    if decim < 1:
+        errors.append(f"single decim expected integer >=1, got {decim}")
     line_samples = float(status.get("effective_input_samples", 0))
     decim_hop = int(status.get("decim_hop", 0))
     fft = int(status.get("effective_fft_size", 0))
+    visible_start = float(status.get("visible_start_hz", 0))
+    visible_end = float(status.get("visible_end_hz", 0))
+    span_hz = visible_end - visible_start
+    if span_hz > 0 and display_bins > 0 and samplerate > 0:
+        expected_fft, expected_decim = expected_single_fft_decim(
+            span_hz, display_bins, samplerate
+        )
+        if fft != expected_fft or decim != expected_decim:
+            errors.append(
+                "single minimum-work plan expected "
+                f"FFT {expected_fft} x{expected_decim}, got FFT {fft} x{decim}"
+            )
+        visible_bins_per_pixel = float(
+            status.get("visible_bins_per_pixel", 0)
+        )
+        if visible_bins_per_pixel + 1e-9 < 1.0:
+            errors.append(
+                "single visible raw-bin density expected >=1, got "
+                f"{visible_bins_per_pixel}"
+            )
     if decim > 1 and decim_hop <= 0:
         errors.append(f"single CIC decim_hop expected >0, got {decim_hop}")
     if line_samples <= 0:

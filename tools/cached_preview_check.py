@@ -1,9 +1,11 @@
 #!/usr/bin/env python3
-"""Verify that compatible deep-zoom view changes publish cached preview rows."""
+"""Verify indexed-history hot handoff for the reported Principle 7 views."""
 
 import json
+import math
 import os
 import queue
+import re
 import shutil
 import signal
 import socket
@@ -17,6 +19,17 @@ import urllib.request
 
 BASE = ""
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+DISPLAY_BINS = int(os.environ.get("PLUTO_TEST_DISPLAY_BINS", "1800"))
+FFT_SIZE = 2048
+VIEW_FINE = (155_760_937.0, 155_761_390.0)
+VIEW_COARSE = (155_760_838.0, 155_761_468.0)
+FIRST_ROW_MAX_MS = float(os.environ.get("PLUTO_TEST_FIRST_ROW_MAX_MS", "2000"))
+FOLLOWING_GAP_MAX_MS = float(
+    os.environ.get("PLUTO_TEST_FOLLOWING_GAP_MAX_MS", "1000")
+)
+ROW_COLLECTION_TIMEOUT = float(
+    os.environ.get("PLUTO_TEST_ROW_COLLECTION_TIMEOUT", "8")
+)
 
 
 def find_test_binary():
@@ -40,6 +53,10 @@ def find_test_binary():
 
 
 TEST_BINARY = find_test_binary()
+RESULT_RE = re.compile(
+    r"CIC tone result: checks (\d+), spectral errors (\d+), "
+    r"sample-order errors (\d+)"
+)
 
 
 def http_json(method, path, payload=None, timeout=20):
@@ -69,26 +86,8 @@ def wait_for_server(process, timeout=10):
     raise RuntimeError("synthetic scanner did not start")
 
 
-def read_sse_rows(count, timeout=20):
-    """Read a fixed number of waterfall rows from the scanner SSE stream."""
-    rows = []
-    deadline = time.monotonic() + timeout
-    saw_event = False
-    with urllib.request.urlopen(BASE + "/api/waterfall", timeout=timeout) as response:
-        while len(rows) < count and time.monotonic() < deadline:
-            line = response.readline().decode("utf-8", "replace").strip()
-            if line == "event: line":
-                saw_event = True
-            elif saw_event and line.startswith("data:"):
-                rows.append(json.loads(line[5:].strip()))
-                saw_event = False
-    if len(rows) != count:
-        raise RuntimeError(f"received {len(rows)} of {count} expected SSE rows")
-    return rows
-
-
 class SSEReader:
-    """Background SSE reader used to catch rows published during /api/view."""
+    """Continuously timestamp waterfall rows so view changes cannot miss one."""
 
     def __init__(self):
         self.rows = queue.Queue()
@@ -97,12 +96,13 @@ class SSEReader:
         self.thread = threading.Thread(target=self._run, daemon=True)
 
     def start(self):
+        """Start the background EventSource reader."""
         self.thread.start()
 
     def _run(self):
         saw_event = False
         try:
-            with urllib.request.urlopen(BASE + "/api/waterfall", timeout=30) as response:
+            with urllib.request.urlopen(BASE + "/api/waterfall", timeout=60) as response:
                 while not self.stop_requested:
                     line = response.readline().decode("utf-8", "replace").strip()
                     if line == "event: line":
@@ -116,10 +116,8 @@ class SSEReader:
             if not self.stop_requested:
                 self.error = exc
 
-    def collect_for_view(
-        self, view_id, minimum_rows=5, timeout=10, require_live=False
-    ):
-        """Collect rows matching one backend view id."""
+    def collect_for_view(self, view_id, minimum_rows, timeout, require_live=True):
+        """Collect timestamped rows for one backend view id."""
         deadline = time.monotonic() + timeout
         matched = []
         while time.monotonic() < deadline:
@@ -129,16 +127,20 @@ class SSEReader:
                 if self.error:
                     raise RuntimeError(f"SSE reader failed: {self.error}")
                 continue
-            if int(row.get("view", -1)) == int(view_id):
-                matched.append(row)
-                if len(matched) >= minimum_rows and (
-                    not require_live
-                    or any(int(item.get("preview", 0)) == 0 for item in matched)
-                ):
-                    break
-        return matched
+            if int(row.get("view", -1)) != int(view_id):
+                continue
+            matched.append(row)
+            if len(matched) >= minimum_rows and (
+                not require_live
+                or any(int(item.get("preview", 0)) == 0 for item in matched)
+            ):
+                return matched
+        raise RuntimeError(
+            f"received {len(matched)} of {minimum_rows} rows for view {view_id}"
+        )
 
     def stop(self):
+        """Stop retaining rows; the daemon reader may remain in readline()."""
         self.stop_requested = True
         self.thread.join(timeout=1)
 
@@ -161,17 +163,26 @@ def stop_backend_process(process):
         process.send_signal(signal.SIGINT)
 
 
-def view_bounds(center_hz, span_hz):
-    """Return visible start/end for one centered view."""
-    return center_hz - span_hz * 0.5, center_hz + span_hz * 0.5
+def int_field(payload, name):
+    """Read a numeric JSON field as an integer."""
+    return int(round(float(payload.get(name, 0))))
 
 
-def start_payload(center_hz, span_hz):
-    """Build a deep x64 overlapped single-frequency request."""
-    visible_start, visible_end = view_bounds(center_hz, span_hz)
+def expected_plan(bounds):
+    """Return the exact minimum-FFT CIC and overlap factors for one view."""
+    span_hz = bounds[1] - bounds[0]
+    decim = math.ceil(DISPLAY_BINS * 4_000_000.0 / span_hz / FFT_SIZE)
+    base_lps = 1_850_000.0 / (FFT_SIZE * decim)
+    required_overlap = max(1, math.ceil(10.0 / base_lps))
+    overlap = 1 << (required_overlap - 1).bit_length()
+    return decim, min(overlap, FFT_SIZE)
+
+
+def start_payload(bounds):
+    """Build the high-zoom request at the configured logical display width."""
     return {
-        "freq_start": 430,
-        "freq_end": 440,
+        "freq_start": 150,
+        "freq_end": 160,
         "converter_freq": 0,
         "samplerate": 61_440_000,
         "rf_bandwidth": 20_000_000,
@@ -179,21 +190,120 @@ def start_payload(center_hz, span_hz):
         "gain_mode": "manual",
         "hardwaregain_db": 20,
         "fft_size": 1024,
-        "display_bins": 1024,
-        "rate_limit_lps": 100,
-        "min_rate_lps": 20,
-        "visible_start_hz": visible_start,
-        "visible_end_hz": visible_end,
+        "display_bins": DISPLAY_BINS,
+        "rate_limit_lps": 20,
+        "min_rate_lps": 10,
+        "visible_start_hz": bounds[0],
+        "visible_end_hz": bounds[1],
     }
 
 
-def int_field(payload, name):
-    """Read a numeric JSON field as an integer."""
-    return int(round(float(payload.get(name, 0))))
+def assert_plan(label, payload, expected_decim, expected_overlap):
+    """Validate the minimum-FFT planner and overlap identity."""
+    if payload.get("mode") != "single":
+        raise RuntimeError(f"{label}: expected single mode: {payload}")
+    if int_field(payload, "effective_fft_size") != FFT_SIZE:
+        raise RuntimeError(f"{label}: FFT was not minimized to {FFT_SIZE}: {payload}")
+    if int_field(payload, "display_bins") != DISPLAY_BINS:
+        raise RuntimeError(f"{label}: display width changed: {payload}")
+    if int_field(payload, "decim_factor") != expected_decim:
+        raise RuntimeError(f"{label}: unexpected CIC plan: {payload}")
+    if int_field(payload, "overlap_factor") != expected_overlap:
+        raise RuntimeError(f"{label}: unexpected overlap: {payload}")
+    if int_field(payload, "decim_hop") * expected_overlap != FFT_SIZE:
+        raise RuntimeError(f"{label}: FFT/hop/overlap identity failed: {payload}")
+    if ("visible_bins_per_pixel" in payload
+            and float(payload["visible_bins_per_pixel"]) < 1.0):
+        raise RuntimeError(f"{label}: plan undersamples display pixels: {payload}")
+    if float(payload.get("true_line_rate", 1)) > 0.5:
+        raise RuntimeError(f"{label}: view is not a slow high-zoom plan: {payload}")
+
+
+def validate_frame_ranges(label, rows, decim, hop, capture_epoch):
+    """Prove that published FFT frames retain one indexed capture timeline."""
+    expected_width = FFT_SIZE * decim
+    expected_step = hop * decim
+    previous_end = None
+    for row in rows:
+        if int_field(row, "capture_epoch") != capture_epoch:
+            raise RuntimeError(f"{label}: capture epoch changed: {row}")
+        start = int_field(row, "frame_sample_start")
+        end = int_field(row, "frame_sample_end")
+        if start < 0 or end <= start or end - start != expected_width:
+            raise RuntimeError(f"{label}: invalid FFT sample range: {row}")
+        if previous_end is not None:
+            advance = end - previous_end
+            if advance <= 0 or advance % expected_step != 0:
+                raise RuntimeError(
+                    f"{label}: sample timeline advanced by {advance}, "
+                    f"expected a positive multiple of {expected_step}"
+                )
+        previous_end = end
+
+
+def run_transition(reader, bounds, expected_decim, expected_overlap,
+                   capture_epoch, physical_center_hz):
+    """Perform and validate one no-restart indexed-history view transition."""
+    requested_at = time.monotonic()
+    plan = http_json(
+        "POST",
+        "/api/view",
+        {
+            "visible_start_hz": bounds[0],
+            "visible_end_hz": bounds[1],
+            "display_bins": DISPLAY_BINS,
+        },
+    )
+    if plan.get("status") != "ok" or plan.get("transition") != "hot":
+        raise RuntimeError(f"compatible transition restarted capture: {plan}")
+    assert_plan("hot plan", plan, expected_decim, expected_overlap)
+
+    view_id = int_field(plan, "view_id")
+    rows = reader.collect_for_view(
+        view_id, minimum_rows=6, timeout=ROW_COLLECTION_TIMEOUT
+    )
+    first_row_ms = (rows[0]["_arrival_monotonic"] - requested_at) * 1000.0
+    if first_row_ms >= FIRST_ROW_MAX_MS:
+        raise RuntimeError(f"first reused row took {first_row_ms:.1f} ms")
+    if int_field(rows[0], "preview") != 1:
+        raise RuntimeError(f"first row did not reuse indexed history: {rows[0]}")
+    if not any(int_field(row, "preview") == 0 for row in rows):
+        raise RuntimeError("hot handoff never reached live rows")
+
+    expected_dsp_center = (bounds[0] + bounds[1]) * 0.5
+    for row in rows:
+        assert_plan("hot row", row, expected_decim, expected_overlap)
+        if abs(float(row.get("physical_center_hz", 0)) - physical_center_hz) > 1e-6:
+            raise RuntimeError(f"hot transition retuned the physical LO: {row}")
+        if abs(float(row.get("dsp_center_hz", 0)) - expected_dsp_center) > 1e-6:
+            raise RuntimeError(f"hot transition used the wrong DSP center: {row}")
+
+    validate_frame_ranges(
+        "hot rows", rows, expected_decim, int_field(plan, "decim_hop"),
+        capture_epoch,
+    )
+    gaps_ms = [
+        (rows[index]["_arrival_monotonic"]
+         - rows[index - 1]["_arrival_monotonic"]) * 1000.0
+        for index in range(1, len(rows))
+    ]
+    if gaps_ms and max(gaps_ms) >= FOLLOWING_GAP_MAX_MS:
+        raise RuntimeError(f"hot handoff contained a visible row pause: {gaps_ms}")
+
+    return {
+        "view_id": view_id,
+        "span_hz": bounds[1] - bounds[0],
+        "fft": FFT_SIZE,
+        "decim": expected_decim,
+        "overlap": expected_overlap,
+        "first_row_ms": first_row_ms,
+        "max_following_gap_ms": max(gaps_ms) if gaps_ms else 0.0,
+        "rows": len(rows),
+    }
 
 
 def run_check():
-    """Run the cache preview validation against a private synthetic backend."""
+    """Run both directions of the reported Principle 7 transition."""
     global BASE
     if not os.path.isfile(TEST_BINARY):
         raise RuntimeError(
@@ -202,149 +312,55 @@ def run_check():
     port = allocate_loopback_port()
     BASE = f"http://127.0.0.1:{port}"
 
-    center = 435_000_000.0
-    span_hz = 4096.0e6 / 3_000_000.0
-    shifted_start, shifted_end = view_bounds(center + 25.0, span_hz)
-
-    with tempfile.TemporaryDirectory(prefix="pluto-cache-preview-") as temp_dir:
+    with tempfile.TemporaryDirectory(prefix="pluto-hot-history-") as temp_dir:
         binary = os.path.join(temp_dir, os.path.basename(TEST_BINARY))
         shutil.copy2(TEST_BINARY, binary)
+        env = os.environ.copy()
+        env["PLUTO_SYNTHETIC_REALTIME"] = "1"
         process = subprocess.Popen(
             [binary, "--port", str(port)],
             cwd=temp_dir,
+            env=env,
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
             text=True,
         )
         reader = None
         output = ""
-        rate_preview_rows = []
-        rate_live_rows = []
+        transitions = []
         try:
             wait_for_server(process)
-            plan = http_json("POST", "/api/start", start_payload(center, span_hz))
-            if plan.get("status") != "ok":
-                raise RuntimeError(f"start failed: {plan}")
-            if int_field(plan, "decim_factor") != 64:
-                raise RuntimeError(f"expected x64 CIC plan, got {plan}")
-            if int_field(plan, "overlap_factor") != 64:
-                raise RuntimeError(f"expected x64 overlap, got {plan}")
-
-            warmup_rows = read_sse_rows(8, timeout=20)
-            if any(int(row.get("preview", 0)) != 0 for row in warmup_rows):
-                raise RuntimeError("initial cache warmup unexpectedly used previews")
-
             reader = SSEReader()
             reader.start()
-            time.sleep(0.2)
-            view_request_at = time.monotonic()
-            view_plan = http_json(
-                "POST",
-                "/api/view",
-                {
-                    "visible_start_hz": shifted_start,
-                    "visible_end_hz": shifted_end,
-                    "display_bins": 1024,
-                },
+            plan = http_json("POST", "/api/start", start_payload(VIEW_FINE))
+            if plan.get("status") != "ok":
+                raise RuntimeError(f"start failed: {plan}")
+            fine_decim, fine_overlap = expected_plan(VIEW_FINE)
+            coarse_decim, coarse_overlap = expected_plan(VIEW_COARSE)
+            assert_plan("initial plan", plan, fine_decim, fine_overlap)
+            initial_rows = reader.collect_for_view(
+                int_field(plan, "view_id"), minimum_rows=3, timeout=20
             )
-            if view_plan.get("status") != "ok":
-                raise RuntimeError(f"view change failed: {view_plan}")
-            view_id = int_field(view_plan, "view_id")
-            rows = reader.collect_for_view(
-                view_id, minimum_rows=6, timeout=20, require_live=True
-            )
-            if len(rows) < 3:
-                raise RuntimeError(f"only {len(rows)} rows captured for view {view_id}")
-            if int(rows[0].get("preview", 0)) != 1:
-                raise RuntimeError(f"first row for new view was not cached preview: {rows[0]}")
-
-            preview_rows = [row for row in rows if int(row.get("preview", 0)) == 1]
-            live_rows = [row for row in rows if int(row.get("preview", 0)) == 0]
-            if not preview_rows:
-                raise RuntimeError("no cached preview rows captured")
+            live_rows = [row for row in initial_rows if int_field(row, "preview") == 0]
             if not live_rows:
-                raise RuntimeError("no live row captured after cached previews")
-            expected_count = int(preview_rows[0].get("preview_count", 0))
-            if expected_count < 1:
-                raise RuntimeError(f"invalid preview_count in {preview_rows[0]}")
-            sequences = [int(row.get("preview_sequence", 0)) for row in preview_rows]
-            if sequences != list(range(1, len(sequences) + 1)):
-                raise RuntimeError(f"preview sequences were not contiguous: {sequences}")
-            if len(preview_rows) != expected_count:
-                raise RuntimeError(
-                    f"produced {len(preview_rows)} previews but preview_count was {expected_count}"
-                )
-            preview_interval_ms = float(preview_rows[0].get("preview_interval_ms", 0))
-            if preview_interval_ms <= 0:
-                raise RuntimeError(f"missing preview interval metadata: {preview_rows[0]}")
-            line_interval_ms = float(preview_rows[0].get("line_interval_ms", 0))
-            if line_interval_ms <= 0:
-                raise RuntimeError(f"missing steady line interval: {preview_rows[0]}")
-            if any(float(row.get("preview_interval_ms", -1)) != 0 for row in live_rows):
-                raise RuntimeError("live rows still carry preview-only pacing metadata")
-            if any(float(row.get("line_interval_ms", 0)) <= 0 for row in live_rows):
-                raise RuntimeError("live rows lack steady-state pacing metadata")
-            first_line_ms = float(view_plan.get("first_line_ms", 0))
-            if expected_count * preview_interval_ms + preview_interval_ms < first_line_ms:
-                raise RuntimeError(
-                    "cached preview coverage is too short for the planned fresh frame: "
-                    f"count={expected_count} interval={preview_interval_ms} "
-                    f"first={first_line_ms}"
-                )
-            for row in rows:
-                if int_field(row, "decim_factor") != 64 or int_field(row, "overlap_factor") != 64:
-                    raise RuntimeError(f"row changed CIC/overlap metadata: {row}")
+                raise RuntimeError("initial view produced no live row")
+            capture_epoch = int_field(live_rows[-1], "capture_epoch")
+            physical_center_hz = float(live_rows[-1].get("physical_center_hz", 0))
+            if capture_epoch <= 0 or physical_center_hz == 0:
+                raise RuntimeError(f"missing capture identity metadata: {live_rows[-1]}")
 
-            time.sleep(0.2)
-            rate_plan = http_json(
-                "POST",
-                "/api/rate",
-                {"min_rate_lps": 10, "rate_limit_lps": 50},
-            )
-            if rate_plan.get("status") != "ok":
-                raise RuntimeError(f"rate change failed: {rate_plan}")
-            rate_view_id = int_field(rate_plan, "view_id")
-            rate_rows = reader.collect_for_view(
-                rate_view_id, minimum_rows=8, timeout=20, require_live=True
-            )
-            if len(rate_rows) < 2:
-                raise RuntimeError(
-                    f"only {len(rate_rows)} rows captured for rate view {rate_view_id}"
+            transitions.append(
+                run_transition(
+                    reader, VIEW_COARSE, coarse_decim, coarse_overlap,
+                    capture_epoch, physical_center_hz,
                 )
-            if int(rate_rows[0].get("preview", 0)) != 1:
-                raise RuntimeError(
-                    "first row after waterfall-rate change was not cached "
-                    f"preview: {rate_rows[0]}"
-                )
-            rate_preview_rows = [
-                row for row in rate_rows if int(row.get("preview", 0)) == 1
-            ]
-            rate_live_rows = [
-                row for row in rate_rows if int(row.get("preview", 0)) == 0
-            ]
-            if not rate_preview_rows:
-                raise RuntimeError("no cached preview rows captured after rate change")
-            if not rate_live_rows:
-                raise RuntimeError("no live row captured after rate-change previews")
-            rate_interval_ms = float(
-                rate_preview_rows[0].get("preview_interval_ms", 0)
             )
-            rate_first_line_ms = float(rate_plan.get("first_line_ms", 0))
-            if rate_interval_ms <= 0 or (
-                int(rate_preview_rows[0].get("preview_count", 0))
-                * rate_interval_ms
-                + rate_interval_ms
-                < rate_first_line_ms
-            ):
-                raise RuntimeError(
-                    "rate-change preview coverage does not hide the planned live fill"
+            transitions.append(
+                run_transition(
+                    reader, VIEW_FINE, fine_decim, fine_overlap,
+                    capture_epoch, physical_center_hz,
                 )
-            if len(rate_preview_rows) != int(
-                rate_preview_rows[0].get("preview_count", 0)
-            ):
-                raise RuntimeError("rate-change preview count was not exact")
-            if any(float(row.get("preview_interval_ms", -1)) != 0 for row in rate_live_rows):
-                raise RuntimeError("rate-change live rows carry preview pacing")
+            )
 
             http_json("POST", "/api/stop", {})
             stop_backend_process(process)
@@ -356,27 +372,35 @@ def run_check():
                 process.kill()
                 output += process.communicate(timeout=5)[0]
 
+    if len(re.findall(r"Hot replan \d+ complete", output)) != 2:
+        raise RuntimeError(f"both hot replans did not complete\n{output[-4000:]}")
+    if output.count("Scan thread stopped") != 1:
+        raise RuntimeError("a compatible view change restarted the scan thread")
+    forbidden = (
+        "lost indexed history",
+        "no complete indexed history",
+        "failed to allocate DSP state",
+        "CIC sample-order mismatch",
+    )
+    if any(message in output for message in forbidden):
+        raise RuntimeError(f"hot handoff diagnostic failure\n{output[-4000:]}")
+    results = RESULT_RE.findall(output)
+    if not results:
+        raise RuntimeError(f"missing synthetic integrity result\n{output[-4000:]}")
+    checks, spectral_errors, order_errors = (int(value) for value in results[-1])
+    if checks < 4 or spectral_errors != 0 or order_errors != 0:
+        raise RuntimeError(
+            f"integrity failure: checks={checks}, spectral={spectral_errors}, "
+            f"order={order_errors}\n{output[-4000:]}"
+        )
+
     return {
         "status": "ok",
-        "preview_rows": len(preview_rows),
-        "preview_count": expected_count,
-        "live_rows": len(live_rows),
-        "rate_preview_rows": len(rate_preview_rows),
-        "rate_live_rows": len(rate_live_rows),
-        "preview_interval_ms": preview_interval_ms,
-        "line_interval_ms": line_interval_ms,
-        "rate_preview_interval_ms": rate_interval_ms,
-        "first_line_ms": float(view_plan.get("first_line_ms", 0.0)),
-        "preview_arrival_span_ms": (
-            preview_rows[-1]["_arrival_monotonic"]
-            - preview_rows[0]["_arrival_monotonic"]
-        )
-        * 1000.0,
-        "first_live_arrival_ms": (
-            live_rows[0]["_arrival_monotonic"] - view_request_at
-        )
-        * 1000.0,
-        "log_tail": output[-1000:],
+        "capture_epoch": capture_epoch,
+        "transitions": transitions,
+        "spectral_errors": spectral_errors,
+        "sample_order_errors": order_errors,
+        "log_tail": output[-1200:],
     }
 
 

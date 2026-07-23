@@ -15,7 +15,7 @@ Design goals (from `README.md`):
 
 1. AI-first development workflow.
 2. A web interface that minimizes traffic (waterfall rows are exactly one
-   byte per screen pixel; only planning metadata rides alongside).
+   byte per visible CSS pixel; only planning metadata rides alongside).
 3. One-million-times zoom: from gigahertz-wide full-screen spans down to
    hertz-per-pixel detail.
 4. Seamless merging of scan/hop mode and single-frequency reception, hidden
@@ -26,10 +26,11 @@ Design goals (from `README.md`):
    clearing the screen. The principle is known in SDR UIs, but this program
    treats it as an area to improve so history remains useful across large zoom
    and frequency changes.
-7. Low-latency resolution changes — very fine frequency resolution needs FFTs
-   built from many seconds of samples. Instead of forcing the user to wait
-   several seconds after a resolution change, compatible memory-held samples
-   are reused for the first preview rows while live acquisition catches up.
+7. Low-latency, smooth resolution changes — compatible high-zoom view changes
+   keep capture running. The new integer-CIC/Hann/FFT generation starts from
+   indexed raw history and joins the same capture timeline at an exact sample
+   boundary. FFT size is the smallest power of two that covers the visible CSS
+   pixels; CIC supplies deeper resolution.
 8. Exact frequency tuning — deterministic compensation for PLL and DDS-style
    rounding errors keeps received signals plotted at their true frequencies.
 
@@ -38,19 +39,16 @@ Design goals (from `README.md`):
 ## 2. Architecture Overview
 
 ```text
-+-------------+      IIO buffers       +-------------------------------+
-| ADALM-Pluto | ---------------------> | C backend: main.c             |
-+-------------+                        |                               |
-                                       | HTTP server / JSON API        |
-+----------------------+               |   -> planner and controls     |
-| Frontend: index.html | -- requests ->|   -> Pluto settings           |
-| controls and dialogs |               |                               |
-| spectrum/waterfall   | <- SSE rows --| scan/capture thread           |
-| rulers and markers   |               |   -> worker queue             |
-+----------------------+               |   -> CIC/Hann/FFT             |
-                                       |   -> display-row reducer      |
-                                       |   -> SSE broadcaster          |
-                                       +-------------------------------+
++-------------+      IIO buffers       +--------------------------------+
+| ADALM-Pluto | ---------------------> | C backend: main.c              |
++-------------+                        |                                |
+                                       | scan/capture thread            |
++----------------------+               |   -> indexed Q15 raw history   |
+| Frontend: index.html | -- JSON API ->|   -> worker queue              |
+| controls and dialogs |               |   -> NCO / CIC / Hann / FFT    |
+| spectrum/waterfall   | <- SSE rows --|   -> CSS-pixel row reducer     |
+| rulers and markers   |               |   -> SSE broadcaster           |
++----------------------+               +--------------------------------+
 ```
 
 The backend is a **single C99 source file** (`main.c`) compiled with `gcc`,
@@ -126,9 +124,11 @@ the waterfall.
 | `FFT_SIZE_MIN` / `MAX` | 1024 / 65536 | FFT bounds (powers of two) |
 | `SCAN_FFT_SIZE_MAX` | 8192 | Scan-mode FFT cap |
 | `SINGLE_RAW_FFT_MIN` | 2048 | Single-mode FFT floor |
-| `SINGLE_DECIM_MAX` | 4096 | Largest CIC factor |
+| `SINGLE_DECIM_MAX` | 65536 | Largest integer CIC factor |
 | `SINGLE_DECIM_ASYNC_MIN_LEN` | 8192 | Smallest raw line advance targeted for CIC refills |
 | `SINGLE_DECIM_ASYNC_MAX_LEN` | 262144 | Largest CIC async refill before capping queue memory |
+| `CACHED_PREVIEW_MAX_SAMPLES` | 16,777,984 | Restart-preview raw-sample bound |
+| `CACHED_HISTORY_MAX_SAMPLES` | 33,555,968 | Q15 complex samples retained for hot handoff |
 | `SINGLE_ZERO_IF_GUARD_HZ` | 50000 | Zero-IF clearance |
 | `PLUTO_REFERENCE_INPUT_HZ` | 40 MHz | Physical Pluto reference input used by the coordinate model |
 | `PLUTO_RFPLL_REFERENCE_HZ` | 80 MHz | AD936x driver RFPLL parent after the 40 MHz reference doubler |
@@ -184,7 +184,8 @@ mode = (required_points > 1) ? SCAN : SINGLE
 > **Single-frequency mode** (narrow spans) — tunes Pluto to one center and
 > streams continuously. Selects a conservative hardware profile from
 > `(4/2), (8/4), (16/8), (20/10), (30.72/15), (61.44/20)` MSPS/MHz, then
-> applies CIC decimation only when the FFT size alone cannot resolve the span.
+> starts with the smallest power-of-two FFT covering the visible CSS pixels and
+> applies the smallest feasible integer CIC factor needed for resolution.
 > Uses a 3-stage CIC response with DC-gain normalization (`decim^−3`) and
 > per-bin inverse droop compensation clamped to `[0.05, 8.0]×`. The runtime
 > implementation uses three bounded moving sums of length `decim`, rather than
@@ -192,12 +193,17 @@ mode = (required_points > 1) ? SCAN : SINGLE
 > line-rate requests keep the same hardware profile, FFT size, and CIC
 > decimation, then use integer overlap on the decimated stream by reducing
 > `decim_hop`. Raw samples must still enter the CIC exactly once and in order.
-> When a view change requires a deeper FFT/CIC window, compatible buffered raw
-> samples may be replayed through the same CIC/Hann/FFT path as `preview=1`
-> rows so the first visible line appears quickly. Live acquisition restarts
-> from reset CIC state and later publishes `preview=0` rows.
-> The zero-IF/DC artifact is pushed `≥ 50 kHz` outside the visible span by
-> offsetting the source center.
+> A compatible view change leaves IIO capture and the physical LO running. The
+> worker initializes the new generation from indexed Q15 raw history ending at
+> one handoff sample, publishes that row as `preview=1`, consumes all samples
+> captured after the handoff, and resumes queued `preview=0` rows on the same
+> continuity epoch. The old and new DSP centers must each remain inside the
+> other's decimated source span; larger center changes use the bounded
+> restart-preview path so out-of-source old-view carriers are not folded into
+> the new narrow source by CIC aliasing. Incompatible changes also restart.
+> The physical LO keeps zero IF at least `50 kHz` outside the visible span. A
+> phase-continuous pre-CIC NCO moves the uninterrupted physical stream to the
+> visible DSP center before decimation.
 
 All coefficient math (zoom table, profile selection, FFT/CIC planning, line
 rates, level normalization) is fully specified in **`SPECTRUM_CALC.MD`**.
@@ -297,17 +303,22 @@ receives an ordered discontinuity flag, resets CIC state, and
 skips the first warmed-up FFT frame rather than publishing a line across a
 hidden sample discontinuity.
 
-For compatible single-frequency view changes, the backend keeps a bounded
-recent raw-sample cache. If the new visible interval, sample rate, RF bandwidth,
-and source coverage match the cached stream, the backend snapshots enough past
-samples for the predicted live-fill interval, digitally rotates them if the
-source center moved, and runs them through the normal CIC/Hann/FFT path as
-`preview=1` rows. Very fine frequency resolution can require many seconds of
-samples per FFT, so this avoids the traditional multi-second blank delay after
-a resolution change. Preview samples are never concatenated with new live
-samples; CIC state is reset before live acquisition resumes. The number of
-preview rows is calculated from the fresh-frame latency and the planned output
-cadence, subject to the bounded compatible cache.
+For compatible single-frequency view changes, each accepted raw complex sample
+has an absolute index and a continuity epoch. The capture callback keeps
+appending Q15 I/Q to a bounded ring while the worker temporarily stops accepting
+old-generation queue entries. The worker snapshots exactly
+`(effective_fft_size + CIC_STAGES) * decim_factor` samples ending at the handoff
+index, initializes the new NCO/CIC/FFT generation, and publishes its completed
+historical frame as `preview=1`. It then processes every indexed sample captured
+after the handoff and atomically resumes the live queue at the same cursor. No
+sample may be lost, duplicated, or joined across continuity epochs. The physical
+LO is not rewritten and the scan thread is not restarted. Compatibility requires
+the same single-mode hardware sample rate, RF bandwidth, converter/input path,
+and analog coverage of the target DSP source.
+
+If those conditions are not met, the backend restarts capture and may use the
+older bounded preview bridge. That fallback never concatenates pre-restart and
+post-restart samples in one FFT.
 
 ### 3.6 I/Q decoding
 
@@ -360,7 +371,7 @@ CORS headers. `OPTIONS` preflight is answered with `204 No Content`.
 | GET | `/api/waterfall` | — | **SSE**: open stream, register fd, keep alive |
 | POST | `/api/start` | JSON | Configure **and** start scan (see §3.10) |
 | POST | `/api/stop` | — | Stop scan thread |
-| POST | `/api/view` | JSON | Update visible viewport (`visible_start_hz`, `visible_end_hz`, `display_bins`); restart scan if changed |
+| POST | `/api/view` | JSON | Update viewport; hot-handoff compatible CIC views, otherwise restart if changed |
 | POST | `/api/fft` | JSON | Set `fft_size` (`1024..65536`, power of two) |
 | POST | `/api/gain` | JSON | Set `gain_mode` + `hardwaregain_db` |
 | POST | `/api/rf-port` | JSON | Reserved backend RF-port plumbing; the current frontend is fixed to `A_BALANCED` |
@@ -409,7 +420,7 @@ ordinary user-editable controls.
 | `bins_per_step`, `line_bins`, `raw_line_bins`, `display_bins` | Bin accounting |
 | `view_id` | Monotonic id incremented on every view change |
 | `fft_size`, `effective_fft_size` | Selected vs planner-chosen FFT |
-| `decim_factor`, `decim_hop`, `overlap_factor` | CIC decimation params |
+| `decim_factor`, `decim_hop`, `overlap_factor` | Integer CIC factor, decimated-sample hop, and power-of-two overlap |
 | `effective_input_samples` | Samples consumed per published line |
 | `gain_mode`, `hardwaregain_db`, `rf_port` | Gain and backend RF-port state; the supported UI value is `A_BALANCED` |
 | `rf_ports` | Backend-probed RF-port capability list reserved for later channel/port work |
@@ -437,6 +448,13 @@ HTTP `400` without changing the persisted configured band.
 The response echoes a full planning summary identical in shape to
 `/api/status`, plus `status:"ok"|"error"`.
 
+`POST /api/view` additionally returns `transition:"hot"` when a compatible
+indexed-history handoff was queued, `transition:"restart"` when capture had to
+restart, or `transition:"unchanged"` when no new view was applied.
+Hot compatibility requires the same hardware profile and analog coverage plus
+mutually overlapping old/new DSP centers; a large pan or Go To therefore
+retunes instead of carrying a distant narrow-source tone through the CIC.
+
 ### 3.11 SSE waterfall row
 
 ```
@@ -447,6 +465,12 @@ data: {"view":<id>,"n":<line#>,"b":<total_steps>,"mode":"scan|single",
        "visible_start_hz":<start>,"visible_end_hz":<end>,
        "second_if_hz":<if_offset>,"zero_if_guard_hz":<guard>,
        "fq_err_correction_hz":<total_coordinate_correction>,
+       "physical_center_hz":<actual_lo_center>,
+       "dsp_center_hz":<post_nco_center>,"digital_mix_hz":<nco_shift>,
+       "capture_epoch":<continuity_id>,
+       "frame_sample_start":<inclusive_raw_index>,
+       "frame_sample_end":<exclusive_raw_index>,
+       "hot_replan_count":<completed>,"hot_replan_failures":<failed>,
        "raw_peak_hz":<interpolated_raw_fft_peak>,
        "live_capture_age_ms":<monotonic_age>,
        "live_first_input_ms":<delay>,"live_first_fft_ms":<delay>,
@@ -480,21 +504,20 @@ data: {"view":<id>,"n":<line#>,"b":<total_steps>,"mode":"scan|single",
   preview-to-live pause measurable without mixing the two sample streams.
 - `view` is the `view_id`; the frontend ignores rows whose `view` is older than
   the one it requested, so zoom/pan changes never show stale data.
+- `capture_epoch` identifies one uninterrupted physical sample stream.
+  `frame_sample_start..frame_sample_end` is the exact raw-sample interval used
+  by that FFT. Across a hot handoff the epoch and physical center stay fixed;
+  frame ends advance by positive multiples of `decim_hop * decim_factor`.
 - `minimum_rate_overlap=1` means the min-rate control shortened `decim_hop`
   while preserving FFT size and CIC decimation.
-- `preview=1` rows are compatible historical samples processed through the same
-  CIC/Hann/FFT path for low-latency high-resolution changes. They provide the
-  first waterfall rows from memory while the live stream fills the larger FFT
-  window. On preview rows, `preview_interval_ms` is exactly the estimated
-  fresh-line wait divided by the number of previews produced; it is zero on
-  live rows. `line_interval_ms` is the planned steady-state published cadence
-  after min-rate overlap and max-rate limiting. The frontend queues previews
-  and following live rows in arrival order against one retained monotonic
-  deadline for the active view, so temporary gaps between SSE deliveries do
-  not turn cached rows into a burst or create a preview-to-live pause. If the
-  first live row arrives earlier than estimated, it supersedes cached rows
-  still waiting in the presentation queue and takes the next deadline. Animated Go To
-  accepts a matching current-resolution preview row and does not stretch an
+- `preview=1` identifies a row computed from compatible historical samples by
+  the same NCO/CIC/Hann/FFT path. In a hot handoff it is the frame ending at the
+  indexed boundary of the still-running capture; following `preview=0` rows
+  continue that epoch. In the restart fallback, preview rows remain independent
+  from the newly started live stream. `line_interval_ms` is the planned
+  steady-state cadence; the frontend queues rows against one retained monotonic
+  deadline so neither path produces a burst followed by a pause. Animated Go To
+  accepts a matching current-resolution preview row and never stretches an
   older row into the new viewport.
 
 ---
@@ -533,7 +556,9 @@ manual dual slider); auto levels use robust percentiles (8 % noise floor,
 ### 4.3 SSE client
 
 `EventSource("/api/waterfall")`. Each `line` payload is validated:
-- `display_bins` must match the canvas width; mismatch requests a fresh view.
+- `display_bins` is the logical CSS width selected when the view was planned.
+  Browser page zoom and DPR changes retain that stream and resample locally to
+  the current canvas backing width; they do not restart the receiver.
 - `encoding:"u8b64"`/`db` must decode to `display_bins` bytes, or legacy `d`
   must be a length-`display_bins` array of integers `0..255`.
 - `f0 < f1` and finite.
@@ -560,6 +585,9 @@ client reconnects. Heartbeat shows `disconnected` / `idle` / `scanning`.
   pixel-preview so the backend is not retuned on every mouse move.
 - **Zoom buttons / keys** — `+`/`=` zoom in, `−`/`_` zoom out, arrows pan,
   `0` resets to full band.
+- **Zoom boundaries** — zoom-in requests at `1,000,000×` and zoom-out
+  requests at `1×` are no-ops. They must not alter the URL viewport, request a
+  backend view, or rematerialize the retained waterfall.
 - **View coalescing** — ordinary zoom/pan updates the canvas immediately but
   debounce the backend retune by `VIEW_RETUNE_IDLE_DELAY_MS = 300 ms`
   (`scheduleViewUpdate`), preventing rapid restart loops.
@@ -662,7 +690,7 @@ Backend planner:
   - required_points = ceil(span / (rf_bw × bw_ratio))
   - mode = scan if required_points > 1, else single
   - scan:   choose FFT = clamp_pow2(display_bins·sr / span, 1024, 8192)
-  - single: choose hardware profile, FFT, CIC decim (see SPECTRUM_CALC.MD)
+  - single: choose profile, minimum CSS-covering FFT, integer CIC
         │
         ▼
 Backend configures Pluto (LO, samplerate, bw, gain) ── converter math:
@@ -672,14 +700,15 @@ Backend configures Pluto (LO, samplerate, bw, gain) ── converter math:
         │
         ▼
 Acquisition:
-  scan:   retune → discard 2 → refill 1 → FFT → stitch → reduce
-  single: continuous stream → FFT (+CIC) → reduce
+  scan:   retune → discard 2 → refill 1 → Hann → FFT → stitch
+  single: continuous stream → indexed Q15 history + worker queue
         │
         ▼
-Decode I/Q (/2048) → Hann window → FFT (→ CIC) → magnitude×scales → dB → uint8
+Single DSP: NCO → bounded CIC → Hann → FFT
+Both modes: magnitude × coherent/CIC/noise scales → calibrated raw bins
         │
         ▼
-publish_scan_line: peak-per-pixel reduce to display_bins → SSE broadcast
+publish_scan_line: peak-per-CSS-pixel reduce → uint8 display_bins → SSE
         │
         ▼
 Frontend: validate row → update scope → scroll waterfall → relabel → autoscale
@@ -701,7 +730,7 @@ Frontend: validate row → update scope → scroll waterfall → relabel → aut
 - In single-frequency CIC mode, `CIC queue waited ...` means the processing
   queue blocked to preserve raw-buffer continuity instead of dropping samples
   before the decimator. Occasional waits are acceptable; repeated waits during
-  a long `FFT=65536 x2` run indicate worker backpressure that should be
+  a long integer-CIC run indicate worker backpressure that should be
   investigated.
 - In single-frequency CIC mode, the end-of-scan `CIC samples:` diagnostic must
   show `accounting errors 0`. Nonzero short-read or refill-recovery counters
@@ -712,14 +741,22 @@ Frontend: validate row → update scope → scroll waterfall → relabel → aut
   acceptance through the worker queue; Pluto/libiio supplies no per-sample
   timestamp, so transport continuity is validated by multi-buffer capture,
   refill diagnostics, long live runs, and the synthetic spectral test.
-- In `FFT=65536 x2` with the normal 4 MSPS / 2 MHz profile, the diagnostic line
-  should report `async 131072, line samples 131072, kernel buffers 4, overlap
-  1.00`. A fallback
-  such as `async 8192, line samples 131072` means one displayed line is being
-  stitched from many IIO refills and should be treated as a regression.
+- In ordinary CIC plans, `async` equals `decim_hop * decim_factor` and
+  `kernel buffers` is `4`. When that hop exceeds `262144`, the logged `async`
+  value is capped and one FFT advance is intentionally assembled across
+  multiple contiguous refills.
 - The separate synthetic-tone build must keep a clean bin-centred tone within
-  a three-bin Hann main lobe at x2, x64, and x256. Periodic skip and duplicate
-  controls must fail both the source-range and spectral-leakage checks.
+  a three-bin Hann main lobe at x2, x64, x256, x5581, and x7761. Periodic skip
+  and duplicate controls must fail both the source-range and spectral-leakage
+  checks. An unchanged physical tone may become off-bin after a DSP-center
+  change; in that case the diagnostic checks expected peak position and Hann
+  main-lobe width without applying the bin-centred `-70 dBc` sidelobe limit.
+  If the expected tone bin is outside the extracted source, the spectral check
+  is skipped because that FFT contains no in-source reference tone.
+  The exact 453 Hz/630 Hz synthetic test runs at 1800 and 1346 logical pixels
+  and must keep one capture epoch and avoid a scan-thread restart in both
+  directions. `tools/live_principle7_check.py` applies the same identity,
+  indexed-frame, first-row, and cadence checks to a five-minute Pluto run.
 - Scan is stopped automatically after `FRONTEND_IDLE_STOP_MS = 20 s` of no
   frontend activity.
 - The device is polled for reconnect every 5 s; an idle backend does not

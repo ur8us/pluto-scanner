@@ -137,11 +137,12 @@ static int win32_nanosleep(const struct timespec *req, struct timespec *rem)
 #define FFT_SIZE_MAX        65536
 #define SINGLE_RAW_FFT_MIN  2048
 #define SINGLE_FFT_SIZE_MAX FFT_SIZE_MAX
-#define SINGLE_DECIM_MAX    4096
+#define SINGLE_DECIM_MAX    65536
 #define SCAN_FFT_SIZE_MAX   8192
 #define SINGLE_DECIM_ASYNC_MIN_LEN 8192U
 #define SINGLE_DECIM_ASYNC_MAX_LEN 262144U
 #define CACHED_PREVIEW_MAX_SAMPLES 16777984U
+#define CACHED_HISTORY_MAX_SAMPLES (CACHED_PREVIEW_MAX_SAMPLES * 2U)
 #define CACHED_PREVIEW_MAX_LINES 128U
 #define CACHED_PREVIEW_MAX_AGE_MS 5000LL
 #define SINGLE_ZERO_IF_GUARD_HZ 50000.0
@@ -324,10 +325,12 @@ static uint32_t g_goto_animate = 0;
 static double g_goto_delay_s = 2.0;
 
 typedef struct {
-    float *samples;
+    int16_t *samples;
     size_t capacity;
     size_t count;
     size_t write_pos;
+    uint64_t first_sample_index;
+    uint64_t next_sample_index;
     double source_center_hz;
     double source_start_hz;
     double source_end_hz;
@@ -599,16 +602,6 @@ static int next_power_of_two_int(int value)
     while (size < value && size <= SINGLE_FFT_SIZE_MAX / 2)
         size *= 2;
     return size;
-}
-
-static int clamp_power_of_two_int(int value, int min_value, int max_value)
-{
-    int result = next_power_of_two_int(value);
-    if (result < min_value)
-        result = min_value;
-    if (result > max_value)
-        result = max_value;
-    return result;
 }
 
 /**
@@ -2734,6 +2727,8 @@ static void format_rf_ports_json(char *buf, size_t len)
 static int normalize_display_bins(int bins);
 static int current_display_bins(void);
 static double estimated_single_stream_sps_for_line_samples(uint32_t line_sample_count);
+static single_fft_plan_t single_fft_plan_for_span_and_bins(double span,
+                                                           int display_bins);
 static single_fft_plan_t single_fft_plan_for_span(double span);
 static int scan_effective_fft_size_for_span(double span, int selected_fft_size);
 static int planned_required_points(void);
@@ -2935,6 +2930,7 @@ typedef struct {
 
 typedef struct {
     int total_steps;
+    int display_bins;
     int bins_per_step;
     int last_bins;
     int line_bins;
@@ -2983,8 +2979,17 @@ typedef struct {
     int cic_skip_frames_after_reset;
     int cic_warmup_outputs_remaining;
     uint32_t pending_refill_flags;
+    /* While set, callbacks retain raw history but do not enqueue old DSP work. */
+    int hot_capture_only;
+    int hot_replan_catchup;
+    uint64_t hot_replan_count;
+    uint64_t hot_replan_failures;
     uint64_t capture_block_sequence;
     uint64_t capture_sample_next;
+    uint64_t capture_epoch;
+    uint64_t dsp_sample_origin;
+    uint64_t last_frame_sample_start;
+    uint64_t last_frame_sample_end;
     uint64_t worker_expected_block_sequence;
     uint64_t worker_expected_sample_index;
     int worker_sequence_initialized;
@@ -3007,6 +3012,11 @@ typedef struct {
     double last_width;
     /* Modeled actual-minus-requested source-center offset, in hertz. */
     double frequency_correction_hz;
+    /* Requested and modeled physical Pluto LO air-frequency centers. */
+    double hardware_requested_center_freq;
+    double hardware_center_freq;
+    /* NCO shift from the physical center to `center_freq`, in hertz. */
+    double digital_mix_hz;
     double center_freq;
     double second_if_hz;
     double zero_if_guard_hz;
@@ -3027,6 +3037,11 @@ typedef struct {
     uint32_t direct_sampling;
     double direct_mix_phase;
     double direct_mix_inc;
+    double single_mix_re;
+    double single_mix_im;
+    double single_mix_step_re;
+    double single_mix_step_im;
+    uint32_t single_mix_renorm_count;
     /* Display-only white-noise density factor; coherent FFT data is unchanged. */
     float waterfall_noise_scale;
     float mag_scale;
@@ -3043,6 +3058,7 @@ typedef struct {
     double synthetic_tone_hz;
     uint64_t synthetic_spectral_checks;
     uint64_t synthetic_spectral_failures;
+    uint64_t synthetic_spectral_skips;
 #endif
     uint8_t step_seen[MAX_FREQS];
     sample_queue_item_t queue[PROCESS_QUEUE_LEN];
@@ -3057,12 +3073,76 @@ typedef struct {
     pthread_t worker_thread;
 } scan_ctx_t;
 
+typedef struct {
+    uint64_t serial;
+    uint32_t view_id;
+    int display_bins;
+    double visible_start;
+    double visible_end;
+    long long requested_msec;
+    int pending;
+} hot_replan_request_t;
+
+static pthread_mutex_t g_hot_replan_mutex = PTHREAD_MUTEX_INITIALIZER;
+static scan_ctx_t *g_hot_active_ctx = NULL;
+static hot_replan_request_t g_hot_replan_request;
+static uint64_t g_hot_replan_serial = 0;
+static double g_hot_active_rf_bandwidth = 0.0;
+static double g_hot_active_source_start = 0.0;
+static double g_hot_active_source_end = 0.0;
+static double g_hot_active_dsp_start = 0.0;
+static double g_hot_active_dsp_end = 0.0;
+
+/**
+ * @brief Publish one active CIC stream as a candidate for DSP replans.
+ *
+ * @param ctx Stack-owned active scan context.
+ * @param rf_bandwidth_hz Physical Pluto RF bandwidth in hertz.
+ */
+static void hot_replan_register_stream(scan_ctx_t *ctx,
+                                       double rf_bandwidth_hz)
+{
+    pthread_mutex_lock(&g_hot_replan_mutex);
+    g_hot_active_ctx = ctx;
+    g_hot_active_rf_bandwidth = rf_bandwidth_hz;
+    g_hot_active_source_start = ctx ?
+        ctx->hardware_center_freq - rf_bandwidth_hz * 0.5 : 0.0;
+    g_hot_active_source_end = ctx ?
+        ctx->hardware_center_freq + rf_bandwidth_hz * 0.5 : 0.0;
+    g_hot_active_dsp_start = ctx ? ctx->scan_start : 0.0;
+    g_hot_active_dsp_end = ctx ? ctx->scan_end : 0.0;
+    memset(&g_hot_replan_request, 0, sizeof(g_hot_replan_request));
+    pthread_mutex_unlock(&g_hot_replan_mutex);
+}
+
+/**
+ * @brief Remove a stack-owned context from the hot-replan registry.
+ *
+ * @param ctx Active scan context being shut down.
+ */
+static void hot_replan_unregister_stream(scan_ctx_t *ctx)
+{
+    pthread_mutex_lock(&g_hot_replan_mutex);
+    if (g_hot_active_ctx == ctx) {
+        g_hot_active_ctx = NULL;
+        g_hot_active_rf_bandwidth = 0.0;
+        g_hot_active_source_start = 0.0;
+        g_hot_active_source_end = 0.0;
+        g_hot_active_dsp_start = 0.0;
+        g_hot_active_dsp_end = 0.0;
+        memset(&g_hot_replan_request, 0, sizeof(g_hot_replan_request));
+    }
+    pthread_mutex_unlock(&g_hot_replan_mutex);
+}
+
 /** Invalidate cached raw history at a known hardware-stream discontinuity. */
 static void recent_sample_cache_invalidate(void)
 {
     pthread_mutex_lock(&g_recent_samples_mutex);
     g_recent_samples.count = 0;
     g_recent_samples.write_pos = 0;
+    g_recent_samples.first_sample_index = 0;
+    g_recent_samples.next_sample_index = 0;
     g_recent_samples.valid = 0;
     g_recent_samples.continuity_generation++;
     pthread_mutex_unlock(&g_recent_samples_mutex);
@@ -3085,12 +3165,14 @@ static void recent_sample_cache_begin(double center_hz,
 {
     pthread_mutex_lock(&g_recent_samples_mutex);
     if (!g_recent_samples.samples) {
-        g_recent_samples.capacity = CACHED_PREVIEW_MAX_SAMPLES;
+        g_recent_samples.capacity = CACHED_HISTORY_MAX_SAMPLES;
         g_recent_samples.samples = malloc(g_recent_samples.capacity * 2U *
-                                          sizeof(float));
+                                          sizeof(int16_t));
     }
     g_recent_samples.count = 0;
     g_recent_samples.write_pos = 0;
+    g_recent_samples.first_sample_index = 0;
+    g_recent_samples.next_sample_index = 0;
     g_recent_samples.source_center_hz = center_hz;
     g_recent_samples.source_start_hz = source_start_hz;
     g_recent_samples.source_end_hz = source_end_hz;
@@ -3103,6 +3185,42 @@ static void recent_sample_cache_begin(double center_hz,
 }
 
 /**
+ * @brief Store normalized complex floats as signed Q15 history samples.
+ *
+ * Pluto's native Q12 sample values round-trip exactly through this format.
+ *
+ * @param dst Interleaved Q15 I/Q destination.
+ * @param src Interleaved normalized float I/Q source.
+ * @param sample_count Number of complex samples.
+ */
+static void recent_sample_cache_store_q15(int16_t *dst, const float *src,
+                                          size_t sample_count)
+{
+    for (size_t n = 0; n < sample_count * 2U; n++) {
+        long value = lrintf(src[n] * 32768.0f);
+        if (value < -32768L)
+            value = -32768L;
+        if (value > 32767L)
+            value = 32767L;
+        dst[n] = (int16_t)value;
+    }
+}
+
+/**
+ * @brief Expand cached Q15 complex samples for the float CIC/FFT path.
+ *
+ * @param dst Interleaved normalized float I/Q destination.
+ * @param src Interleaved Q15 I/Q source.
+ * @param sample_count Number of complex samples.
+ */
+static void recent_sample_cache_load_q15(float *dst, const int16_t *src,
+                                         size_t sample_count)
+{
+    for (size_t n = 0; n < sample_count * 2U; n++)
+        dst[n] = (float)src[n] / 32768.0f;
+}
+
+/**
  * @brief Append raw float I/Q to the recent contiguous sample ring.
  *
  * A flagged refill starts a new cache segment before its samples are appended.
@@ -3112,45 +3230,61 @@ static void recent_sample_cache_begin(double center_hz,
  * @param samples Interleaved complex float samples.
  * @param sample_count Complex sample count.
  * @param refill_flags Discontinuity flags associated with this refill.
+ * @param sample_index_start Absolute index of the first source sample.
+ * @param sample_index_end Absolute index one past the final source sample.
+ * @return Nonzero when capture-only handoff mode owns the appended samples.
  */
-static void recent_sample_cache_append(const scan_ctx_t *ctx,
-                                       const float *samples,
-                                       uint32_t sample_count,
-                                       uint32_t refill_flags)
+static int recent_sample_cache_append(scan_ctx_t *ctx,
+                                      const float *samples,
+                                      uint32_t sample_count,
+                                      uint32_t refill_flags,
+                                      uint64_t sample_index_start,
+                                      uint64_t sample_index_end)
 {
     size_t source_offset = 0;
     size_t append_count;
     size_t first_count;
 
+    int capture_only = 0;
+
     if (!ctx || !ctx->single_mode || ctx->direct_sampling || !samples ||
         sample_count == 0)
-        return;
+        return 0;
 
     pthread_mutex_lock(&g_recent_samples_mutex);
     if (!g_recent_samples.valid || !g_recent_samples.samples ||
-        fabs(g_recent_samples.source_center_hz - ctx->center_freq) > 1.0 ||
+        fabs(g_recent_samples.source_center_hz - ctx->hardware_center_freq) > 1.0 ||
         fabs(g_recent_samples.samplerate_hz - ctx->raw_samplerate) > 1.0) {
         pthread_mutex_unlock(&g_recent_samples_mutex);
-        return;
+        return 0;
     }
-    if (refill_flags != 0) {
+    capture_only = ctx->hot_capture_only;
+    if (refill_flags != 0 ||
+        (g_recent_samples.count > 0 &&
+         sample_index_start != g_recent_samples.next_sample_index) ||
+        sample_index_end < sample_index_start ||
+        sample_index_end - sample_index_start != (uint64_t)sample_count) {
         g_recent_samples.count = 0;
         g_recent_samples.write_pos = 0;
+        g_recent_samples.first_sample_index = sample_index_start;
+        g_recent_samples.next_sample_index = sample_index_start;
         g_recent_samples.continuity_generation++;
     }
+    ctx->capture_epoch = g_recent_samples.continuity_generation;
     if ((size_t)sample_count > g_recent_samples.capacity)
         source_offset = (size_t)sample_count - g_recent_samples.capacity;
     append_count = (size_t)sample_count - source_offset;
     first_count = g_recent_samples.capacity - g_recent_samples.write_pos;
     if (first_count > append_count)
         first_count = append_count;
-    memcpy(g_recent_samples.samples + g_recent_samples.write_pos * 2U,
-           samples + source_offset * 2U,
-           first_count * 2U * sizeof(float));
+    recent_sample_cache_store_q15(
+        g_recent_samples.samples + g_recent_samples.write_pos * 2U,
+        samples + source_offset * 2U, first_count);
     if (append_count > first_count) {
-        memcpy(g_recent_samples.samples,
-               samples + (source_offset + first_count) * 2U,
-               (append_count - first_count) * 2U * sizeof(float));
+        recent_sample_cache_store_q15(
+            g_recent_samples.samples,
+            samples + (source_offset + first_count) * 2U,
+            append_count - first_count);
     }
     g_recent_samples.write_pos =
         (g_recent_samples.write_pos + append_count) % g_recent_samples.capacity;
@@ -3158,8 +3292,12 @@ static void recent_sample_cache_append(const scan_ctx_t *ctx,
         g_recent_samples.count = g_recent_samples.capacity;
     else
         g_recent_samples.count += append_count;
+    g_recent_samples.next_sample_index = sample_index_end;
+    g_recent_samples.first_sample_index = sample_index_end -
+        (uint64_t)g_recent_samples.count;
     g_recent_samples.updated_msec = now_msec();
     pthread_mutex_unlock(&g_recent_samples_mutex);
+    return capture_only;
 }
 
 /**
@@ -3170,18 +3308,24 @@ static void recent_sample_cache_append(const scan_ctx_t *ctx,
  *
  * @param ctx New single-frequency context and requested RF interval.
  * @param rf_bandwidth_hz New Pluto RF bandwidth in hertz.
+ * @param end_sample_index Exclusive absolute history index, or `UINT64_MAX`
+ *        for the newest available sample.
  * @param needed_samples Raw complex samples required including CIC warm-up.
  * @param out_age_ms Cache age in milliseconds on success.
+ * @param out_generation Continuity epoch on success.
  * @return Allocated interleaved float I/Q, or NULL when not compatible.
  */
-static float *recent_sample_cache_snapshot(const scan_ctx_t *ctx,
-                                           double rf_bandwidth_hz,
-                                           uint32_t needed_samples,
-                                           long long *out_age_ms)
+static float *recent_sample_cache_snapshot_at(const scan_ctx_t *ctx,
+                                              double rf_bandwidth_hz,
+                                              uint64_t end_sample_index,
+                                              uint32_t needed_samples,
+                                              long long *out_age_ms,
+                                              uint64_t *out_generation)
 {
     float *snapshot = NULL;
     long long age_ms;
     size_t start;
+    uint64_t start_sample_index;
     double shift_hz;
     double coverage_guard_hz;
     double phase = 0.0;
@@ -3190,8 +3334,10 @@ static float *recent_sample_cache_snapshot(const scan_ctx_t *ctx,
 
     if (out_age_ms)
         *out_age_ms = 0;
+    if (out_generation)
+        *out_generation = 0;
     if (!ctx || !ctx->single_mode || ctx->direct_sampling ||
-        needed_samples == 0 || needed_samples > CACHED_PREVIEW_MAX_SAMPLES)
+        needed_samples == 0 || needed_samples > CACHED_HISTORY_MAX_SAMPLES)
         return NULL;
 
     pthread_mutex_lock(&g_recent_samples_mutex);
@@ -3201,7 +3347,13 @@ static float *recent_sample_cache_snapshot(const scan_ctx_t *ctx,
         ctx->raw_samplerate / (double)(ctx->fft_size > 0 ? ctx->fft_size : 1) * 2.0);
     if (!g_recent_samples.valid || !g_recent_samples.samples)
         reject_reason = "no contiguous raw cache";
-    else if (g_recent_samples.count < (size_t)needed_samples)
+    else if (end_sample_index == UINT64_MAX)
+        end_sample_index = g_recent_samples.next_sample_index;
+    if (!reject_reason &&
+        (end_sample_index > g_recent_samples.next_sample_index ||
+         end_sample_index < g_recent_samples.first_sample_index ||
+         (uint64_t)needed_samples > end_sample_index -
+             g_recent_samples.first_sample_index))
         reject_reason = "insufficient raw samples";
     else if (g_recent_samples.updated_msec <= 0 || age_ms < 0 ||
              age_ms > CACHED_PREVIEW_MAX_AGE_MS)
@@ -3225,14 +3377,22 @@ static float *recent_sample_cache_snapshot(const scan_ctx_t *ctx,
         pthread_mutex_unlock(&g_recent_samples_mutex);
         return NULL;
     }
+    start_sample_index = end_sample_index - (uint64_t)needed_samples;
     start = (g_recent_samples.write_pos + g_recent_samples.capacity -
-             (size_t)needed_samples) % g_recent_samples.capacity;
+             g_recent_samples.count +
+             (size_t)(start_sample_index -
+                      g_recent_samples.first_sample_index)) %
+        g_recent_samples.capacity;
     for (size_t n = 0; n < (size_t)needed_samples; n++) {
         size_t source = ((start + n) % g_recent_samples.capacity) * 2U;
-        snapshot[n * 2U] = g_recent_samples.samples[source];
-        snapshot[n * 2U + 1U] = g_recent_samples.samples[source + 1U];
+        snapshot[n * 2U] =
+            (float)g_recent_samples.samples[source] / 32768.0f;
+        snapshot[n * 2U + 1U] =
+            (float)g_recent_samples.samples[source + 1U] / 32768.0f;
     }
-    shift_hz = g_recent_samples.source_center_hz - ctx->center_freq;
+    shift_hz = g_recent_samples.source_center_hz - ctx->hardware_center_freq;
+    if (out_generation)
+        *out_generation = g_recent_samples.continuity_generation;
     pthread_mutex_unlock(&g_recent_samples_mutex);
 
     phase_inc = ctx->raw_samplerate > 0.0 ?
@@ -3254,6 +3414,71 @@ static float *recent_sample_cache_snapshot(const scan_ctx_t *ctx,
             "[SDR] Cached preview accepted: %u raw samples, age %lld ms, shift %.6f Hz\n",
             needed_samples, age_ms, shift_hz);
     return snapshot;
+}
+
+/**
+ * @brief Snapshot the newest compatible raw-history interval.
+ *
+ * @param ctx New single-frequency context and requested RF interval.
+ * @param rf_bandwidth_hz New Pluto RF bandwidth in hertz.
+ * @param needed_samples Raw complex samples required including CIC warm-up.
+ * @param out_age_ms Cache age in milliseconds on success.
+ * @return Allocated interleaved float I/Q, or NULL when not compatible.
+ */
+static float *recent_sample_cache_snapshot(const scan_ctx_t *ctx,
+                                           double rf_bandwidth_hz,
+                                           uint32_t needed_samples,
+                                           long long *out_age_ms)
+{
+    return recent_sample_cache_snapshot_at(ctx, rf_bandwidth_hz,
+                                           UINT64_MAX, needed_samples,
+                                           out_age_ms, NULL);
+}
+
+/**
+ * @brief Copy an indexed raw-history range without changing its RF center.
+ *
+ * @param start_index Absolute index of the first requested complex sample.
+ * @param sample_count Number of complex samples requested.
+ * @param generation Required cache continuity generation.
+ * @param dst Interleaved float I/Q destination.
+ * @return Zero on success, otherwise -1 when the range was overwritten or the
+ *         stream continuity generation changed.
+ */
+static int recent_sample_cache_copy_range(uint64_t start_index,
+                                          uint32_t sample_count,
+                                          uint64_t generation, float *dst)
+{
+    size_t offset;
+    size_t start;
+    size_t first_count;
+
+    if (!dst || sample_count == 0)
+        return -1;
+    pthread_mutex_lock(&g_recent_samples_mutex);
+    if (!g_recent_samples.valid || !g_recent_samples.samples ||
+        g_recent_samples.continuity_generation != generation ||
+        start_index < g_recent_samples.first_sample_index ||
+        start_index + (uint64_t)sample_count >
+            g_recent_samples.next_sample_index) {
+        pthread_mutex_unlock(&g_recent_samples_mutex);
+        return -1;
+    }
+    offset = (size_t)(start_index - g_recent_samples.first_sample_index);
+    start = (g_recent_samples.write_pos + g_recent_samples.capacity -
+             g_recent_samples.count + offset) % g_recent_samples.capacity;
+    first_count = g_recent_samples.capacity - start;
+    if (first_count > (size_t)sample_count)
+        first_count = (size_t)sample_count;
+    recent_sample_cache_load_q15(
+        dst, g_recent_samples.samples + start * 2U, first_count);
+    if ((size_t)sample_count > first_count) {
+        recent_sample_cache_load_q15(
+            dst + first_count * 2U, g_recent_samples.samples,
+            (size_t)sample_count - first_count);
+    }
+    pthread_mutex_unlock(&g_recent_samples_mutex);
+    return 0;
 }
 
 static int build_scan_frequencies_for_band(double start, double end, double *freqs, double *out_step)
@@ -3776,6 +4001,54 @@ static double second_if_for_center(double visible_start, double visible_end,
     return fabs(visible_center - source_center);
 }
 
+/**
+ * @brief Resolve physical and digital centers for one single-frequency view.
+ *
+ * The hardware LO uses the analog RF bandwidth to keep Pluto zero IF outside
+ * the visible interval. CIC views are mixed digitally to the visible center,
+ * allowing a narrow decimated source without sacrificing the physical guard.
+ * All returned values are air-frequency coordinates in hertz.
+ *
+ * @param visible_start Visible lower edge in hertz.
+ * @param visible_end Visible upper edge in hertz.
+ * @param plan Active single-frequency FFT/CIC plan.
+ * @param requested_hardware_center Requested air-frequency LO center.
+ * @param actual_hardware_center Modeled physical LO center after RFPLL error.
+ * @param dsp_center Digital FFT source center.
+ */
+static void single_centers_for_view(double visible_start, double visible_end,
+                                    const single_fft_plan_t *plan,
+                                    double *requested_hardware_center,
+                                    double *actual_hardware_center,
+                                    double *dsp_center)
+{
+    double requested;
+    double actual;
+    double digital;
+
+    if (!plan) {
+        requested = actual = digital = (visible_start + visible_end) * 0.5;
+    } else if (direct_sampling_enabled()) {
+        requested = direct_source_center_for_visible(
+            visible_start, visible_end, plan->source_span);
+        actual = requested;
+        digital = requested;
+    } else {
+        requested = single_source_center_for_visible(
+            visible_start, visible_end, plan->hardware_rf_bandwidth);
+        actual = requested + configured_frequency_correction_hz(requested);
+        digital = plan->decim_factor > 1 ?
+            (visible_start + visible_end) * 0.5 : actual;
+    }
+
+    if (requested_hardware_center)
+        *requested_hardware_center = requested;
+    if (actual_hardware_center)
+        *actual_hardware_center = actual;
+    if (dsp_center)
+        *dsp_center = digital;
+}
+
 static void raw_visible_band(double *out_start, double *out_end)
 {
     clamp_visible_to_config();
@@ -3798,7 +4071,7 @@ static double current_second_if_hz(void)
     double start;
     double end;
     single_fft_plan_t plan;
-    double center;
+    double hardware_center;
 
     if (planned_run_mode() != RUN_MODE_SINGLE)
         return 0.0;
@@ -3806,11 +4079,8 @@ static double current_second_if_hz(void)
     if (end <= start)
         return 0.0;
     plan = single_fft_plan_for_span(end - start);
-    center = direct_sampling_enabled() ?
-        direct_source_center_for_visible(start, end, plan.source_span) :
-        single_source_center_for_visible(start, end, plan.source_span);
-    center += configured_frequency_correction_hz(center);
-    return second_if_for_center(start, end, center);
+    single_centers_for_view(start, end, &plan, NULL, &hardware_center, NULL);
+    return second_if_for_center(start, end, hardware_center);
 }
 
 /**
@@ -3823,7 +4093,7 @@ static double current_frequency_correction_hz(void)
     double start;
     double end;
     single_fft_plan_t plan;
-    double center;
+    double requested_center;
 
     if (planned_run_mode() != RUN_MODE_SINGLE || direct_sampling_enabled())
         return 0.0;
@@ -3831,8 +4101,8 @@ static double current_frequency_correction_hz(void)
     if (end <= start)
         return 0.0;
     plan = single_fft_plan_for_span(end - start);
-    center = single_source_center_for_visible(start, end, plan.source_span);
-    return configured_frequency_correction_hz(center);
+    single_centers_for_view(start, end, &plan, &requested_center, NULL, NULL);
+    return configured_frequency_correction_hz(requested_center);
 }
 
 /**
@@ -3854,7 +4124,8 @@ static double current_frequency_model_error_hz(void)
     if (end <= start)
         return 0.0;
     plan = single_fft_plan_for_span(end - start);
-    center = single_source_center_for_visible(start, end, plan.source_span);
+    center = single_source_center_for_visible(start, end,
+                                              plan.hardware_rf_bandwidth);
     receiver_hz = receiver_frequency_from_radio(center);
     return air_error_from_receiver_error(
         center, pluto_rfpll_modeled_error_hz(receiver_hz));
@@ -4118,32 +4389,35 @@ static void update_single_plan_metrics(single_fft_plan_t *plan, double span,
 }
 
 /**
- * single_fft_plan_for_span:
- * Choose the FFT/CIC plan for "single frequency" views.
+ * @brief Choose the FFT/CIC plan for one single-frequency view.
  *
  * Machine-readable contract:
  * - Input `span` is the visible air-frequency width in Hz.
- * - Output `fft_size` and `decim_factor` are powers of two.
+ * - Output `fft_size` is a power of two. `decim_factor` is the smallest
+ *   positive integer that gives every CSS display pixel at least one visible
+ *   source bin while retaining a 5% source-span margin.
  * - `source_span` covers the visible span and usually includes a zero-IF
  *   guard chosen by the hardware profile. At very high zoom, CIC decimation
  *   keeps the raw-bin product exact and zero-IF avoidance becomes best-effort.
- * - `fft_size * decim_factor` follows the Fobos-proven resolution product
+ * - `fft_size * decim_factor` covers the resolution product
  *   `display_bins * hardware_sample_rate / visible_span`.
  * - Hardware sample rate/RF bandwidth are lowered before CIC and every Pluto
  *   RF bandwidth is strictly less than its sample rate.
- * - CIC is introduced only after the product no longer fits in a 65536-point
- *   FFT at the chosen hardware profile.
+ * - FFT size is minimized first; CIC is then the smallest feasible integer.
  *
  * Human note:
- * The old Pluto planner sized single-mode FFTs from display width only, which
- * made narrow views fast but under-resolved. This planner restores the tested
- * Fobos rule while adding Pluto-specific hardware profiles to keep first-line
- * latency bounded.
+ * A 1800-pixel waterfall therefore starts at FFT 2048 rather than growing to
+ * FFT 65536. CIC supplies the remaining frequency resolution at substantially
+ * lower FFT cost.
+ *
+ * @param span Visible air-frequency width in hertz.
+ * @param display_bins Logical CSS waterfall width in pixels/bins.
+ * @return Complete hardware, FFT, CIC, source-span, and cadence plan.
  */
-static single_fft_plan_t single_fft_plan_for_span(double span)
+static single_fft_plan_t single_fft_plan_for_span_and_bins(double span,
+                                                           int display_bins)
 {
     single_fft_plan_t plan;
-    int display_bins = current_display_bins();
     pluto_rf_profile_t profile = single_profile_for_span(span);
     double hardware_sr = profile.samplerate;
     double hardware_bw = profile.rf_bandwidth;
@@ -4189,25 +4463,44 @@ static single_fft_plan_t single_fft_plan_for_span(double span)
         return plan;
     }
 
-    /*
-     * Preserve the Fobos-proven resolution rule: the processed product
-     * FFT_size * decimation must provide enough raw bins for the exact
-     * display-bin reducer. The published SSE row is then reduced to one
-     * processed bin per screen pixel.
-     */
+    /* Minimize FFT work lexicographically: first choose the smallest FFT that
+     * can cover the CSS display width, then the smallest integer CIC factor
+     * that supplies the required product without narrowing the decimated
+     * source below the visible span plus its 5% planning margin. */
     required_product = ceil(((double)display_bins * hardware_sr) / span);
     if (required_product < (double)SINGLE_RAW_FFT_MIN)
         required_product = (double)SINGLE_RAW_FFT_MIN;
 
-    decim = (int)ceil(required_product / (double)SINGLE_FFT_SIZE_MAX);
-    if (decim < 1)
-        decim = 1;
-    decim = clamp_power_of_two_int(decim, 1, SINGLE_DECIM_MAX);
-    while (decim > 1 && (hardware_sr / (double)decim) < span * 1.05)
-        decim >>= 1;
+    fft_size = next_power_of_two_int(
+        display_bins > SINGLE_RAW_FFT_MIN ? display_bins : SINGLE_RAW_FFT_MIN);
+    if (fft_size < SINGLE_RAW_FFT_MIN)
+        fft_size = SINGLE_RAW_FFT_MIN;
+    if (fft_size > SINGLE_FFT_SIZE_MAX)
+        fft_size = SINGLE_FFT_SIZE_MAX;
+    decim = 1;
+    for (;;) {
+        double needed_decim = ceil(required_product / (double)fft_size);
+        double covering_decim = floor(hardware_sr / (span * 1.05));
+        int max_decim;
 
-    fft_size = (int)ceil(required_product / (double)decim);
-    fft_size = clamp_power_of_two_int(fft_size, SINGLE_RAW_FFT_MIN, SINGLE_FFT_SIZE_MAX);
+        if (needed_decim < 1.0)
+            needed_decim = 1.0;
+        if (covering_decim < 1.0)
+            covering_decim = 1.0;
+        max_decim = covering_decim > (double)SINGLE_DECIM_MAX ?
+            SINGLE_DECIM_MAX : (int)covering_decim;
+        if (needed_decim <= (double)max_decim) {
+            decim = (int)needed_decim;
+            break;
+        }
+        if (fft_size >= SINGLE_FFT_SIZE_MAX) {
+            decim = max_decim;
+            break;
+        }
+        fft_size <<= 1;
+        if (fft_size > SINGLE_FFT_SIZE_MAX)
+            fft_size = SINGLE_FFT_SIZE_MAX;
+    }
 
     plan.fft_size = fft_size;
     plan.decim_factor = decim;
@@ -4225,6 +4518,17 @@ static single_fft_plan_t single_fft_plan_for_span(double span)
 
     update_single_plan_metrics(&plan, span, display_bins);
     return plan;
+}
+
+/**
+ * @brief Plan one single-frequency view at the current logical display width.
+ *
+ * @param span Visible air-frequency width in hertz.
+ * @return Complete single-frequency FFT/CIC plan.
+ */
+static single_fft_plan_t single_fft_plan_for_span(double span)
+{
+    return single_fft_plan_for_span_and_bins(span, current_display_bins());
 }
 
 static int single_effective_fft_size_for_span(double span)
@@ -4837,7 +5141,10 @@ static int scan_ctx_apply_fft_config(scan_ctx_t *ctx)
         step_width = ctx->step_width;
         last_width = ctx->last_width;
         if (ctx->single_mode) {
-            single_fft_plan_t plan = single_fft_plan_for_span(ctx->visible_end - ctx->visible_start);
+            single_fft_plan_t plan = single_fft_plan_for_span_and_bins(
+                ctx->visible_end - ctx->visible_start,
+                ctx->display_bins > 0 ? ctx->display_bins :
+                    current_display_bins());
             fft_size = plan.fft_size;
             decim_factor = plan.decim_factor;
             decim_hop = single_decim_hop_for_plan(&plan);
@@ -4942,6 +5249,18 @@ static int scan_ctx_apply_fft_config(scan_ctx_t *ctx)
     }
     ctx->direct_mix_phase = 0.0;
     ctx->direct_mix_inc = 0.0;
+    ctx->single_mix_re = 1.0;
+    ctx->single_mix_im = 0.0;
+    ctx->single_mix_step_re = 1.0;
+    ctx->single_mix_step_im = 0.0;
+    ctx->single_mix_renorm_count = 0;
+    if (!ctx->direct_sampling && decim_factor > 1 &&
+        ctx->raw_samplerate > 0.0 && fabs(ctx->digital_mix_hz) > 1.0e-12) {
+        double inc = 2.0 * M_PI * ctx->digital_mix_hz /
+            ctx->raw_samplerate;
+        ctx->single_mix_step_re = cos(inc);
+        ctx->single_mix_step_im = sin(inc);
+    }
     if (ctx->direct_sampling && decim_factor > 1 &&
         ctx->raw_samplerate > 0.0) {
         ctx->direct_mix_inc = 2.0 * M_PI * ctx->center_freq / ctx->raw_samplerate;
@@ -5135,11 +5454,15 @@ static void advance_decim_frame(scan_ctx_t *ctx)
 
 #if PSEUDO_RANDOM_SAMPLE_SOURCE == SYNTHETIC_TONE_SAMPLE_SOURCE
 /**
- * @brief Measure whether a synthetic bin-centred tone remains Hann-narrow.
+ * @brief Measure whether a synthetic tone remains Hann-narrow.
  *
  * The check runs on unquantized CIC/FFT magnitudes before display reduction.
  * A clean bin-centred complex tone should occupy the Hann main lobe (peak plus
- * its two adjacent bins) with distant leakage below -70 dBc.
+ * its two adjacent bins) with distant leakage below -70 dBc. A hot view change
+ * can place the unchanged physical tone between bins; that valid case keeps
+ * the peak-position and main-lobe-width checks but does not apply the
+ * bin-centred sidelobe threshold. A tone outside the extracted source is
+ * skipped because its expected bin is not part of this FFT product.
  *
  * @param ctx Active synthetic scan context.
  * @param magnitude Shifted FFT magnitudes.
@@ -5159,10 +5482,30 @@ static void synthetic_check_fft_spectrum(scan_ctx_t *ctx,
     double outside_power = 0.0;
     double distant_dbc;
     double outside_dbc;
+    double expected_full_bin;
+    double fractional_bin_offset;
+    int bin_centered;
     int passed;
 
-    if (!ctx || !magnitude || bins <= 0)
+    if (!ctx || !magnitude || bins <= 0 || ctx->samplerate <= 0.0)
         return;
+    shifted_start = (ctx->fft_size - bins) / 2;
+    expected_full_bin = ctx->synthetic_tone_hz *
+        (double)ctx->fft_size / ctx->samplerate +
+        (double)ctx->fft_size * 0.5;
+    fractional_bin_offset = fabs(expected_full_bin - round(expected_full_bin));
+    bin_centered = fractional_bin_offset <= 1.0e-3;
+    expected_peak_bin = (int)llround(expected_full_bin) - shifted_start;
+    if (expected_peak_bin < 0 || expected_peak_bin >= bins) {
+        ctx->synthetic_spectral_skips++;
+        if (ctx->synthetic_spectral_skips <= 8) {
+            fprintf(stderr,
+                    "[TEST] CIC tone spectrum SKIP: decim x%d, tone %.6f Hz is outside %d extracted bins (expected %d)\n",
+                    ctx->decim_factor, ctx->synthetic_tone_hz, bins,
+                    expected_peak_bin);
+        }
+        return;
+    }
     for (int i = 0; i < bins; i++) {
         if (magnitude[i] > peak) {
             peak = magnitude[i];
@@ -5194,23 +5537,20 @@ static void synthetic_check_fft_spectrum(scan_ctx_t *ctx,
     distant_dbc = 20.0 * log10((double)distant / (double)peak + 1.0e-30);
     outside_dbc = 10.0 * log10(outside_power / ((double)peak * (double)peak) +
                                 1.0e-30);
-    shifted_start = (ctx->fft_size - bins) / 2;
-    expected_peak_bin = (int)llround(ctx->synthetic_tone_hz *
-        (double)ctx->fft_size / ctx->samplerate +
-        (double)ctx->fft_size * 0.5) - shifted_start;
     passed = abs(peak_bin - expected_peak_bin) <= 1 && width <= 3 &&
-        distant_dbc <= -70.0;
+        (!bin_centered || distant_dbc <= -70.0);
     ctx->synthetic_spectral_checks++;
     if (!passed)
         ctx->synthetic_spectral_failures++;
 
     if (ctx->synthetic_spectral_checks <= 8 || !passed) {
         fprintf(stderr,
-                "[TEST] CIC tone spectrum %s: frame %llu, decim x%d, tone %.6f Hz, peak %.9g at bin %d (expected %d), -6 dB width %d bins, distant %.2f dBc, outside-main-lobe energy %.2f dBc\n",
+                "[TEST] CIC tone spectrum %s: frame %llu, decim x%d, tone %.6f Hz, bin offset %.3f, peak %.9g at bin %d (expected %d), -6 dB width %d bins, distant %.2f dBc, outside-main-lobe energy %.2f dBc\n",
                 passed ? "PASS" : "ERROR",
                 (unsigned long long)ctx->synthetic_spectral_checks,
-                ctx->decim_factor, ctx->synthetic_tone_hz, peak, peak_bin,
-                expected_peak_bin, width, distant_dbc, outside_dbc);
+                ctx->decim_factor, ctx->synthetic_tone_hz,
+                fractional_bin_offset, peak, peak_bin, expected_peak_bin,
+                width, distant_dbc, outside_dbc);
     }
 }
 #endif
@@ -5370,6 +5710,13 @@ static int cic_decimated_fft_magnitude(scan_ctx_t *ctx, float *buf,
             } else {
                 int ok = fft_magnitude_from_accum(ctx, bins_per_step, out);
                 if (ok > 0) {
+                    uint64_t frame_samples = (uint64_t)ctx->fft_size *
+                        (uint64_t)ctx->decim_factor;
+                    ctx->last_frame_sample_end = ctx->dsp_sample_origin +
+                        ctx->cic_raw_samples_in;
+                    ctx->last_frame_sample_start =
+                        ctx->last_frame_sample_end >= frame_samples ?
+                        ctx->last_frame_sample_end - frame_samples : 0;
                     produced++;
                     complete_processed_channel(ctx, 0);
                 }
@@ -5420,6 +5767,62 @@ static void prepare_direct_sampling_samples(scan_ctx_t *ctx, float *buf, uint32_
             buf[2*i + 1] = 0.0f;
         }
     }
+}
+
+/**
+ * @brief Mix one physical Pluto stream to the narrow CIC/FFT source center.
+ *
+ * A recursive double-precision oscillator avoids one trigonometric evaluation
+ * per raw sample. Renormalization bounds long-run magnitude drift. Input and
+ * output are interleaved normalized complex I/Q samples.
+ *
+ * @param ctx Active single-frequency DSP context.
+ * @param buf Mutable interleaved complex samples.
+ * @param buf_len Number of complex samples.
+ */
+static void prepare_single_mixed_samples(scan_ctx_t *ctx, float *buf,
+                                         uint32_t buf_len)
+{
+    double osc_re;
+    double osc_im;
+    double step_re;
+    double step_im;
+    uint32_t renorm_count;
+
+    if (!ctx || !buf || buf_len == 0 || ctx->direct_sampling ||
+        ctx->decim_factor <= 1 || fabs(ctx->digital_mix_hz) <= 1.0e-12)
+        return;
+
+    osc_re = ctx->single_mix_re;
+    osc_im = ctx->single_mix_im;
+    step_re = ctx->single_mix_step_re;
+    step_im = ctx->single_mix_step_im;
+    renorm_count = ctx->single_mix_renorm_count;
+    for (uint32_t i = 0; i < buf_len; i++) {
+        double in_re = buf[2U * i];
+        double in_im = buf[2U * i + 1U];
+        double next_re;
+        double next_im;
+
+        buf[2U * i] = (float)(in_re * osc_re - in_im * osc_im);
+        buf[2U * i + 1U] = (float)(in_re * osc_im + in_im * osc_re);
+        next_re = osc_re * step_re - osc_im * step_im;
+        next_im = osc_re * step_im + osc_im * step_re;
+        osc_re = next_re;
+        osc_im = next_im;
+        renorm_count++;
+        if (renorm_count >= 4096U) {
+            double magnitude = hypot(osc_re, osc_im);
+            if (magnitude > 0.0) {
+                osc_re /= magnitude;
+                osc_im /= magnitude;
+            }
+            renorm_count = 0;
+        }
+    }
+    ctx->single_mix_re = osc_re;
+    ctx->single_mix_im = osc_im;
+    ctx->single_mix_renorm_count = renorm_count;
 }
 
 /**
@@ -5610,7 +6013,8 @@ static void base64_encode_u8(const uint8_t *src, size_t len, char *dst)
 static void publish_scan_line(scan_ctx_t *ctx)
 {
     int source_bins = ctx->line_bins;
-    int display_bins = current_display_bins();
+    int display_bins = ctx->display_bins > 0 ? ctx->display_bins :
+        current_display_bins();
     double source_span = ctx->scan_end - ctx->scan_start;
     double visible_span = ctx->visible_end - ctx->visible_start;
     uint8_t *line_packed;
@@ -5634,6 +6038,12 @@ static void publish_scan_line(scan_ctx_t *ctx)
         "\"visible_start_hz\":" JSON_COORD_FMT ",\"visible_end_hz\":" JSON_COORD_FMT ","
         "\"second_if_hz\":" JSON_COORD_FMT ",\"zero_if_guard_hz\":" JSON_COORD_FMT ","
         "\"fq_err_correction_hz\":%.9f,"
+        "\"physical_center_hz\":" JSON_COORD_FMT ","
+        "\"dsp_center_hz\":" JSON_COORD_FMT ","
+        "\"digital_mix_hz\":%.9f,"
+        "\"capture_epoch\":%llu,\"frame_sample_start\":%llu,"
+        "\"frame_sample_end\":%llu,\"hot_replan_count\":%llu,"
+        "\"hot_replan_failures\":%llu,"
         "\"raw_peak_hz\":%.9f,"
         "\"live_capture_age_ms\":%lld,"
         "\"live_first_input_ms\":%lld,\"live_first_fft_ms\":%lld,"
@@ -5708,6 +6118,12 @@ static void publish_scan_line(scan_ctx_t *ctx)
         ctx->visible_start, ctx->visible_end,
         ctx->second_if_hz, ctx->zero_if_guard_hz,
         ctx->frequency_correction_hz,
+        ctx->hardware_center_freq, ctx->center_freq, ctx->digital_mix_hz,
+        (unsigned long long)ctx->capture_epoch,
+        (unsigned long long)ctx->last_frame_sample_start,
+        (unsigned long long)ctx->last_frame_sample_end,
+        (unsigned long long)ctx->hot_replan_count,
+        (unsigned long long)ctx->hot_replan_failures,
         raw_peak_hz, live_capture_age_ms, live_first_input_ms,
         live_first_fft_ms, live_first_publish_ms,
         display_bins, display_bins, display_bins, source_bins, ctx->fft_size,
@@ -5741,6 +6157,12 @@ static void publish_scan_line(scan_ctx_t *ctx)
         ctx->visible_start, ctx->visible_end,
         ctx->second_if_hz, ctx->zero_if_guard_hz,
         ctx->frequency_correction_hz,
+        ctx->hardware_center_freq, ctx->center_freq, ctx->digital_mix_hz,
+        (unsigned long long)ctx->capture_epoch,
+        (unsigned long long)ctx->last_frame_sample_start,
+        (unsigned long long)ctx->last_frame_sample_end,
+        (unsigned long long)ctx->hot_replan_count,
+        (unsigned long long)ctx->hot_replan_failures,
         raw_peak_hz, live_capture_age_ms, live_first_input_ms,
         live_first_fft_ms, live_first_publish_ms,
         display_bins, display_bins, display_bins, source_bins, ctx->fft_size,
@@ -5831,6 +6253,17 @@ static int publish_clock_should_keep(scan_ctx_t *ctx)
         return 1;
     if (ctx->preview_mode)
         return 1;
+    if (ctx->hot_replan_catchup && ctx->line_interval_ms > 0.0) {
+        now = now_msec();
+        if (ctx->last_publish_msec > 0 &&
+            (double)(now - ctx->last_publish_msec) <
+                ctx->line_interval_ms) {
+            ctx->rate_output_dropped++;
+            return 0;
+        }
+        ctx->last_publish_msec = now;
+        return 1;
+    }
     limit_lps = normalize_rate_limit_lps(ctx->rate_limit_lps);
     if (!ctx->single_mode || ctx->estimated_line_rate <= (double)limit_lps)
         return 1;
@@ -5955,6 +6388,8 @@ static void process_scan_buffer(scan_ctx_t *ctx, float *buf, uint32_t buf_len,
 
     if (ctx->direct_sampling)
         prepare_direct_sampling_samples(ctx, buf, buf_len);
+    else
+        prepare_single_mixed_samples(ctx, buf, buf_len);
 
     channel_bins = (channel == ctx->total_steps - 1) ? ctx->last_bins : ctx->bins_per_step;
     slot = ctx->line_buf + (size_t)channel * ctx->bins_per_step;
@@ -6132,17 +6567,26 @@ static void scan_queue_push(scan_ctx_t *ctx, int channel, float *buf,
                             uint64_t sample_index_end)
 {
     sample_queue_item_t *item;
-    int require_contiguous = scan_queue_requires_contiguous_samples(ctx);
+    int require_contiguous;
     uint64_t block_sequence;
 
     if (buf_len > (uint32_t)ctx->async_buf_len)
         buf_len = (uint32_t)ctx->async_buf_len;
 
     pthread_mutex_lock(&ctx->queue_mutex);
+    if (ctx->hot_capture_only) {
+        pthread_mutex_unlock(&ctx->queue_mutex);
+        return;
+    }
+    require_contiguous = scan_queue_requires_contiguous_samples(ctx);
     while (ctx->queue_len >= PROCESS_QUEUE_LEN && require_contiguous &&
-           !ctx->worker_stop && g_scanning) {
+           !ctx->hot_capture_only && !ctx->worker_stop && g_scanning) {
         ctx->cic_queue_waits++;
         pthread_cond_wait(&ctx->queue_cond, &ctx->queue_mutex);
+    }
+    if (ctx->hot_capture_only) {
+        pthread_mutex_unlock(&ctx->queue_mutex);
+        return;
     }
     if (ctx->queue_len >= PROCESS_QUEUE_LEN) {
         if (!require_contiguous)
@@ -6158,13 +6602,7 @@ static void scan_queue_push(scan_ctx_t *ctx, int channel, float *buf,
     item = &ctx->queue[ctx->queue_tail];
     item->ready = 0;
     block_sequence = ctx->capture_block_sequence++;
-    ctx->queue_tail = (ctx->queue_tail + 1) % PROCESS_QUEUE_LEN;
-    ctx->queue_len++;
-    pthread_mutex_unlock(&ctx->queue_mutex);
-
     memcpy(item->samples, buf, (size_t)buf_len * 2 * sizeof(float));
-
-    pthread_mutex_lock(&ctx->queue_mutex);
     item->buf_len = buf_len;
     item->channel = channel;
     item->flags = flags;
@@ -6172,6 +6610,8 @@ static void scan_queue_push(scan_ctx_t *ctx, int channel, float *buf,
     item->sample_index_start = sample_index_start;
     item->sample_index_end = sample_index_end;
     item->ready = 1;
+    ctx->queue_tail = (ctx->queue_tail + 1) % PROCESS_QUEUE_LEN;
+    ctx->queue_len++;
     pthread_cond_signal(&ctx->queue_cond);
     pthread_mutex_unlock(&ctx->queue_mutex);
 }
@@ -6222,6 +6662,285 @@ static void scan_queue_check_cic_sequence(scan_ctx_t *ctx,
     ctx->worker_sequence_initialized = 1;
 }
 
+/**
+ * @brief Test whether the active worker has a queued DSP replan.
+ *
+ * @param ctx Candidate active scan context.
+ * @return Nonzero when a request is pending for this exact context.
+ */
+static int hot_replan_pending_for(const scan_ctx_t *ctx)
+{
+    int pending;
+    pthread_mutex_lock(&g_hot_replan_mutex);
+    pending = g_hot_active_ctx == ctx && g_hot_replan_request.pending;
+    pthread_mutex_unlock(&g_hot_replan_mutex);
+    return pending;
+}
+
+/**
+ * @brief Atomically remove the pending DSP replan for one worker.
+ *
+ * @param ctx Candidate active scan context.
+ * @param request Destination for the accepted request.
+ * @return Nonzero when a request was copied and removed.
+ */
+static int hot_replan_take(scan_ctx_t *ctx, hot_replan_request_t *request)
+{
+    int found = 0;
+    pthread_mutex_lock(&g_hot_replan_mutex);
+    if (g_hot_active_ctx == ctx && g_hot_replan_request.pending) {
+        *request = g_hot_replan_request;
+        g_hot_replan_request.pending = 0;
+        found = 1;
+    }
+    pthread_mutex_unlock(&g_hot_replan_mutex);
+    return found;
+}
+
+/**
+ * @brief Drop queued old-generation buffers while `queue_mutex` is held.
+ *
+ * @param ctx Active scan context whose worker queue is being reset.
+ */
+static void scan_queue_clear_for_hot_replan_locked(scan_ctx_t *ctx)
+{
+    for (int i = 0; i < PROCESS_QUEUE_LEN; i++)
+        ctx->queue[i].ready = 0;
+    ctx->queue_head = 0;
+    ctx->queue_tail = 0;
+    ctx->queue_len = 0;
+    ctx->worker_sequence_initialized = 0;
+    pthread_cond_broadcast(&ctx->queue_cond);
+}
+
+#if PSEUDO_RANDOM_SAMPLE_SOURCE == SYNTHETIC_TONE_SAMPLE_SOURCE
+/**
+ * @brief Return capture-only state synchronized with queue insertion.
+ *
+ * @param ctx Active synthetic scan context.
+ * @return Nonzero while callbacks must append history without queuing work.
+ */
+static int scan_queue_hot_capture_only(scan_ctx_t *ctx)
+{
+    int capture_only;
+
+    pthread_mutex_lock(&ctx->queue_mutex);
+    capture_only = ctx->hot_capture_only;
+    pthread_mutex_unlock(&ctx->queue_mutex);
+    return capture_only;
+}
+#endif
+
+/**
+ * @brief Recompute cadence fields after a worker-owned DSP generation change.
+ *
+ * @param ctx Active scan context with its new FFT/CIC fields installed.
+ */
+static void scan_ctx_refresh_line_plan(scan_ctx_t *ctx)
+{
+    double published_rate;
+
+    ctx->line_sample_count = ctx->decim_factor > 1 ?
+        decim_raw_sample_count_for_hop(ctx->decim_hop,
+                                       ctx->decim_factor) :
+        (uint32_t)ctx->fft_size;
+    ctx->rate_limit_lps = normalize_rate_limit_lps(g_rate_limit_lps);
+    ctx->rate_drop_factor = rate_drop_factor_for_plan(
+        ctx->raw_samplerate, ctx->line_sample_count, ctx->total_steps,
+        ctx->decim_factor, ctx->rate_limit_lps,
+        &ctx->estimated_line_rate);
+    ctx->rate_keep_ratio = rate_keep_ratio_for_line_rate(
+        ctx->estimated_line_rate, ctx->rate_limit_lps, ctx->single_mode);
+    ctx->rate_keep_credit = 1.0;
+    published_rate = ctx_published_line_rate(ctx);
+    ctx->line_interval_ms = published_rate > 0.0 ?
+        1000.0 / published_rate : 0.0;
+    if (ctx->line_interval_ms > 0.0 && ctx->line_interval_ms < 10.0)
+        ctx->line_interval_ms = 10.0;
+}
+
+/**
+ * @brief Warm and install one compatible CIC/FFT generation from raw history.
+ *
+ * Capture callbacks remain active and append every sample to the indexed raw
+ * ring while queue insertion is suspended. The new generation processes one
+ * historical frame ending at `handoff_index`, then consumes every following
+ * cached sample and atomically resumes queued processing at the same index.
+ *
+ * @param ctx Active worker-owned single-frequency scan context.
+ * @return Nonzero when a pending request was consumed, including fallback on
+ *         an allocation/history failure; zero when no request was pending.
+ */
+static int scan_worker_apply_hot_replan(scan_ctx_t *ctx)
+{
+    hot_replan_request_t request;
+    single_fft_plan_t plan;
+    uint64_t handoff_index;
+    uint64_t cache_generation;
+    uint64_t needed_raw;
+    uint64_t cursor;
+    float *history = NULL;
+    float *scratch = NULL;
+    long long preview_age_ms = 0;
+    int success = 0;
+#if PSEUDO_RANDOM_SAMPLE_SOURCE == SYNTHETIC_TONE_SAMPLE_SOURCE
+    double synthetic_raw_tone_hz = 0.0;
+#endif
+
+    if (!hot_replan_take(ctx, &request))
+        return 0;
+
+    plan = single_fft_plan_for_span_and_bins(
+        request.visible_end - request.visible_start, request.display_bins);
+#if PSEUDO_RANDOM_SAMPLE_SOURCE == SYNTHETIC_TONE_SAMPLE_SOURCE
+    synthetic_raw_tone_hz = ctx->synthetic_tone_hz - ctx->digital_mix_hz;
+#endif
+    needed_raw = ((uint64_t)plan.fft_size + CIC_STAGES) *
+        (uint64_t)plan.decim_factor;
+    if (needed_raw == 0 || needed_raw > UINT32_MAX ||
+        needed_raw > CACHED_HISTORY_MAX_SAMPLES) {
+        ctx->hot_replan_failures++;
+        return 1;
+    }
+
+    /* Lock history before the queue everywhere this pair is needed. This
+     * makes sample classification, the handoff cursor, and removal of queued
+     * old-generation buffers one indivisible capture boundary. */
+    pthread_mutex_lock(&g_recent_samples_mutex);
+    pthread_mutex_lock(&ctx->queue_mutex);
+    ctx->hot_capture_only = 1;
+    handoff_index = g_recent_samples.next_sample_index;
+    cache_generation = g_recent_samples.continuity_generation;
+    scan_queue_clear_for_hot_replan_locked(ctx);
+    pthread_mutex_unlock(&ctx->queue_mutex);
+    pthread_mutex_unlock(&g_recent_samples_mutex);
+
+    ctx->display_bins = request.display_bins;
+    ctx->configured_start = g_freq_start;
+    ctx->configured_end = g_freq_end;
+    ctx->visible_start = request.visible_start;
+    ctx->visible_end = request.visible_end;
+    ctx->view_id = request.view_id;
+    ctx->center_freq = (request.visible_start + request.visible_end) * 0.5;
+    ctx->digital_mix_hz = ctx->hardware_center_freq - ctx->center_freq;
+#if PSEUDO_RANDOM_SAMPLE_SOURCE == SYNTHETIC_TONE_SAMPLE_SOURCE
+    ctx->synthetic_tone_hz = synthetic_raw_tone_hz + ctx->digital_mix_hz;
+#endif
+    ctx->scan_start = ctx->center_freq - plan.source_span * 0.5;
+    ctx->scan_end = ctx->center_freq + plan.source_span * 0.5;
+    ctx->step_width = plan.source_span;
+    ctx->last_width = plan.source_span;
+    ctx->second_if_hz = second_if_for_center(
+        request.visible_start, request.visible_end,
+        ctx->hardware_center_freq);
+
+    if (scan_ctx_apply_fft_config(ctx) != 0) {
+        fprintf(stderr, "[SDR] Hot replan %llu failed to allocate DSP state\n",
+                (unsigned long long)request.serial);
+        goto finish;
+    }
+    scan_ctx_refresh_line_plan(ctx);
+    history = recent_sample_cache_snapshot_at(
+        ctx, g_hot_active_rf_bandwidth, handoff_index,
+        (uint32_t)needed_raw, &preview_age_ms, &cache_generation);
+    if (!history) {
+        fprintf(stderr,
+                "[SDR] Hot replan %llu has no complete indexed history; continuing with a cold live fill\n",
+                (unsigned long long)request.serial);
+        goto finish;
+    }
+
+    ctx->preview_mode = 1;
+    ctx->preview_age_ms = preview_age_ms;
+    ctx->preview_sequence = 1;
+    ctx->preview_count = 1;
+    ctx->preview_interval_ms = ctx->line_interval_ms;
+    ctx->capture_epoch = cache_generation;
+    ctx->dsp_sample_origin = handoff_index - needed_raw;
+    process_scan_buffer(ctx, history, (uint32_t)needed_raw, 0, 0);
+    ctx->preview_mode = 0;
+    ctx->preview_age_ms = 0;
+    ctx->preview_sequence = 0;
+    ctx->preview_count = 0;
+    ctx->last_publish_msec = now_msec();
+    ctx->hot_replan_catchup = 1;
+    free(history);
+    history = NULL;
+
+    scratch = malloc((size_t)ctx->async_buf_len * 2U * sizeof(float));
+    if (!scratch)
+        goto finish;
+    cursor = handoff_index;
+    while (g_scanning) {
+        uint64_t available;
+        uint32_t chunk;
+
+        pthread_mutex_lock(&g_recent_samples_mutex);
+        if (g_recent_samples.continuity_generation != cache_generation ||
+            cursor < g_recent_samples.first_sample_index ||
+            cursor > g_recent_samples.next_sample_index) {
+            pthread_mutex_unlock(&g_recent_samples_mutex);
+            fprintf(stderr,
+                    "[SDR] Hot replan %llu lost indexed history during catch-up\n",
+                    (unsigned long long)request.serial);
+            goto finish;
+        }
+        available = g_recent_samples.next_sample_index - cursor;
+        if (available == 0) {
+            /* No callback can append between this boundary and clearing the
+             * cache-only flag. Clear old queue entries once more so the first
+             * resumed item starts exactly at `cursor`. */
+            pthread_mutex_lock(&ctx->queue_mutex);
+            scan_queue_clear_for_hot_replan_locked(ctx);
+            ctx->hot_capture_only = 0;
+            pthread_mutex_unlock(&ctx->queue_mutex);
+            pthread_mutex_unlock(&g_recent_samples_mutex);
+            success = 1;
+            break;
+        }
+        pthread_mutex_unlock(&g_recent_samples_mutex);
+
+        chunk = available > (uint64_t)ctx->async_buf_len ?
+            (uint32_t)ctx->async_buf_len : (uint32_t)available;
+        if (recent_sample_cache_copy_range(cursor, chunk,
+                                           cache_generation, scratch) != 0)
+            goto finish;
+        process_scan_buffer(ctx, scratch, chunk, 0, 0);
+        cursor += (uint64_t)chunk;
+    }
+
+finish:
+    free(history);
+    free(scratch);
+    ctx->hot_replan_catchup = 0;
+    if (!success) {
+        pthread_mutex_lock(&g_recent_samples_mutex);
+        pthread_mutex_lock(&ctx->queue_mutex);
+        scan_queue_clear_for_hot_replan_locked(ctx);
+        ctx->hot_capture_only = 0;
+        pthread_mutex_unlock(&ctx->queue_mutex);
+        pthread_mutex_unlock(&g_recent_samples_mutex);
+        if (ctx->decim_factor > 1)
+            cic_reset_state(ctx, 1);
+        ctx->hot_replan_failures++;
+    } else {
+        pthread_mutex_lock(&g_hot_replan_mutex);
+        if (g_hot_active_ctx == ctx) {
+            g_hot_active_dsp_start = ctx->scan_start;
+            g_hot_active_dsp_end = ctx->scan_end;
+        }
+        pthread_mutex_unlock(&g_hot_replan_mutex);
+        ctx->hot_replan_count++;
+        fprintf(stderr,
+                "[SDR] Hot replan %llu complete: view %u, handoff sample %llu, fft %d, decim %d, hop %d, first row %lld ms\n",
+                (unsigned long long)request.serial, request.view_id,
+                (unsigned long long)handoff_index, ctx->fft_size,
+                ctx->decim_factor, ctx->decim_hop,
+                now_msec() - request.requested_msec);
+    }
+    return 1;
+}
+
 static void *scan_worker_thread(void *arg)
 {
     scan_ctx_t *ctx = (scan_ctx_t *)arg;
@@ -6229,13 +6948,22 @@ static void *scan_worker_thread(void *arg)
     for (;;) {
         sample_queue_item_t *item;
 
+        if (scan_worker_apply_hot_replan(ctx))
+            continue;
+
         pthread_mutex_lock(&ctx->queue_mutex);
         while (ctx->queue_len == 0 || !ctx->queue[ctx->queue_head].ready) {
             if (ctx->worker_stop) {
                 pthread_mutex_unlock(&ctx->queue_mutex);
                 return NULL;
             }
+            if (hot_replan_pending_for(ctx))
+                break;
             pthread_cond_wait(&ctx->queue_cond, &ctx->queue_mutex);
+        }
+        if (hot_replan_pending_for(ctx)) {
+            pthread_mutex_unlock(&ctx->queue_mutex);
+            continue;
         }
         item = &ctx->queue[ctx->queue_head];
         pthread_mutex_unlock(&ctx->queue_mutex);
@@ -6316,15 +7044,17 @@ static void scan_callback(float *buf, uint32_t buf_len, uint32_t refill_flags,
     if (ctx->single_mode && ctx->decim_factor > 1 &&
         buf_len != (uint32_t)ctx->async_buf_len)
         refill_flags |= PLUTO_REFILL_FLAG_SHORT_READ;
-    recent_sample_cache_append(ctx, buf, buf_len, refill_flags);
+    sample_index_start = ctx->capture_sample_next;
+    sample_index_end = sample_index_start + (uint64_t)buf_len;
+    ctx->capture_sample_next = sample_index_end;
+    if (recent_sample_cache_append(ctx, buf, buf_len, refill_flags,
+                                   sample_index_start, sample_index_end))
+        return;
     if (!scan_callback_should_process(ctx, channel))
         return;
 
     flags = refill_flags | ctx->pending_refill_flags;
     ctx->pending_refill_flags = 0;
-    sample_index_start = ctx->capture_sample_next;
-    sample_index_end = sample_index_start + (uint64_t)buf_len;
-    ctx->capture_sample_next = sample_index_end;
     scan_queue_push(ctx, channel, buf, buf_len, flags,
                     sample_index_start, sample_index_end);
 }
@@ -6457,10 +7187,12 @@ static int run_pseudo_random_sample_source(scan_ctx_t *ctx, uint32_t async_len)
         double bin_hz = ctx->samplerate / (double)ctx->fft_size;
         double visible_center = (ctx->visible_start + ctx->visible_end) * 0.5;
         double target_hz = visible_center - ctx->center_freq;
+        double raw_tone_hz;
 
         ctx->synthetic_tone_hz = bin_hz > 0.0 ? round(target_hz / bin_hz) * bin_hz : 0.0;
+        raw_tone_hz = ctx->synthetic_tone_hz - ctx->digital_mix_hz;
         tone_state.phase_increment = ctx->raw_samplerate > 0.0 ?
-            2.0 * M_PI * ctx->synthetic_tone_hz / ctx->raw_samplerate : 0.0;
+            2.0 * M_PI * raw_tone_hz / ctx->raw_samplerate : 0.0;
         tone_state.fault_period = synthetic_env_u64("PLUTO_SYNTHETIC_FAULT_PERIOD");
         if (fault && strcmp(fault, "skip") == 0)
             tone_state.fault_kind = 1;
@@ -6468,8 +7200,8 @@ static int run_pseudo_random_sample_source(scan_ctx_t *ctx, uint32_t async_len)
             tone_state.fault_kind = 2;
         if (tone_state.fault_kind == 0)
             tone_state.fault_period = 0;
-        printf("[TEST] Synthetic complex tone running: %.6f Hz, %u samples/buffer, fault %s every %llu samples\n",
-               ctx->synthetic_tone_hz, async_len,
+        printf("[TEST] Synthetic complex tone running: raw %.6f Hz, mixed %.6f Hz, %u samples/buffer, fault %s every %llu samples\n",
+               raw_tone_hz, ctx->synthetic_tone_hz, async_len,
                tone_state.fault_kind == 1 ? "skip" :
                (tone_state.fault_kind == 2 ? "duplicate" : "none"),
                (unsigned long long)tone_state.fault_period);
@@ -6499,9 +7231,10 @@ static int run_pseudo_random_sample_source(scan_ctx_t *ctx, uint32_t async_len)
             ctx->live_first_input_msec == 0)
             ctx->live_first_input_msec = ctx->last_callback_msec;
 
-        recent_sample_cache_append(ctx, buf, async_len, 0);
-
-        if (scan_callback_should_process(ctx, current_channel))
+        if (!recent_sample_cache_append(ctx, buf, async_len, 0,
+                                        sample_index_start,
+                                        sample_index_end) &&
+            scan_callback_should_process(ctx, current_channel))
             scan_queue_push(ctx, current_channel, buf, async_len, 0,
                             sample_index_start, sample_index_end);
 
@@ -6512,7 +7245,7 @@ static int run_pseudo_random_sample_source(scan_ctx_t *ctx, uint32_t async_len)
         }
 
 #if PSEUDO_RANDOM_SAMPLE_SOURCE == SYNTHETIC_TONE_SAMPLE_SOURCE
-        if (realtime)
+        if (realtime || scan_queue_hot_capture_only(ctx))
             sleep_for_sample_count(async_len, ctx->raw_samplerate);
 #else
         sleep_for_sample_count(async_len, g_samplerate);
@@ -6580,6 +7313,9 @@ static void *scan_thread_func(void *arg)
     long long preview_age_ms = 0;
     double preview_first_line_ms = 0.0;
     double frequency_correction_hz = 0.0;
+    double hardware_requested_center = 0.0;
+    double hardware_actual_center = 0.0;
+    double dsp_center = 0.0;
 
     mode = planned_run_mode();
     g_active_mode = mode;
@@ -6589,28 +7325,23 @@ static void *scan_thread_func(void *arg)
     if (mode == RUN_MODE_SINGLE) {
         double visible_start;
         double visible_end;
-        double center;
-
         raw_visible_band(&visible_start, &visible_end);
         if (visible_end <= visible_start) {
             g_scanning = 0;
             return NULL;
         }
         single_plan = single_fft_plan_for_span(visible_end - visible_start);
-        center = direct_sampling_enabled() ?
-            direct_source_center_for_visible(visible_start, visible_end,
-                                             single_plan.source_span) :
-            single_source_center_for_visible(visible_start, visible_end,
-                                             single_plan.source_span);
-        frequency_correction_hz = direct_sampling_enabled() ? 0.0 :
-            configured_frequency_correction_hz(center);
+        single_centers_for_view(visible_start, visible_end, &single_plan,
+                                &hardware_requested_center,
+                                &hardware_actual_center, &dsp_center);
+        frequency_correction_hz = hardware_actual_center -
+            hardware_requested_center;
         total_steps = 1;
         step = single_plan.source_span;
-        scan_start = center + frequency_correction_hz -
-            single_plan.source_span * 0.5;
-        scan_end = center + frequency_correction_hz +
-            single_plan.source_span * 0.5;
-        device_center = direct_sampling_enabled() ? 0.0 : receiver_frequency_from_radio(center);
+        scan_start = dsp_center - single_plan.source_span * 0.5;
+        scan_end = dsp_center + single_plan.source_span * 0.5;
+        device_center = direct_sampling_enabled() ? 0.0 :
+            receiver_frequency_from_radio(hardware_requested_center);
         if (!direct_sampling_enabled() && !receiver_frequency_valid(device_center)) {
             fprintf(stderr, "[SDR] Converter frequency puts receiver center outside %lld - %lld Hz (%s)\n",
                     g_receiver_min_hz, g_receiver_max_hz,
@@ -6639,6 +7370,7 @@ static void *scan_thread_func(void *arg)
 
     memset(&ctx, 0, sizeof(ctx));
     ctx.total_steps = total_steps;
+    ctx.display_bins = current_display_bins();
     ctx.single_mode = (mode == RUN_MODE_SINGLE);
     ctx.raw_samplerate = ctx.single_mode ? single_plan.hardware_samplerate : g_samplerate;
     ctx.samplerate = ctx.single_mode ? single_plan.fft_samplerate : g_samplerate;
@@ -6654,10 +7386,18 @@ static void *scan_thread_func(void *arg)
     ctx.scan_end = ctx.single_mode ? scan_end :
         build_scan_effective_end_for_band(scan_start, scan_end, total_steps, step);
     ctx.center_freq = (scan_start + scan_end) * 0.5;
+    ctx.hardware_requested_center_freq = ctx.single_mode ?
+        hardware_requested_center : ctx.center_freq;
+    ctx.hardware_center_freq = ctx.single_mode ?
+        hardware_actual_center : ctx.center_freq;
+    ctx.digital_mix_hz = ctx.single_mode && !direct_sampling_enabled() &&
+        single_plan.decim_factor > 1 ?
+        ctx.hardware_center_freq - ctx.center_freq : 0.0;
     ctx.frequency_correction_hz = frequency_correction_hz;
     ctx.zero_if_guard_hz = ctx.single_mode ? single_plan.zero_if_guard_hz : 0.0;
     ctx.second_if_hz = ctx.single_mode ?
-        second_if_for_center(ctx.visible_start, ctx.visible_end, ctx.center_freq) : 0.0;
+        second_if_for_center(ctx.visible_start, ctx.visible_end,
+                             ctx.hardware_center_freq) : 0.0;
     ctx.view_id = g_view_id;
     ctx.direct_sampling = normalize_direct_sampling(g_direct_sampling);
 
@@ -6724,7 +7464,7 @@ static void *scan_thread_func(void *arg)
             }
             needed_raw = needed_decimated * (uint64_t)ctx.decim_factor;
             if (needed_raw > UINT32_MAX ||
-                needed_raw > CACHED_PREVIEW_MAX_SAMPLES)
+                needed_raw > CACHED_HISTORY_MAX_SAMPLES)
                 continue;
             preview_sample_count = (uint32_t)needed_raw;
             preview_samples = recent_sample_cache_snapshot(
@@ -6741,9 +7481,9 @@ static void *scan_thread_func(void *arg)
                     ctx.view_id);
         }
         recent_sample_cache_begin(
-            ctx.center_freq,
-            ctx.center_freq - single_plan.hardware_rf_bandwidth * 0.5,
-            ctx.center_freq + single_plan.hardware_rf_bandwidth * 0.5,
+            ctx.hardware_center_freq,
+            ctx.hardware_center_freq - single_plan.hardware_rf_bandwidth * 0.5,
+            ctx.hardware_center_freq + single_plan.hardware_rf_bandwidth * 0.5,
             ctx.raw_samplerate, single_plan.hardware_rf_bandwidth);
         if (preview_samples) {
             /* Distribute every cached row across the predicted fresh live
@@ -6808,6 +7548,8 @@ static void *scan_thread_func(void *arg)
         return NULL;
     }
     worker_started = 1;
+    if (ctx.single_mode && ctx.decim_factor > 1 && !ctx.direct_sampling)
+        hot_replan_register_stream(&ctx, single_plan.hardware_rf_bandwidth);
 
 #if !PSEUDO_RANDOM_SAMPLE_SOURCE
     ret = pluto_sdr_set_samplerate(g_dev, ctx.raw_samplerate);
@@ -6853,9 +7595,10 @@ static void *scan_thread_func(void *arg)
                    async_len, line_sample_count, kernel_buffers,
                    ctx.estimated_line_rate, ctx.rate_limit_lps, ctx.rate_drop_factor);
         } else {
-            printf("[SDR] Single stream: visible %.0f - %.0f Hz, source %.0f - %.0f Hz, second IF %.0f Hz, converter %.0f Hz, SDR center %.0f Hz, receiver %lld - %lld Hz %s, SR %.0f Hz, RF BW %.0f Hz, fft %d effective %d, decim %d, hop %d, overlap %.2f, async %u, line samples %u, kernel buffers %u, %.1f lines/s raw, min %u, limit %u, drop %d\n",
+            printf("[SDR] Single stream: visible %.0f - %.0f Hz, source %.0f - %.0f Hz, second IF %.0f Hz, digital mix %.6f Hz, converter %.0f Hz, SDR center %.0f Hz, receiver %lld - %lld Hz %s, SR %.0f Hz, RF BW %.0f Hz, fft %d effective %d, decim %d, hop %d, overlap %.2f, async %u, line samples %u, kernel buffers %u, %.1f lines/s raw, min %u, limit %u, drop %d\n",
                    ctx.visible_start, ctx.visible_end,
-                   ctx.scan_start, ctx.scan_end, ctx.second_if_hz, g_converter_freq,
+                   ctx.scan_start, ctx.scan_end, ctx.second_if_hz,
+                   ctx.digital_mix_hz, g_converter_freq,
                    device_center, g_receiver_min_hz, g_receiver_max_hz,
                    g_receiver_range_source,
                    ctx.raw_samplerate, single_plan.hardware_rf_bandwidth,
@@ -6941,6 +7684,7 @@ static void *scan_thread_func(void *arg)
         pluto_sdr_stop_scan(g_dev);
 #endif
     }
+    hot_replan_unregister_stream(&ctx);
     if (worker_started) {
         scan_queue_stop(&ctx);
         pthread_join(ctx.worker_thread, NULL);
@@ -6985,6 +7729,11 @@ static void *scan_thread_func(void *arg)
                 (unsigned long long)ctx.synthetic_spectral_checks,
                 (unsigned long long)ctx.synthetic_spectral_failures,
                 (unsigned long long)ctx.cic_sample_order_errors);
+    }
+    if (ctx.synthetic_spectral_skips > 0) {
+        fprintf(stderr,
+                "[TEST] CIC tone checks skipped outside source: %llu\n",
+                (unsigned long long)ctx.synthetic_spectral_skips);
     }
 #endif
     if (ctx.tuning_skipped > 0) {
@@ -7061,16 +7810,16 @@ static int start_scan(void)
     mode = planned_run_mode();
     if (mode == RUN_MODE_SINGLE) {
         single_fft_plan_t plan;
-        double center;
+        double requested_center;
         raw_visible_band(&start, &end);
         if (end <= start)
             return -1;
         plan = single_fft_plan_for_span(end - start);
-        center = direct_sampling_enabled() ?
-            direct_source_center_for_visible(start, end, plan.source_span) :
-            single_source_center_for_visible(start, end, plan.source_span);
+        single_centers_for_view(start, end, &plan, &requested_center,
+                                NULL, NULL);
         if (!direct_sampling_enabled() &&
-            !receiver_frequency_valid(receiver_frequency_from_radio(center)))
+            !receiver_frequency_valid(
+                receiver_frequency_from_radio(requested_center)))
             return -1;
     } else {
         total_steps = build_scan_frequencies(air_freqs, &step);
@@ -7097,6 +7846,93 @@ static void stop_scan(void)
     request_async_cancel();
     pthread_join(g_scan_thread, NULL);
     g_scan_thread_joinable = 0;
+}
+
+/**
+ * @brief Queue a compatible single-stream DSP replan without restarting IIO.
+ *
+ * Compatibility is deliberately conservative: the hardware profile and
+ * analog capture coverage must already contain the complete target DSP source,
+ * and the indexed cache must hold one target frame including CIC warm-up.
+ *
+ * @param visible_start Target visible lower edge in hertz.
+ * @param visible_end Target visible upper edge in hertz.
+ * @param display_bins Logical CSS display width in bins.
+ * @param view_id Frontend view generation assigned to resulting rows.
+ * @return Nonzero when the active worker accepted the request.
+ */
+static int queue_compatible_hot_replan(double visible_start,
+                                       double visible_end,
+                                       int display_bins,
+                                       uint32_t view_id)
+{
+    single_fft_plan_t plan;
+    scan_ctx_t *ctx;
+    double dsp_center;
+    double target_start;
+    double target_end;
+    uint64_t needed_raw;
+    int accepted = 0;
+
+    if (!g_scanning || visible_end <= visible_start || display_bins <= 0)
+        return 0;
+    plan = single_fft_plan_for_span_and_bins(
+        visible_end - visible_start, display_bins);
+    if (plan.decim_factor <= 1)
+        return 0;
+    needed_raw = ((uint64_t)plan.fft_size + CIC_STAGES) *
+        (uint64_t)plan.decim_factor;
+    if (needed_raw == 0 || needed_raw > UINT32_MAX ||
+        needed_raw > CACHED_HISTORY_MAX_SAMPLES)
+        return 0;
+    dsp_center = (visible_start + visible_end) * 0.5;
+    target_start = dsp_center - plan.source_span * 0.5;
+    target_end = dsp_center + plan.source_span * 0.5;
+
+    pthread_mutex_lock(&g_hot_replan_mutex);
+    ctx = g_hot_active_ctx;
+    if (ctx && ctx->single_mode && !ctx->direct_sampling &&
+        fabs(ctx->raw_samplerate - plan.hardware_samplerate) <= 1.0 &&
+        fabs(g_hot_active_rf_bandwidth - plan.hardware_rf_bandwidth) <= 1.0 &&
+        target_start >= g_hot_active_source_start - 1.0 &&
+        target_end <= g_hot_active_source_end + 1.0 &&
+        dsp_center >= g_hot_active_dsp_start - 1.0 &&
+        dsp_center <= g_hot_active_dsp_end + 1.0 &&
+        (g_hot_active_dsp_start + g_hot_active_dsp_end) * 0.5 >=
+            target_start - 1.0 &&
+        (g_hot_active_dsp_start + g_hot_active_dsp_end) * 0.5 <=
+            target_end + 1.0) {
+        pthread_mutex_lock(&g_recent_samples_mutex);
+        if (g_recent_samples.valid &&
+            g_recent_samples.count >= (size_t)needed_raw &&
+            fabs(g_recent_samples.samplerate_hz -
+                 plan.hardware_samplerate) <= 1.0 &&
+            fabs(g_recent_samples.rf_bandwidth_hz -
+                 plan.hardware_rf_bandwidth) <= 1.0) {
+            g_hot_replan_serial++;
+            if (g_hot_replan_serial == 0)
+                g_hot_replan_serial++;
+            g_hot_replan_request.serial = g_hot_replan_serial;
+            g_hot_replan_request.view_id = view_id;
+            g_hot_replan_request.display_bins = display_bins;
+            g_hot_replan_request.visible_start = visible_start;
+            g_hot_replan_request.visible_end = visible_end;
+            g_hot_replan_request.requested_msec = now_msec();
+            g_hot_replan_request.pending = 1;
+            accepted = 1;
+        }
+        pthread_mutex_unlock(&g_recent_samples_mutex);
+    }
+    if (accepted) {
+        pthread_cond_signal(&ctx->queue_cond);
+        fprintf(stderr,
+                "[SDR] Queued hot replan %llu: view %u, %.6f - %.6f Hz, fft %d, decim %d\n",
+                (unsigned long long)g_hot_replan_request.serial, view_id,
+                visible_start, visible_end, plan.fft_size,
+                plan.decim_factor);
+    }
+    pthread_mutex_unlock(&g_hot_replan_mutex);
+    return accepted;
 }
 
 static void stop_scan_if_frontend_idle(void)
@@ -7945,12 +8781,8 @@ static void handle_request(int client_fd, const char *req, size_t req_len,
             double center;
             raw_visible_band(&scan_start, &scan_end);
             plan = single_fft_plan_for_span(scan_end - scan_start);
-            center = direct_sampling_enabled() ?
-                direct_source_center_for_visible(scan_start, scan_end,
-                                                 plan.source_span) :
-                single_source_center_for_visible(scan_start, scan_end,
-                                                 plan.source_span);
-            center += current_frequency_correction_hz();
+            single_centers_for_view(scan_start, scan_end, &plan, NULL, NULL,
+                                    &center);
             step = plan.source_span;
             scan_start = center - plan.source_span * 0.5;
             scan_end = center + plan.source_span * 0.5;
@@ -8483,6 +9315,7 @@ start_bad_json:
         int visible_changed;
         int display_changed = 0;
         int ret = 0;
+        int hot_replan_queued = 0;
 
         if (json_body_for_request(&http, &json, err, sizeof(err)) != 0) {
             send_json_error(client_fd, 400, "Bad Request", cors, err);
@@ -8537,8 +9370,13 @@ start_bad_json:
             g_visible_start = visible_start;
             g_visible_end = visible_end;
             g_view_id++;
-            if (g_scanning)
-                ret = start_scan();
+            if (g_scanning) {
+                hot_replan_queued = queue_compatible_hot_replan(
+                    visible_start, visible_end, current_display_bins(),
+                    g_view_id);
+                if (!hot_replan_queued)
+                    ret = start_scan();
+            }
         }
         if (visible_changed || display_changed)
             save_config();
@@ -8579,6 +9417,7 @@ start_bad_json:
             char json_body[2048];
             snprintf(json_body, sizeof(json_body),
                 "{\"status\":\"%s\",\"view_id\":%u,"
+                "\"transition\":\"%s\","
                 "\"freq_start\":" JSON_COORD_FMT ",\"freq_end\":" JSON_COORD_FMT ","
                 "\"configured_start_hz\":" JSON_COORD_FMT ",\"configured_end_hz\":" JSON_COORD_FMT ","
                 "\"visible_start_hz\":" JSON_COORD_FMT ",\"visible_end_hz\":" JSON_COORD_FMT ","
@@ -8603,6 +9442,9 @@ start_bad_json:
                 "\"samplerate\":%.0f,\"rf_bandwidth\":%.0f,"
                 "\"bw_ratio\":%.2f,\"scanning\":%d}",
                 (ret == 0) ? "ok" : "error", g_view_id,
+                hot_replan_queued ? "hot" :
+                    ((visible_changed || display_changed) && g_scanning ?
+                     "restart" : "unchanged"),
                 g_freq_start, g_freq_end,
                 g_freq_start, g_freq_end,
                 g_visible_start, g_visible_end,
