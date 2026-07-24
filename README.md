@@ -67,7 +67,7 @@ I want this project to explore new principles for SDR tools (click to watch vide
 8. [Exact frequency tuning: deterministic compensation for PLL and DDS-style rounding errors keeps received signals plotted at their true frequencies.](https://www.youtube.com/watch?v=_p2u7YL9E5U)
 9. [Automatic device recovery: the physical receiver can be unplugged and reconnected at any time. The backend detects the disconnection, polls for the device to reappear, and resumes scanning automatically — no restart button, no page reload, no user intervention. A receive explicitly started with `Run` also resumes after the scanner program is restarted; `Stop` disables that resume intent.](https://www.youtube.com/watch?v=pBepJdQ0E8A)
 
-[Interactive presentation of the principles](presentation.html)
+[Interactive presentation of the principles](https://htmlpreview.github.io/?https://github.com/ur8us/pluto-scanner/blob/master/presentation.html)
 
 ## Project Scope
 
