@@ -13,9 +13,24 @@ mkdir -p "$BUILD_ROOT" "$DEPS_PREFIX"
 fetch_tarball() {
     local url="$1"
     local archive="$2"
-    if [ ! -f "$archive" ]; then
-        curl -fsSL "$url" -o "$archive"
+    local partial="${archive}.part"
+
+    if [ -f "$archive" ]; then
+        return
     fi
+
+    # Upstream mirrors and GitHub can transiently return 5xx responses. Keep
+    # failed downloads out of the cache so a later build never extracts a
+    # truncated archive as if it were complete.
+    rm -f "$partial"
+    curl -fsSL \
+        --connect-timeout 30 \
+        --max-time 300 \
+        --retry 6 \
+        --retry-delay 5 \
+        --retry-max-time 300 \
+        "$url" -o "$partial"
+    mv "$partial" "$archive"
 }
 
 extract_once() {
