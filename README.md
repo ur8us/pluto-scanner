@@ -63,9 +63,9 @@ I want this project to explore new principles for SDR tools (click to watch vide
 4. [Seamless merging of scan/hop mode and single-frequency reception, hidden from the user.](https://www.youtube.com/watch?v=KnPlvGlBu_s)
 5. [Waterfall speed limits expressed as a range FROM and TO lines per second instead of tying behavior directly to FFT size. The program should do its best to satisfy the user's desired behavior.](https://www.youtube.com/watch?v=GDP-NtIiRhI)
 6. [Persistent waterfall history: when zooming or moving through frequencies, the waterfall is not cleared. It shows all recorded data that still applies, even when stretched. This is a known SDR UI principle, but it still needs better implementation so history remains useful across large zoom and frequency changes.](https://www.youtube.com/watch?v=wFkcWrQWWDI)
-7. Low-latency, smooth resolution changes: very fine frequency resolution needs several seconds of samples. For compatible high-zoom changes, this scanner keeps capture running and moves the CIC/FFT handoff through indexed raw-sample history, so the first new row appears promptly and the live waterfall continues without a preview burst followed by a pause. FFT size is kept to the smallest power of two that covers the visible CSS pixels; integer CIC decimation supplies any deeper resolution.
-8. Exact frequency tuning: deterministic compensation for PLL and DDS-style rounding errors keeps received signals plotted at their true frequencies.
-9. Automatic device recovery: the physical receiver can be unplugged and reconnected at any time. The backend detects the disconnection, polls for the device to reappear, and resumes scanning automatically — no restart button, no page reload, no user intervention.
+7. [Low-latency, smooth resolution changes: very fine frequency resolution needs several seconds of samples. For compatible high-zoom changes, this scanner keeps capture running and moves the CIC/FFT handoff through indexed raw-sample history, so the first new row appears promptly and the live waterfall continues without a preview burst followed by a pause. FFT size is kept to the smallest power of two that covers the visible CSS pixels; integer CIC decimation supplies any deeper resolution.](https://www.youtube.com/watch?v=HPQgIPxhlEk)
+8. [Exact frequency tuning: deterministic compensation for PLL and DDS-style rounding errors keeps received signals plotted at their true frequencies.](https://www.youtube.com/watch?v=_p2u7YL9E5U)
+9. [Automatic device recovery: the physical receiver can be unplugged and reconnected at any time. The backend detects the disconnection, polls for the device to reappear, and resumes scanning automatically — no restart button, no page reload, no user intervention. A receive explicitly started with `Run` also resumes after the scanner program is restarted; `Stop` disables that resume intent.](https://www.youtube.com/watch?v=pBepJdQ0E8A)
 
 
 ## Project Scope
@@ -333,6 +333,9 @@ http://localhost:8080
 - The main action button is labeled `Run`. Stop then Run preserves a valid
   `#view=start-end` URL viewport when it still fits inside the typed Start/End
   band.
+- The backend persists `resume_scan = 1` after `Run`, so an active receive is
+  restored after restarting the program. Explicit `Stop` writes
+  `resume_scan = 0` and leaves the next program start idle.
 - Passband usage still defines hop spacing internally as `rf_bandwidth * ratio`.
 - Gain mode and hardware gain map to AD936x `gain_control_mode` and `hardwaregain`.
 - FFT/CIC status shows the active backend plan used for the current zoom.
@@ -406,6 +409,7 @@ tools/min_rate_overlap_check.py
 tools/cached_preview_check.py
 tools/frequency_coordinate_check.py
 tools/fft_level_normalization_check.py
+tools/startup_resume_check.py
 ```
 
 With the backend running:

@@ -175,6 +175,7 @@ check: all $(TEST_TARGET)
 	PLUTO_CIC_TEST_BINARY="$(TEST_TARGET)" tools/cached_preview_check.py >/dev/null
 	PLUTO_CIC_TEST_BINARY="$(TEST_TARGET)" PLUTO_TEST_DISPLAY_BINS=1346 tools/cached_preview_check.py >/dev/null
 	PLUTO_CIC_TEST_BINARY="$(TEST_TARGET)" tools/frequency_coordinate_check.py >/dev/null
+	PLUTO_CIC_TEST_BINARY="$(TEST_TARGET)" tools/startup_resume_check.py >/dev/null
 	@echo "Build checks passed."
 
 ci-check: all

@@ -357,6 +357,7 @@ static long long g_receiver_max_hz = RF_RECEIVER_FALLBACK_MAX_HZ;
 static char g_receiver_range_source[32] = "fallback";
 static long long g_last_frontend_activity_msec = 0;
 static volatile int g_auto_restart_on_reconnect = 0;
+static int g_resume_scan_on_start = 0;
 static long long g_last_auto_restart_msec = 0;
 static long long g_auto_restart_suppress_until_msec = 0;
 
@@ -837,6 +838,7 @@ static void save_config(void)
     fprintf(f, "goto_target_zoom = %.6g\n", g_goto_target_zoom);
     fprintf(f, "goto_animate = %u\n", g_goto_animate);
     fprintf(f, "goto_delay_s = %g\n", g_goto_delay_s);
+    fprintf(f, "resume_scan = %d\n", g_resume_scan_on_start);
     fclose(f);
 }
 
@@ -896,6 +898,7 @@ static void load_config(void)
         else if (strcmp(key, "goto_target_zoom") == 0) { g_goto_target_zoom = normalize_goto_target_zoom(val); }
         else if (strcmp(key, "goto_animate") == 0)   { uval = (unsigned int)val; g_goto_animate = uval ? 1 : 0; }
         else if (strcmp(key, "goto_delay_s") == 0)   { g_goto_delay_s = normalize_goto_delay_s(val); }
+        else if (strcmp(key, "resume_scan") == 0)    { g_resume_scan_on_start = val != 0.0 ? 1 : 0; }
     }
     fclose(f);
     if (!have_visible_start || !have_visible_end) {
@@ -8836,6 +8839,7 @@ static void handle_request(int client_fd, const char *req, size_t req_len,
             "\"receiver_range_note\":\"active Pluto receiver range\","
             "\"scanning\":%d,\"device_present\":%d,"
             "\"auto_restart_on_reconnect\":%d,"
+            "\"resume_scan\":%d,"
             "\"freq_start\":" JSON_COORD_FMT ",\"freq_end\":" JSON_COORD_FMT ","
             "\"converter_freq\":" JSON_COORD_FMT ","
             "\"configured_start_hz\":" JSON_COORD_FMT ",\"configured_end_hz\":" JSON_COORD_FMT ","
@@ -8878,6 +8882,7 @@ static void handle_request(int client_fd, const char *req, size_t req_len,
             g_receiver_min_hz, g_receiver_max_hz, g_receiver_range_source,
             g_scanning, g_dev != NULL || PSEUDO_RANDOM_SAMPLE_SOURCE,
             g_auto_restart_on_reconnect,
+            g_resume_scan_on_start,
             g_freq_start, g_freq_end, g_converter_freq,
             g_freq_start, g_freq_end,
             g_visible_start, g_visible_end,
@@ -9189,6 +9194,7 @@ static void handle_request(int client_fd, const char *req, size_t req_len,
         }
         g_view_id++;
 
+        g_resume_scan_on_start = 1;
         save_config();
 
         int ret = start_scan();
@@ -9821,6 +9827,8 @@ start_bad_json:
     if (strcmp(http.method, "POST") == 0 && strcmp(http.path, "/api/stop") == 0) {
         clear_auto_restart_request(PLUTO_AUTO_RESTART_SUPPRESS_MS);
         stop_scan();
+        g_resume_scan_on_start = 0;
+        save_config();
         send_json_response(client_fd, 200, "OK", cors, "{\"status\":\"ok\"}");
         close(client_fd);
         return;
@@ -9844,6 +9852,29 @@ start_bad_json:
 /* ------------------------------------------------------------------ */
 static volatile int g_exit = 0;
 static void sigint_handler(int sig) { (void)sig; g_exit = 1; }
+
+/**
+ * @brief Resume the saved receive after the HTTP service is ready.
+ *
+ * A failed immediate start leaves the reconnect intent armed so a Pluto that
+ * is still booting or temporarily disconnected can be opened by the normal
+ * reconnect poll. Explicit Stop clears the persisted intent.
+ */
+static void resume_scan_after_startup(void)
+{
+    int ret;
+
+    if (!g_resume_scan_on_start)
+        return;
+    ret = start_scan();
+    if (ret == 0) {
+        g_auto_restart_on_reconnect = 0;
+        printf("[SDR] Auto-resumed saved receive after program restart\n");
+    } else {
+        g_auto_restart_on_reconnect = 1;
+        printf("[SDR] Saved receive will resume when Pluto reconnects\n");
+    }
+}
 
 /**
  * @brief Create the HTTP listening socket for the configured bind endpoint.
@@ -10552,7 +10583,10 @@ int main(int argc, char **argv)
     print_startup_banner(&startup_urls);
     printf("[SDR] HTTP listening on %s:%d\n", g_bind_address, g_http_port);
 
-    printf("[SDR] Waiting for scan start from web UI\n");
+    if (g_resume_scan_on_start)
+        resume_scan_after_startup();
+    else
+        printf("[SDR] Waiting for scan start from web UI\n");
 
     while (!g_exit) {
         struct sockaddr_storage client_addr;

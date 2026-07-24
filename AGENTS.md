@@ -450,7 +450,15 @@ cic_runtime = bounded moving sums with CIC_STAGES * decim complex delay entries
 cic_frequency_weight = min(1 / max(abs(sin(decim*pi*f/fs) / (decim*sin(pi*f/fs)))^CIC_STAGES, 0.05), 8)
 ```
 
-Do not auto-start a saved scan when the backend is idle. The page may restore saved fields and view state, but actual scanning should require Run unless the backend was already scanning before the browser attached. Stop then Run should preserve a valid `#view=start-end` URL viewport when it still fits inside the typed Start/End band. The browser button label is `Run`, while the backend API endpoint remains `/api/start`.
+Persist an explicit `resume_scan` intent in `pluto-scanner.conf`. A successful
+or requested Run sets it, explicit Stop clears it, and a program restart tries
+to resume the saved receive after the HTTP service is ready. If Pluto is not
+available yet, the reconnect poll must resume it when the device returns. The
+page may restore saved fields and view state, but must not turn a previously
+stopped receive into an automatic scan. Stop then Run should preserve a valid
+`#view=start-end` URL viewport when it still fits inside the typed Start/End
+band. The browser button label is `Run`, while the backend API endpoint remains
+`/api/start`.
 
 ## Tests
 
@@ -469,6 +477,7 @@ tools/cic_synthetic_signal_check.py
 tools/min_rate_overlap_check.py
 tools/cached_preview_check.py
 tools/frequency_coordinate_check.py
+tools/startup_resume_check.py
 tools/headless_tester.py
 tools/ui_browser_test.py
 tools/phase3_browser_stress.py

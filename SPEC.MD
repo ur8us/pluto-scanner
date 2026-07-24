@@ -82,7 +82,8 @@ no bundled dependencies. No external HTTP, UI, or JS framework is used.
   as bounded moving sums to avoid unbounded numeric state.
 - **Dual-mode planner** — automatically selects scan/hop vs single-frequency.
 - **SSE broadcast** — publishes waterfall rows as `event: line` to all clients.
-- **Persistent config** — `pluto-scanner.conf` saved/restored on every change.
+- **Persistent config** — `pluto-scanner.conf` saved/restored on every change,
+  including the explicit `resume_scan` receive intent.
 - **Watchdog & reconnect** — detects Pluto I/O stalls and reopens the device.
 
 ### 3.2 Threading model
@@ -402,6 +403,7 @@ ordinary user-editable controls.
 | `receiver_range_source` | `"frequency_available"` or `"fallback"` |
 | `receiver_range_note` | `"active Pluto receiver range"` |
 | `scanning`, `device_present` | Run state flags |
+| `auto_restart_on_reconnect`, `resume_scan` | Pending device reconnect and program-restart receive intents |
 | `freq_start`, `freq_end` | Configured full band (Hz) |
 | `configured_start_hz`, `configured_end_hz` | Alias of full band |
 | `visible_start_hz`, `visible_end_hz` | Current viewport |
@@ -598,8 +600,9 @@ client reconnects. Heartbeat shows `disconnected` / `idle` / `scanning`.
   row) so each step does not stretch the previous lower-resolution image.
 - **Persistence** — the visible viewport is saved to `localStorage` and the URL
   hash (`#view=start-end`); restored on page load. Stop then Run preserves a
-  valid URL hash viewport when it fits inside the typed Start/End band. A saved
-  scan is **not** auto-started if the backend was idle.
+  valid URL hash viewport when it fits inside the typed Start/End band. A
+  `resume_scan = 1` receive is auto-started after program restart; explicit
+  Stop clears the intent and leaves the backend idle.
 
 ### 4.5 Rulers, markers, bands
 
@@ -759,8 +762,9 @@ Frontend: validate row → update scope → scroll waterfall → relabel → aut
   indexed-frame, first-row, and cadence checks to a five-minute Pluto run.
 - Scan is stopped automatically after `FRONTEND_IDLE_STOP_MS = 20 s` of no
   frontend activity.
-- The device is polled for reconnect every 5 s; an idle backend does not
-  auto-start a saved scan. The browser action button is labeled `Run`; the API
+- The device is polled for reconnect every 5 s. A saved `resume_scan = 1`
+  receive is resumed after program restart or delayed Pluto reconnect; explicit
+  Stop clears the intent. The browser action button is labeled `Run`; the API
   endpoint remains `/api/start`.
 
 ---
