@@ -55,7 +55,7 @@ file. To use a specific Pluto address:
 
 ## My Motivation
 
-I want this project to explore new principles for SDR tools (click to watch video descriptions):
+I want this project to explore new principles for SDR tools (click to watch video descriptions): 
 
 1. [AI-first development.](https://www.youtube.com/watch?v=ZIS-IX3Hf2Q)
 2. [A web interface that minimizes traffic.](https://www.youtube.com/watch?v=8sGSH4dmKbU)
