@@ -1,0 +1,1596 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="description" content="A visual summary of nine new principles explored in the Pluto SDR Scanner video series.">
+  <title>Pluto Scanner: Nine Principles for Modern SDR Tools</title>
+  <style>
+    :root {
+      color-scheme: dark;
+      --ink: #f7f8f2;
+      --muted: #a7adb6;
+      --dim: #747b86;
+      --night: #080a0d;
+      --panel: #101419;
+      --line: rgba(255, 255, 255, 0.13);
+      --yellow: #ffd30a;
+      --cyan: #28d7f5;
+      --green: #71e66f;
+      --coral: #ff6d5e;
+      --blue: #5287ff;
+      --max: 1180px;
+    }
+
+    * {
+      box-sizing: border-box;
+    }
+
+    html {
+      scroll-behavior: smooth;
+      background: var(--night);
+    }
+
+    body {
+      margin: 0;
+      overflow-x: hidden;
+      background:
+        linear-gradient(rgba(255, 255, 255, 0.018) 1px, transparent 1px),
+        linear-gradient(90deg, rgba(255, 255, 255, 0.018) 1px, transparent 1px),
+        var(--night);
+      background-size: 56px 56px;
+      color: var(--ink);
+      font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      letter-spacing: 0;
+    }
+
+    a {
+      color: inherit;
+    }
+
+    img {
+      display: block;
+      max-width: 100%;
+    }
+
+    button,
+    a {
+      -webkit-tap-highlight-color: transparent;
+    }
+
+    .skip-link {
+      position: fixed;
+      top: 10px;
+      left: 10px;
+      z-index: 100;
+      transform: translateY(-160%);
+      padding: 10px 14px;
+      background: var(--ink);
+      color: var(--night);
+      font-weight: 800;
+      text-decoration: none;
+    }
+
+    .skip-link:focus {
+      transform: translateY(0);
+    }
+
+    .progress {
+      position: fixed;
+      inset: 0 0 auto;
+      z-index: 90;
+      height: 3px;
+      transform: scaleX(0);
+      transform-origin: left;
+      background: linear-gradient(90deg, var(--yellow), var(--cyan), var(--green));
+    }
+
+    .topbar {
+      position: absolute;
+      inset: 0 0 auto;
+      z-index: 20;
+      height: 76px;
+      border-bottom: 1px solid rgba(255, 255, 255, 0.14);
+    }
+
+    .topbar-inner {
+      width: min(calc(100% - 48px), var(--max));
+      height: 100%;
+      margin: 0 auto;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 24px;
+    }
+
+    .brand {
+      display: flex;
+      align-items: center;
+      gap: 12px;
+      font-weight: 900;
+      text-decoration: none;
+      text-transform: uppercase;
+    }
+
+    .brand-mark {
+      width: 34px;
+      height: 34px;
+      display: grid;
+      place-items: center;
+      border: 2px solid var(--cyan);
+      border-radius: 50%;
+      color: var(--cyan);
+      box-shadow: 0 0 22px rgba(40, 215, 245, 0.24);
+      font-size: 15px;
+    }
+
+    .source-link,
+    .watch-link {
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
+      font-size: 13px;
+      font-weight: 800;
+      text-decoration: none;
+      text-transform: uppercase;
+    }
+
+    .source-link {
+      color: #d9dde3;
+    }
+
+    .source-link::after,
+    .watch-link::after {
+      content: "↗";
+      transition: transform 180ms ease;
+    }
+
+    .source-link:hover::after,
+    .watch-link:hover::after {
+      transform: translate(2px, -2px);
+    }
+
+    .hero {
+      min-height: min(900px, 92vh);
+      position: relative;
+      display: grid;
+      align-items: end;
+      overflow: hidden;
+      border-bottom: 1px solid var(--line);
+      isolation: isolate;
+    }
+
+    .hero-media {
+      position: absolute;
+      inset: 0;
+      z-index: -3;
+    }
+
+    .hero-media img {
+      width: 100%;
+      height: 100%;
+      object-fit: cover;
+      object-position: center;
+      filter: saturate(0.72) contrast(1.08);
+      transform: scale(1.03);
+      animation: hero-drift 16s ease-in-out infinite alternate;
+    }
+
+    .hero::before {
+      content: "";
+      position: absolute;
+      inset: 0;
+      z-index: -2;
+      background:
+        linear-gradient(90deg, rgba(8, 10, 13, 0.97) 0%, rgba(8, 10, 13, 0.82) 44%, rgba(8, 10, 13, 0.16) 100%),
+        linear-gradient(0deg, rgba(8, 10, 13, 0.98) 0%, transparent 62%);
+    }
+
+    .hero::after {
+      content: "";
+      position: absolute;
+      inset: 76px 0 auto;
+      z-index: -1;
+      height: 1px;
+      background: linear-gradient(90deg, transparent, var(--cyan), transparent);
+      box-shadow: 0 0 26px var(--cyan);
+      opacity: 0.58;
+      animation: scan 7s linear infinite;
+    }
+
+    .hero-inner {
+      width: min(calc(100% - 48px), var(--max));
+      margin: 0 auto;
+      padding: 160px 0 84px;
+    }
+
+    .eyebrow {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      margin: 0 0 22px;
+      color: var(--yellow);
+      font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+      font-size: 12px;
+      font-weight: 800;
+      text-transform: uppercase;
+    }
+
+    .eyebrow::before {
+      content: "";
+      width: 34px;
+      height: 2px;
+      background: currentColor;
+    }
+
+    h1 {
+      max-width: 850px;
+      margin: 0;
+      font-size: 78px;
+      line-height: 0.94;
+      letter-spacing: 0;
+      text-transform: uppercase;
+    }
+
+    h1 span {
+      display: block;
+      color: var(--yellow);
+    }
+
+    .hero-copy {
+      max-width: 660px;
+      margin: 30px 0 0;
+      color: #d1d6de;
+      font-size: 20px;
+      line-height: 1.6;
+    }
+
+    .hero-meta {
+      margin-top: 42px;
+      display: flex;
+      flex-wrap: wrap;
+      gap: 28px;
+    }
+
+    .metric {
+      min-width: 128px;
+      padding-left: 14px;
+      border-left: 2px solid var(--line);
+    }
+
+    .metric strong {
+      display: block;
+      font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+      font-size: 24px;
+      color: var(--ink);
+    }
+
+    .metric span {
+      display: block;
+      margin-top: 4px;
+      color: var(--muted);
+      font-size: 11px;
+      font-weight: 800;
+      text-transform: uppercase;
+    }
+
+    .hero-cue {
+      position: absolute;
+      right: max(24px, calc((100vw - var(--max)) / 2));
+      bottom: 36px;
+      display: flex;
+      align-items: center;
+      gap: 12px;
+      color: var(--muted);
+      font-size: 11px;
+      font-weight: 800;
+      text-transform: uppercase;
+      writing-mode: vertical-rl;
+    }
+
+    .hero-cue::after {
+      content: "";
+      width: 1px;
+      height: 44px;
+      background: var(--yellow);
+      animation: cue 1.8s ease-in-out infinite;
+    }
+
+    main {
+      overflow: clip;
+    }
+
+    .thesis {
+      position: relative;
+      padding: 112px 24px;
+      background: #0d1116;
+      border-bottom: 1px solid var(--line);
+    }
+
+    .thesis-inner {
+      width: min(100%, var(--max));
+      margin: 0 auto;
+      display: grid;
+      grid-template-columns: minmax(0, 1.4fr) minmax(280px, 0.6fr);
+      gap: 84px;
+      align-items: start;
+    }
+
+    .section-kicker {
+      margin: 0 0 18px;
+      color: var(--cyan);
+      font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+      font-size: 12px;
+      font-weight: 800;
+      text-transform: uppercase;
+    }
+
+    .thesis h2,
+    .closing h2 {
+      margin: 0;
+      font-size: 48px;
+      line-height: 1.08;
+      letter-spacing: 0;
+      text-transform: uppercase;
+    }
+
+    .thesis h2 em {
+      color: var(--yellow);
+      font-style: normal;
+    }
+
+    .thesis-copy {
+      margin: 28px 0 0;
+      max-width: 760px;
+      color: #c0c6ce;
+      font-size: 18px;
+      line-height: 1.75;
+    }
+
+    .throughline {
+      border-top: 1px solid var(--line);
+    }
+
+    .throughline-item {
+      display: grid;
+      grid-template-columns: 42px 1fr;
+      gap: 16px;
+      padding: 20px 0;
+      border-bottom: 1px solid var(--line);
+    }
+
+    .throughline-item strong {
+      color: var(--yellow);
+      font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+      font-size: 13px;
+    }
+
+    .throughline-item span {
+      font-size: 14px;
+      line-height: 1.5;
+      color: var(--muted);
+    }
+
+    .signal-strip {
+      position: relative;
+      height: 92px;
+      display: flex;
+      align-items: end;
+      gap: 3px;
+      padding: 0 2vw;
+      overflow: hidden;
+      border-bottom: 1px solid var(--line);
+      background: #05070a;
+    }
+
+    .signal-strip i {
+      flex: 1;
+      min-width: 2px;
+      height: var(--h);
+      background: linear-gradient(to top, var(--cyan), var(--green));
+      opacity: 0.66;
+      transform-origin: bottom;
+      animation: spectrum 2.6s ease-in-out infinite alternate;
+      animation-delay: var(--d);
+    }
+
+    .chapters {
+      position: relative;
+    }
+
+    .chapter-nav {
+      position: fixed;
+      top: 50%;
+      right: 22px;
+      z-index: 60;
+      display: grid;
+      gap: 9px;
+      transform: translateY(-50%);
+      opacity: 0;
+      pointer-events: none;
+      transition: opacity 250ms ease;
+    }
+
+    .chapter-nav.visible {
+      opacity: 1;
+      pointer-events: auto;
+    }
+
+    .chapter-nav button {
+      position: relative;
+      width: 11px;
+      height: 11px;
+      padding: 0;
+      border: 1px solid rgba(255, 255, 255, 0.48);
+      border-radius: 50%;
+      background: rgba(8, 10, 13, 0.76);
+      cursor: pointer;
+      transition: transform 180ms ease, background 180ms ease, border-color 180ms ease;
+    }
+
+    .chapter-nav button::before {
+      content: attr(data-label);
+      position: absolute;
+      top: 50%;
+      right: 19px;
+      width: max-content;
+      padding: 6px 9px;
+      transform: translate(6px, -50%);
+      background: var(--ink);
+      color: var(--night);
+      font-size: 10px;
+      font-weight: 900;
+      opacity: 0;
+      pointer-events: none;
+      transition: opacity 160ms ease, transform 160ms ease;
+    }
+
+    .chapter-nav button:hover::before,
+    .chapter-nav button:focus-visible::before {
+      opacity: 1;
+      transform: translate(0, -50%);
+    }
+
+    .chapter-nav button.active {
+      transform: scale(1.45);
+      border-color: var(--yellow);
+      background: var(--yellow);
+    }
+
+    .principle {
+      --accent: var(--cyan);
+      min-height: 760px;
+      position: relative;
+      display: grid;
+      align-items: center;
+      padding: 104px 24px;
+      border-bottom: 1px solid var(--line);
+      background: var(--section-bg, #0a0d11);
+    }
+
+    .principle:nth-child(even) {
+      --section-bg: #0d1116;
+    }
+
+    .principle-grid {
+      width: min(100%, var(--max));
+      margin: 0 auto;
+      display: grid;
+      grid-template-columns: minmax(0, 1.02fr) minmax(360px, 0.98fr);
+      gap: 76px;
+      align-items: center;
+    }
+
+    .principle:nth-of-type(even) .principle-visual {
+      order: 2;
+    }
+
+    .principle:nth-of-type(even) .principle-copy {
+      order: 1;
+    }
+
+    .principle-visual {
+      position: relative;
+      opacity: 0;
+      transform: translateY(28px);
+      transition: opacity 700ms ease, transform 700ms cubic-bezier(0.2, 0.8, 0.2, 1);
+    }
+
+    .principle-visual::before {
+      content: "";
+      position: absolute;
+      inset: -12px 12px 12px -12px;
+      z-index: -1;
+      border: 1px solid var(--accent);
+      opacity: 0.36;
+      transition: transform 400ms ease;
+    }
+
+    .principle-visual:hover::before {
+      transform: translate(7px, -7px);
+    }
+
+    .principle-visual a {
+      display: block;
+      position: relative;
+      overflow: hidden;
+      background: #020305;
+    }
+
+    .principle-visual img {
+      width: 100%;
+      aspect-ratio: 3 / 2;
+      object-fit: cover;
+      transition: transform 600ms cubic-bezier(0.2, 0.8, 0.2, 1), filter 600ms ease;
+    }
+
+    #p7 .principle-visual img,
+    #p8 .principle-visual img,
+    #p9 .principle-visual img {
+      aspect-ratio: 16 / 9;
+      object-fit: contain;
+    }
+
+    .principle-visual:hover img {
+      transform: scale(1.025);
+      filter: saturate(1.12);
+    }
+
+    .principle-visual::after {
+      content: "";
+      position: absolute;
+      inset: auto 0 0;
+      height: 3px;
+      transform: scaleX(0);
+      transform-origin: left;
+      background: var(--accent);
+      transition: transform 900ms 180ms ease;
+    }
+
+    .principle.in-view .principle-visual,
+    .principle.in-view .principle-copy {
+      opacity: 1;
+      transform: translateY(0);
+    }
+
+    .principle.in-view .principle-visual::after {
+      transform: scaleX(1);
+    }
+
+    .principle-copy {
+      opacity: 0;
+      transform: translateY(28px);
+      transition: opacity 700ms 100ms ease, transform 700ms 100ms cubic-bezier(0.2, 0.8, 0.2, 1);
+    }
+
+    .chapter-number {
+      display: flex;
+      align-items: center;
+      gap: 14px;
+      margin-bottom: 22px;
+      color: var(--accent);
+      font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+      font-size: 12px;
+      font-weight: 900;
+      text-transform: uppercase;
+    }
+
+    .chapter-number::after {
+      content: "";
+      width: 52px;
+      height: 1px;
+      background: currentColor;
+    }
+
+    .principle h3 {
+      margin: 0;
+      max-width: 620px;
+      font-size: 42px;
+      line-height: 1.04;
+      letter-spacing: 0;
+      text-transform: uppercase;
+    }
+
+    .principle .lead {
+      margin: 24px 0 0;
+      color: #d2d6dc;
+      font-size: 18px;
+      line-height: 1.65;
+    }
+
+    .principle .detail {
+      margin: 18px 0 0;
+      color: var(--muted);
+      font-size: 15px;
+      line-height: 1.7;
+    }
+
+    .fact {
+      margin-top: 28px;
+      padding: 17px 0 17px 18px;
+      border-left: 3px solid var(--accent);
+    }
+
+    .fact strong {
+      display: block;
+      color: var(--accent);
+      font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+      font-size: 21px;
+    }
+
+    .fact span {
+      display: block;
+      margin-top: 5px;
+      color: var(--muted);
+      font-size: 12px;
+      font-weight: 800;
+      text-transform: uppercase;
+    }
+
+    .watch-link {
+      margin-top: 26px;
+      color: var(--ink);
+    }
+
+    .watch-link:hover {
+      color: var(--accent);
+    }
+
+    .closing {
+      position: relative;
+      padding: 120px 24px;
+      overflow: hidden;
+      background: var(--yellow);
+      color: #090b0e;
+    }
+
+    .closing::after {
+      content: "1,000,000×";
+      position: absolute;
+      right: -38px;
+      bottom: -28px;
+      color: rgba(8, 10, 13, 0.09);
+      font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+      font-size: 132px;
+      font-weight: 900;
+      line-height: 1;
+    }
+
+    .closing-inner {
+      position: relative;
+      z-index: 1;
+      width: min(100%, var(--max));
+      margin: 0 auto;
+      display: grid;
+      grid-template-columns: minmax(0, 1.2fr) minmax(320px, 0.8fr);
+      gap: 80px;
+      align-items: end;
+    }
+
+    .closing .section-kicker {
+      color: #090b0e;
+    }
+
+    .closing p {
+      max-width: 580px;
+      margin: 0;
+      font-size: 19px;
+      line-height: 1.65;
+    }
+
+    .closing-link {
+      display: inline-flex;
+      align-items: center;
+      justify-content: space-between;
+      width: 100%;
+      padding: 18px 0;
+      border-top: 2px solid #090b0e;
+      border-bottom: 2px solid #090b0e;
+      color: #090b0e;
+      font-size: 14px;
+      font-weight: 900;
+      text-decoration: none;
+      text-transform: uppercase;
+    }
+
+    .closing-link span:last-child {
+      font-size: 22px;
+      transition: transform 180ms ease;
+    }
+
+    .closing-link:hover span:last-child {
+      transform: translate(4px, -4px);
+    }
+
+    footer {
+      padding: 28px 24px;
+      background: #050609;
+      color: var(--dim);
+      font-size: 12px;
+    }
+
+    .footer-inner {
+      width: min(100%, var(--max));
+      margin: 0 auto;
+      display: flex;
+      justify-content: space-between;
+      gap: 24px;
+    }
+
+    @keyframes hero-drift {
+      from { transform: scale(1.03) translate3d(0, 0, 0); }
+      to { transform: scale(1.07) translate3d(-0.7%, -0.5%, 0); }
+    }
+
+    @keyframes scan {
+      0% { transform: translateY(0); opacity: 0; }
+      8% { opacity: 0.65; }
+      92% { opacity: 0.65; }
+      100% { transform: translateY(calc(92vh - 76px)); opacity: 0; }
+    }
+
+    @keyframes cue {
+      0%, 100% { transform: scaleY(0.35); transform-origin: top; }
+      50% { transform: scaleY(1); transform-origin: top; }
+    }
+
+    @keyframes spectrum {
+      from { transform: scaleY(0.72); opacity: 0.36; }
+      to { transform: scaleY(1); opacity: 0.8; }
+    }
+
+    @media (max-width: 1020px) {
+      h1 {
+        font-size: 62px;
+      }
+
+      .thesis-inner,
+      .closing-inner {
+        gap: 48px;
+      }
+
+      .principle-grid {
+        gap: 48px;
+      }
+
+      .principle h3 {
+        font-size: 36px;
+      }
+    }
+
+    @media (max-width: 780px) {
+      .topbar {
+        height: 66px;
+      }
+
+      .topbar-inner,
+      .hero-inner {
+        width: min(calc(100% - 32px), var(--max));
+      }
+
+      .source-link span {
+        display: none;
+      }
+
+      .source-link {
+        width: 36px;
+        height: 36px;
+        justify-content: center;
+        border: 1px solid var(--line);
+        border-radius: 50%;
+      }
+
+      .source-link::after {
+        content: "↗";
+        font-size: 17px;
+      }
+
+      .hero {
+        min-height: 760px;
+      }
+
+      .hero::before {
+        background:
+          linear-gradient(90deg, rgba(8, 10, 13, 0.94), rgba(8, 10, 13, 0.4)),
+          linear-gradient(0deg, rgba(8, 10, 13, 0.98) 0%, rgba(8, 10, 13, 0.36) 72%);
+      }
+
+      .hero-media img {
+        object-position: 58% center;
+      }
+
+      .hero-inner {
+        padding: 132px 0 74px;
+      }
+
+      h1 {
+        font-size: 50px;
+      }
+
+      .hero-copy {
+        max-width: 540px;
+        font-size: 17px;
+      }
+
+      .hero-meta {
+        gap: 20px;
+      }
+
+      .metric {
+        min-width: 116px;
+      }
+
+      .hero-cue {
+        display: none;
+      }
+
+      .thesis {
+        padding: 82px 20px;
+      }
+
+      .thesis-inner,
+      .closing-inner {
+        grid-template-columns: 1fr;
+      }
+
+      .thesis h2,
+      .closing h2 {
+        font-size: 40px;
+      }
+
+      .principle {
+        min-height: 0;
+        padding: 82px 20px;
+      }
+
+      .principle-grid {
+        grid-template-columns: 1fr;
+        gap: 44px;
+      }
+
+      .principle:nth-of-type(even) .principle-visual,
+      .principle:nth-of-type(even) .principle-copy {
+        order: initial;
+      }
+
+      .principle h3 {
+        font-size: 34px;
+      }
+
+      .chapter-nav {
+        display: none;
+      }
+
+      .closing {
+        padding: 86px 20px;
+      }
+
+      .closing::after {
+        font-size: 84px;
+      }
+    }
+
+    @media (max-width: 480px) {
+      .brand {
+        font-size: 13px;
+      }
+
+      .brand-mark {
+        width: 30px;
+        height: 30px;
+        font-size: 12px;
+      }
+
+      h1 {
+        font-size: 40px;
+      }
+
+      .hero-copy {
+        font-size: 16px;
+        line-height: 1.55;
+      }
+
+      .hero-meta {
+        display: grid;
+        grid-template-columns: 1fr 1fr;
+      }
+
+      .thesis h2,
+      .closing h2 {
+        font-size: 34px;
+      }
+
+      .thesis-copy {
+        font-size: 16px;
+      }
+
+      .principle h3 {
+        font-size: 30px;
+      }
+
+      .principle .lead {
+        font-size: 16px;
+      }
+
+      .principle-visual::before {
+        inset: -8px 8px 8px -8px;
+      }
+
+      .footer-inner {
+        flex-direction: column;
+        gap: 8px;
+      }
+    }
+
+    @media (prefers-reduced-motion: reduce) {
+      html {
+        scroll-behavior: auto;
+      }
+
+      *,
+      *::before,
+      *::after {
+        animation-duration: 0.01ms !important;
+        animation-iteration-count: 1 !important;
+        transition-duration: 0.01ms !important;
+      }
+
+      .principle-visual,
+      .principle-copy {
+        opacity: 1;
+        transform: none;
+      }
+    }
+
+    /* Single-screen presentation mode */
+    html,
+    body {
+      width: 100%;
+      height: 100%;
+      overflow: hidden;
+    }
+
+    .topbar {
+      position: fixed;
+    }
+
+    main {
+      overflow: visible;
+    }
+
+    .page {
+      position: fixed;
+      inset: 0;
+      z-index: 1;
+      width: 100%;
+      height: 100dvh;
+      min-height: 0;
+      overflow-x: hidden;
+      overflow-y: auto;
+      overscroll-behavior: contain;
+      visibility: hidden;
+      opacity: 0;
+      pointer-events: none;
+      transform: translateY(24px);
+      transition:
+        opacity 320ms ease,
+        transform 420ms cubic-bezier(0.2, 0.8, 0.2, 1),
+        visibility 0s linear 420ms;
+    }
+
+    .page.is-active {
+      z-index: 2;
+      visibility: visible;
+      opacity: 1;
+      pointer-events: auto;
+      transform: translateY(0);
+      transition-delay: 0s;
+    }
+
+    .page.thesis,
+    .page.closing {
+      display: grid;
+      align-items: center;
+    }
+
+    .page.principle {
+      padding-top: 96px;
+      padding-bottom: 72px;
+    }
+
+    .signal-strip,
+    .chapter-nav,
+    footer {
+      display: none;
+    }
+
+    .page-controls {
+      position: fixed;
+      right: 24px;
+      bottom: 24px;
+      z-index: 80;
+      display: grid;
+      grid-template-columns: 44px 44px;
+      gap: 8px;
+    }
+
+    .page-control {
+      position: relative;
+      width: 44px;
+      height: 44px;
+      display: grid;
+      place-items: center;
+      padding: 0;
+      border: 1px solid rgba(255, 255, 255, 0.34);
+      border-radius: 50%;
+      background: rgba(8, 10, 13, 0.86);
+      color: var(--ink);
+      font-size: 20px;
+      line-height: 1;
+      cursor: pointer;
+      backdrop-filter: blur(10px);
+      transition: color 180ms ease, border-color 180ms ease, background 180ms ease, transform 180ms ease;
+    }
+
+    .page-control:hover:not(:disabled),
+    .page-control:focus-visible {
+      border-color: var(--yellow);
+      background: var(--yellow);
+      color: var(--night);
+      transform: translateY(-2px);
+    }
+
+    .page-control:disabled {
+      opacity: 0.26;
+      cursor: not-allowed;
+    }
+
+    .page-status {
+      position: fixed;
+      right: 28px;
+      bottom: 80px;
+      z-index: 80;
+      color: rgba(255, 255, 255, 0.66);
+      font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+      font-size: 11px;
+      font-weight: 800;
+    }
+
+    @media (max-width: 780px) {
+      .page.principle {
+        padding-top: 96px;
+        padding-bottom: 94px;
+      }
+
+      .page.thesis,
+      .page.closing {
+        display: block;
+      }
+
+      .page-controls {
+        right: 14px;
+        bottom: 14px;
+      }
+
+      .page-status {
+        right: 18px;
+        bottom: 69px;
+      }
+    }
+
+    @media (min-width: 781px) {
+      .topbar-inner {
+        width: min(calc(100% - 64px), 1560px);
+      }
+
+      .page.principle {
+        padding: 88px 32px 72px;
+      }
+
+      .page .principle-grid {
+        width: min(calc(100% - 32px), 1560px);
+        grid-template-columns: minmax(0, 1.05fr) minmax(430px, 0.95fr);
+        gap: 64px;
+      }
+
+      .page .principle-visual img,
+      .page #p7 .principle-visual img,
+      .page #p8 .principle-visual img,
+      .page #p9 .principle-visual img {
+        width: auto;
+        max-width: 100%;
+        height: auto;
+        max-height: calc(100dvh - 190px);
+        margin-inline: auto;
+        object-fit: contain;
+      }
+
+      .page .principle h3 {
+        font-size: 50px;
+      }
+
+      .page .principle .lead {
+        font-size: 21px;
+        line-height: 1.55;
+      }
+
+      .page .principle .detail {
+        font-size: 17px;
+        line-height: 1.65;
+      }
+
+      .page .chapter-number {
+        font-size: 13px;
+      }
+
+      .page .fact strong {
+        font-size: 25px;
+      }
+
+      .page .fact span,
+      .page .watch-link {
+        font-size: 13px;
+      }
+
+      .page.thesis,
+      .page.closing {
+        padding-right: 48px;
+        padding-left: 48px;
+      }
+
+      .page .thesis-inner,
+      .page .closing-inner {
+        width: min(100%, 1560px);
+      }
+
+      .page .thesis h2,
+      .page .closing h2 {
+        font-size: 64px;
+      }
+
+      .page .thesis-copy {
+        max-width: 900px;
+        font-size: 21px;
+      }
+
+      .page .throughline-item span {
+        font-size: 16px;
+      }
+
+      .page .closing p {
+        max-width: 680px;
+        font-size: 22px;
+      }
+
+      .page .closing-link {
+        font-size: 16px;
+      }
+    }
+
+    @media (min-width: 1500px) and (min-height: 850px) {
+      .page .principle h3 {
+        font-size: 56px;
+      }
+
+      .page .principle .lead {
+        font-size: 23px;
+      }
+
+      .page .principle .detail {
+        font-size: 19px;
+      }
+
+      .page .thesis h2,
+      .page .closing h2 {
+        font-size: 72px;
+      }
+
+      .page .thesis-copy,
+      .page .closing p {
+        font-size: 23px;
+      }
+    }
+  </style>
+</head>
+<body>
+  <a class="skip-link" href="#summary">Skip to summary</a>
+  <div class="progress" id="progress" aria-hidden="true"></div>
+  <div class="page-status" id="pageStatus" aria-live="polite">01 / 12</div>
+  <div class="page-controls" aria-label="Page navigation">
+    <button class="page-control" id="pageUp" type="button" aria-label="Previous page" title="Previous page">↑</button>
+    <button class="page-control" id="pageDown" type="button" aria-label="Next page" title="Next page">↓</button>
+  </div>
+
+  <header class="topbar">
+    <div class="topbar-inner">
+      <a class="brand" href="#top" aria-label="Pluto Scanner principles, back to top">
+        <span class="brand-mark">PS</span>
+        <span>Pluto Scanner</span>
+      </a>
+      <a class="source-link" href="https://github.com/ur8us/pluto-scanner" target="_blank" rel="noopener">
+        <span>View source</span>
+      </a>
+    </div>
+  </header>
+
+  <section class="hero page is-active" id="top">
+    <div class="hero-media" aria-hidden="true">
+      <img src="images/03.png" alt="">
+    </div>
+    <div class="hero-inner">
+      <p class="eyebrow">A nine-part video series</p>
+      <h1>New principles <span>for SDR tools</span></h1>
+      <p class="hero-copy">
+        Pluto Scanner asks a practical question: what should a spectrum tool feel like when the interface,
+        processing pipeline, and recovery logic are designed as one continuous system?
+      </p>
+      <div class="hero-meta" aria-label="Series highlights">
+        <div class="metric"><strong>9</strong><span>principles</span></div>
+        <div class="metric"><strong>10<sup>6</sup>×</strong><span>zoom range</span></div>
+        <div class="metric"><strong>~0.01 Hz</strong><span>tuning accuracy</span></div>
+        <div class="metric"><strong>25–30 KB/s</strong><span>moderate traffic</span></div>
+      </div>
+    </div>
+    <div class="hero-cue" aria-hidden="true">Explore the system</div>
+  </section>
+
+  <main id="summary">
+    <section class="thesis page" id="overview">
+      <div class="thesis-inner">
+        <div>
+          <p class="section-kicker">The central idea</p>
+          <h2>Preserve <em>continuity</em> while everything changes.</h2>
+          <p class="thesis-copy">
+            The series is less about adding isolated features than removing interruptions. The user should be
+            able to move from gigahertz to hertz, from hopping to fixed reception, and from one processing
+            resolution to another without losing context. Even a disconnected receiver should be a pause,
+            not a dead end.
+          </p>
+        </div>
+        <div class="throughline" aria-label="Three layers of the approach">
+          <div class="throughline-item">
+            <strong>01</strong>
+            <span><b>Build differently.</b> Use AI to extend one developer’s time, reach, and test capacity.</span>
+          </div>
+          <div class="throughline-item">
+            <strong>02</strong>
+            <span><b>Move less data.</b> Compute on the server and transmit only what the display needs.</span>
+          </div>
+          <div class="throughline-item">
+            <strong>03</strong>
+            <span><b>Hide machinery.</b> Let the backend adapt while the operator keeps one coherent view.</span>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <div class="signal-strip" aria-hidden="true">
+      <i style="--h:18%;--d:-.2s"></i><i style="--h:24%;--d:-1.1s"></i><i style="--h:36%;--d:-.5s"></i>
+      <i style="--h:21%;--d:-1.6s"></i><i style="--h:44%;--d:-.8s"></i><i style="--h:72%;--d:-2s"></i>
+      <i style="--h:30%;--d:-.3s"></i><i style="--h:26%;--d:-1.4s"></i><i style="--h:38%;--d:-.9s"></i>
+      <i style="--h:86%;--d:-1.9s"></i><i style="--h:46%;--d:-.6s"></i><i style="--h:31%;--d:-1.2s"></i>
+      <i style="--h:22%;--d:-.1s"></i><i style="--h:58%;--d:-1.7s"></i><i style="--h:28%;--d:-.7s"></i>
+      <i style="--h:34%;--d:-1.5s"></i><i style="--h:94%;--d:-.4s"></i><i style="--h:42%;--d:-1.8s"></i>
+      <i style="--h:25%;--d:-1s"></i><i style="--h:37%;--d:-.25s"></i><i style="--h:63%;--d:-1.3s"></i>
+      <i style="--h:29%;--d:-.65s"></i><i style="--h:19%;--d:-1.75s"></i><i style="--h:48%;--d:-.45s"></i>
+      <i style="--h:76%;--d:-1.05s"></i><i style="--h:33%;--d:-.85s"></i><i style="--h:23%;--d:-1.45s"></i>
+      <i style="--h:55%;--d:-.15s"></i><i style="--h:39%;--d:-1.95s"></i><i style="--h:68%;--d:-.55s"></i>
+    </div>
+
+    <nav class="chapter-nav" id="chapterNav" aria-label="Principle navigation">
+      <button type="button" data-target="p1" data-label="AI-first development" aria-label="Go to principle 1"></button>
+      <button type="button" data-target="p2" data-label="Minimal web traffic" aria-label="Go to principle 2"></button>
+      <button type="button" data-target="p3" data-label="Million-times zoom" aria-label="Go to principle 3"></button>
+      <button type="button" data-target="p4" data-label="Seamless modes" aria-label="Go to principle 4"></button>
+      <button type="button" data-target="p5" data-label="Waterfall rate range" aria-label="Go to principle 5"></button>
+      <button type="button" data-target="p6" data-label="Persistent history" aria-label="Go to principle 6"></button>
+      <button type="button" data-target="p7" data-label="Low-latency resolution" aria-label="Go to principle 7"></button>
+      <button type="button" data-target="p8" data-label="Exact tuning" aria-label="Go to principle 8"></button>
+      <button type="button" data-target="p9" data-label="Automatic recovery" aria-label="Go to principle 9"></button>
+    </nav>
+
+    <div class="chapters">
+      <section class="principle page" id="p1" style="--accent:var(--cyan)">
+        <div class="principle-grid">
+          <div class="principle-visual">
+            <a href="https://www.youtube.com/watch?v=ZIS-IX3Hf2Q" target="_blank" rel="noopener" aria-label="Watch AI-first development">
+              <img src="images/01.png" alt="Illustrated summary of AI-first development" loading="lazy">
+            </a>
+          </div>
+          <div class="principle-copy">
+            <div class="chapter-number">Principle 01</div>
+            <h3>AI-first development</h3>
+            <p class="lead">Choose projects that become feasible because AI changes the economics of making them.</p>
+            <p class="detail">
+              For a specialist with deep C and DSP knowledge but limited web and GitHub experience, AI bridges
+              the missing layers. It also moves useful work away from the desk and gives repetitive browser
+              testing to agents that can run for hours. Human judgment still owns the interface and the tests
+              that require real perception.
+            </p>
+            <div class="fact"><strong>Build beyond your stack</strong><span>AI expands reach; verification sets quality</span></div>
+            <a class="watch-link" href="https://www.youtube.com/watch?v=ZIS-IX3Hf2Q" target="_blank" rel="noopener">Watch chapter</a>
+          </div>
+        </div>
+      </section>
+
+      <section class="principle page" id="p2" style="--accent:var(--green)">
+        <div class="principle-grid">
+          <div class="principle-visual">
+            <a href="https://www.youtube.com/watch?v=8sGSH4dmKbU" target="_blank" rel="noopener" aria-label="Watch the low-traffic web interface chapter">
+              <img src="images/02.png" alt="Diagram of the Pluto Scanner low-traffic web architecture" loading="lazy">
+            </a>
+          </div>
+          <div class="principle-copy">
+            <div class="chapter-number">Principle 02</div>
+            <h3>A web interface that minimizes traffic</h3>
+            <p class="lead">Put the DSP near the radio; send the browser only the pixels’ worth of data it asked for.</p>
+            <p class="detail">
+              ADALM-Pluto feeds samples to a compact C backend. The server computes FFT results, then streams
+              spectrum and waterfall rows over Server-Sent Events. The browser controls both the number of
+              displayed bins and update cadence, so portability does not require wasteful transport.
+            </p>
+            <div class="fact"><strong>25–30 KB/s</strong><span>Typical traffic at about five lines per second</span></div>
+            <a class="watch-link" href="https://www.youtube.com/watch?v=8sGSH4dmKbU" target="_blank" rel="noopener">Watch chapter</a>
+          </div>
+        </div>
+      </section>
+
+      <section class="principle page" id="p3" style="--accent:var(--yellow)">
+        <div class="principle-grid">
+          <div class="principle-visual">
+            <a href="https://www.youtube.com/watch?v=fvIV3nouoQ4" target="_blank" rel="noopener" aria-label="Watch the million-times zoom chapter">
+              <img src="images/03.png" alt="Comparison of wide and narrow Pluto Scanner spectrum views" loading="lazy">
+            </a>
+          </div>
+          <div class="principle-copy">
+            <div class="chapter-number">Principle 03</div>
+            <h3>One spectrum, one million times zoom</h3>
+            <p class="lead">Do not force a choice between panoramic awareness and fine spectral inspection.</p>
+            <p class="detail">
+              One continuous view spans from almost the Pluto’s entire 70 MHz–6 GHz tuning range down to
+              hertz-per-pixel detail. The demonstrations move through QO-100 transponders, individual beacons,
+              CW and FT signals, broadcast FM, DAB, and cellular bands. At extreme zoom, frequency resolution
+              improves while time resolution necessarily slows.
+            </p>
+            <div class="fact"><strong>GHz → Hz</strong><span>Wide scan and narrow inspection in the same coordinate system</span></div>
+            <a class="watch-link" href="https://www.youtube.com/watch?v=fvIV3nouoQ4" target="_blank" rel="noopener">Watch chapter</a>
+          </div>
+        </div>
+      </section>
+
+      <section class="principle page" id="p4" style="--accent:var(--blue)">
+        <div class="principle-grid">
+          <div class="principle-visual">
+            <a href="https://www.youtube.com/watch?v=KnPlvGlBu_s" target="_blank" rel="noopener" aria-label="Watch the seamless scan and reception chapter">
+              <img src="images/04.png" alt="Wide scan and fixed reception modes merging in one interface" loading="lazy">
+            </a>
+          </div>
+          <div class="principle-copy">
+            <div class="chapter-number">Principle 04</div>
+            <h3>Seamless scan and fixed reception</h3>
+            <p class="lead">The operator changes scale; the backend chooses the appropriate acquisition mode.</p>
+            <p class="detail">
+              A wide view is assembled by hopping across overlapping frequency steps. As the view narrows,
+              the hop count falls until a single-frequency stream can cover the span continuously. Zoom back
+              out and hopping resumes. The waterfall keeps the transition visually quiet, so internal mode
+              switching never becomes a separate user workflow.
+            </p>
+            <div class="fact"><strong>55 → 1 step</strong><span>The mode follows the visible bandwidth</span></div>
+            <a class="watch-link" href="https://www.youtube.com/watch?v=KnPlvGlBu_s" target="_blank" rel="noopener">Watch chapter</a>
+          </div>
+        </div>
+      </section>
+
+      <section class="principle page" id="p5" style="--accent:var(--coral)">
+        <div class="principle-grid">
+          <div class="principle-visual">
+            <a href="https://www.youtube.com/watch?v=GDP-NtIiRhI" target="_blank" rel="noopener" aria-label="Watch the waterfall speed chapter">
+              <img src="images/05.png" alt="Waterfall speed represented by minimum and maximum limits" loading="lazy">
+            </a>
+          </div>
+          <div class="principle-copy">
+            <div class="chapter-number">Principle 05</div>
+            <h3>Specify a useful speed range</h3>
+            <p class="lead">Let users state the behavior they want, then adapt the processing plan to meet it.</p>
+            <p class="detail">
+              Traditional controls expose FFT-dependent presets whose real cadence is hard to predict.
+              Pluto Scanner instead asks for minimum and maximum waterfall lines per second. The lower bound
+              prevents very fine resolution from feeling frozen; the upper bound protects CPU and network
+              capacity. Some hop-mode limits are physical, so the backend does its best within the range.
+            </p>
+            <div class="fact"><strong>From / to LPS</strong><span>An intent-level control, not an FFT knob</span></div>
+            <a class="watch-link" href="https://www.youtube.com/watch?v=GDP-NtIiRhI" target="_blank" rel="noopener">Watch chapter</a>
+          </div>
+        </div>
+      </section>
+
+      <section class="principle page" id="p6" style="--accent:var(--green)">
+        <div class="principle-grid">
+          <div class="principle-visual">
+            <a href="https://www.youtube.com/watch?v=wFkcWrQWWDI" target="_blank" rel="noopener" aria-label="Watch the persistent history chapter">
+              <img src="images/06.png" alt="Persistent waterfall history across changes of view" loading="lazy">
+            </a>
+          </div>
+          <div class="principle-copy">
+            <div class="chapter-number">Principle 06</div>
+            <h3>Do not erase the past</h3>
+            <p class="lead">A view change should reinterpret recorded data, not throw it away.</p>
+            <p class="detail">
+              Waterfall history survives zooming, panning, frequency changes, and canvas resizing. Rows that
+              still overlap the new view remain, stretched or compressed into the new coordinate system.
+              This is more than retaining a bitmap: the history has to stay aligned with frequency while
+              the visible span changes around it.
+            </p>
+            <div class="fact"><strong>Persistent context</strong><span>Zoom, pan, resize; history remains useful</span></div>
+            <a class="watch-link" href="https://www.youtube.com/watch?v=wFkcWrQWWDI" target="_blank" rel="noopener">Watch chapter</a>
+          </div>
+        </div>
+      </section>
+
+      <section class="principle page" id="p7" style="--accent:var(--cyan)">
+        <div class="principle-grid">
+          <div class="principle-visual">
+            <a href="https://www.youtube.com/watch?v=HPQgIPxhlEk" target="_blank" rel="noopener" aria-label="Watch the low-latency resolution chapter">
+              <img src="images/07.png" alt="Low-latency transitions between spectrum resolutions" loading="lazy">
+            </a>
+          </div>
+          <div class="principle-copy">
+            <div class="chapter-number">Principle 07</div>
+            <h3>Change resolution without the wait</h3>
+            <p class="lead">Use compatible history to bridge the delay while a high-resolution live pipeline fills.</p>
+            <p class="detail">
+              At maximum zoom, one fresh FFT row can require many seconds of samples. Instead of showing a
+              blank pause, the scanner recalculates stored compatible samples through the new decimation,
+              windowing, and FFT plan. Cached preview rows appear promptly and are released at the intended
+              cadence until live acquisition catches up.
+            </p>
+            <div class="fact"><strong>Preview, then live</strong><span>Fast response without pretending processing is free</span></div>
+            <a class="watch-link" href="https://www.youtube.com/watch?v=HPQgIPxhlEk" target="_blank" rel="noopener">Watch chapter</a>
+          </div>
+        </div>
+      </section>
+
+      <section class="principle page" id="p8" style="--accent:var(--yellow)">
+        <div class="principle-grid">
+          <div class="principle-visual">
+            <a href="https://www.youtube.com/watch?v=_p2u7YL9E5U" target="_blank" rel="noopener" aria-label="Watch the exact tuning chapter">
+              <img src="images/08.png" alt="Exact frequency tuning with correction for quantization error" loading="lazy">
+            </a>
+          </div>
+          <div class="principle-copy">
+            <div class="chapter-number">Principle 08</div>
+            <h3>Plot signals where they really are</h3>
+            <p class="lead">Model deterministic tuner quantization instead of accepting it as mysterious offset.</p>
+            <p class="detail">
+              Floating-point arithmetic is only one source of frequency error. PLL and DDS-style tuning
+              words also round requested values to what hardware can represent. By modelling Pluto’s
+              frequency synthesis and carrying fractional-hertz coordinates through the pipeline, the
+              scanner compensates the expected offset without changing the requested LO.
+            </p>
+            <div class="fact"><strong>~0.01 Hz error</strong><span>About 30–40× better in the demonstrated test</span></div>
+            <a class="watch-link" href="https://www.youtube.com/watch?v=_p2u7YL9E5U" target="_blank" rel="noopener">Watch chapter</a>
+          </div>
+        </div>
+      </section>
+
+      <section class="principle page" id="p9" style="--accent:var(--coral)">
+        <div class="principle-grid">
+          <div class="principle-visual">
+            <a href="https://www.youtube.com/watch?v=pBepJdQ0E8A" target="_blank" rel="noopener" aria-label="Watch the automatic recovery chapter">
+              <img src="images/09.png" alt="Automatic recovery after Pluto SDR disconnection" loading="lazy">
+            </a>
+          </div>
+          <div class="principle-copy">
+            <div class="chapter-number">Principle 09</div>
+            <h3>Recover automatically</h3>
+            <p class="lead">Treat temporary hardware and backend loss as a state the system can survive.</p>
+            <p class="detail">
+              Unplug the Pluto, reconnect it, restart the backend, or even launch without a receiver present:
+              the application keeps polling and resumes when the device becomes available. The frontend
+              remains coherent through backend restarts. Recovery belongs in the normal operating model,
+              not behind a restart button.
+            </p>
+            <div class="fact"><strong>No manual restart</strong><span>Detect, wait, reconnect, resume</span></div>
+            <a class="watch-link" href="https://www.youtube.com/watch?v=pBepJdQ0E8A" target="_blank" rel="noopener">Watch chapter</a>
+          </div>
+        </div>
+      </section>
+    </div>
+
+    <section class="closing page" id="conclusion">
+      <div class="closing-inner">
+        <div>
+          <p class="section-kicker">What the series proposes</p>
+          <h2>The complexity can be real without feeling complicated.</h2>
+        </div>
+        <div>
+          <p>
+            Pluto Scanner’s strongest principle is the combination of all nine: keep the operator’s mental
+            model stable while software continuously changes acquisition mode, resolution, rate, coordinates,
+            cached data, and device state underneath.
+          </p>
+          <a class="closing-link" href="https://github.com/ur8us/pluto-scanner" target="_blank" rel="noopener">
+            <span>Explore Pluto Scanner</span><span>↗</span>
+          </a>
+        </div>
+      </div>
+    </section>
+  </main>
+
+  <footer>
+    <div class="footer-inner">
+      <span>Pluto Scanner · video series summary</span>
+      <span>ADALM-Pluto · C · SSE · DSP</span>
+    </div>
+  </footer>
+
+  <script>
+    (() => {
+      const progress = document.getElementById("progress");
+      const status = document.getElementById("pageStatus");
+      const up = document.getElementById("pageUp");
+      const down = document.getElementById("pageDown");
+      const pages = [...document.querySelectorAll(".page")];
+      const principlePages = [...document.querySelectorAll(".principle.page")];
+      const initialHash = window.location.hash.slice(1);
+      const hashIndex = pages.findIndex((page) => page.id === initialHash);
+      let current = hashIndex >= 0 ? hashIndex : 0;
+
+      const showPage = (next) => {
+        if (next < 0 || next >= pages.length || next === current) return;
+
+        pages[current].classList.remove("is-active");
+        pages[current].setAttribute("aria-hidden", "true");
+        pages[current].inert = true;
+        current = next;
+
+        const active = pages[current];
+        active.scrollTop = 0;
+        active.classList.add("is-active");
+        active.removeAttribute("aria-hidden");
+        active.inert = false;
+        if (active.classList.contains("principle")) active.classList.add("in-view");
+
+        up.disabled = current === 0;
+        down.disabled = current === pages.length - 1;
+        status.textContent = `${String(current + 1).padStart(2, "0")} / ${String(pages.length).padStart(2, "0")}`;
+        progress.style.transform = `scaleX(${current / (pages.length - 1)})`;
+        history.replaceState(null, "", `#${active.id}`);
+      };
+
+      pages.forEach((page, index) => {
+        const active = index === current;
+        page.classList.toggle("is-active", active);
+        page.inert = !active;
+        if (!active) page.setAttribute("aria-hidden", "true");
+      });
+      principlePages.forEach((page) => page.classList.add("in-view"));
+
+      up.addEventListener("click", () => showPage(current - 1));
+      down.addEventListener("click", () => showPage(current + 1));
+
+      window.addEventListener("keydown", (event) => {
+        if (event.altKey || event.ctrlKey || event.metaKey || event.shiftKey) return;
+        if (event.target.closest("a, button, input, textarea, select")) return;
+
+        if (event.key === "PageUp") {
+          event.preventDefault();
+          showPage(current - 1);
+        } else if (event.key === "PageDown") {
+          event.preventDefault();
+          showPage(current + 1);
+        }
+      });
+
+      if (current !== 0) {
+        pages[0].classList.remove("is-active");
+        pages[current].classList.add("is-active");
+      }
+      up.disabled = current === 0;
+      down.disabled = current === pages.length - 1;
+      status.textContent = `${String(current + 1).padStart(2, "0")} / ${String(pages.length).padStart(2, "0")}`;
+      progress.style.transform = `scaleX(${current / (pages.length - 1)})`;
+    })();
+  </script>
+</body>
+</html>
