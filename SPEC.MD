@@ -220,19 +220,22 @@ Pluto and exposes the active receiver limits as `receiver_min_hz` and
 after converter math:
 
 ```text
-rx_hz = air_hz - converter_hz          when converter_hz >= 0
-rx_hz = abs(-converter_hz - air_hz)    when converter_hz < 0
+inverted = converter_hz > 0 and freq_start_hz < converter_hz
+rx_hz = converter_hz - air_hz          when inverted
+rx_hz = air_hz - converter_hz          otherwise
 ```
 
-Valid configured air-frequency intervals are therefore:
+`converter_hz` must be non-negative. The configured Start value selects one
+conversion direction for the entire band. Valid configured air-frequency
+intervals are therefore:
 
 ```text
-converter_hz >= 0:
-  [converter_hz + receiver_min_hz, converter_hz + receiver_max_hz]
+inverted:
+  [max(0, converter_hz - receiver_max_hz),
+   converter_hz - receiver_min_hz]
 
-converter_hz < 0, conv_hz = -converter_hz:
-  [max(0, conv_hz - receiver_max_hz), conv_hz - receiver_min_hz]
-  [conv_hz + receiver_min_hz, conv_hz + receiver_max_hz]
+otherwise:
+  [converter_hz + receiver_min_hz, converter_hz + receiver_max_hz]
 ```
 
 The frontend may normalize typed Start/End fields into the active valid
@@ -241,6 +244,8 @@ air/signal inputs to raw `6000 MHz` without converter math; converter-mapped
 air frequencies may legitimately be above `6 GHz`. `/api/start` must reject a
 configured band that is not wholly inside one valid converted receiver interval
 with HTTP `400`, and it must do so before mutating `g_freq_start`/`g_freq_end`.
+A configured band cannot cross the converter frequency because that would
+cross zero IF and change conversion direction inside one scan.
 
 ### 3.4.2 RFPLL coordinate correction
 
@@ -445,9 +450,12 @@ supports one complex receiver channel. The backend retains probing and
 `/api/rf-port` plumbing for development and future channel/port support; those
 alternate values are not part of the supported frontend workflow.
 
-`freq_start`/`freq_end` are air-frequency values in MHz. Receiver limits are
-validated after applying `converter_freq`; invalid converted bands return
-HTTP `400` without changing the persisted configured band.
+`freq_start`/`freq_end` are air-frequency values in MHz and
+`converter_freq` is a non-negative frequency in MHz. Start below Converter
+selects inverted conversion for the configured band; Start at or above
+Converter selects normal conversion. Receiver limits are validated after
+applying that conversion; invalid converted bands return HTTP `400` without
+changing the persisted configured band.
 
 The response echoes a full planning summary identical in shape to
 `/api/status`, plus `status:"ok"|"error"`.
@@ -705,8 +713,9 @@ Backend planner:
         │
         ▼
 Backend configures Pluto (LO, samplerate, bw, gain) ── converter math:
-    rx_lo = air − f_conv        (f_conv ≥ 0)
-    rx_lo = |−f_conv − air|     (f_conv < 0, e.g. −530 MHz for FM band)
+    inverted = f_conv > 0 and configured Start < f_conv
+    rx_lo = f_conv − air        (inverted conversion)
+    rx_lo = air − f_conv        (normal/direct conversion)
     reject before changing config if rx_lo would leave receiver_min_hz..receiver_max_hz
         │
         ▼

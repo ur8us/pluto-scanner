@@ -876,7 +876,15 @@ static void load_config(void)
         val = strtod(value, NULL);
         if      (strcmp(key, "freq_start") == 0)       g_freq_start = val;
         else if (strcmp(key, "freq_end") == 0)         g_freq_end = val;
-        else if (strcmp(key, "converter_freq") == 0)   g_converter_freq = val;
+        else if (strcmp(key, "converter_freq") == 0) {
+            if (isfinite(val) && val >= 0.0 && val <= 1.0e12) {
+                g_converter_freq = val;
+            } else {
+                fprintf(stderr,
+                        "[SDR] Ignoring invalid converter frequency; expected 0..1 THz\n");
+                g_converter_freq = 0.0;
+            }
+        }
         else if (strcmp(key, "samplerate") == 0)       g_samplerate = val;
         else if (strcmp(key, "rf_bandwidth") == 0)     g_rf_bandwidth = val;
         else if (strcmp(key, "bw_ratio") == 0)         g_bw_ratio = val;
@@ -3604,13 +3612,41 @@ static int current_scan_plan(double *out_step, double *out_freq_end)
     return total_steps;
 }
 
+/**
+ * @brief Return whether one positive converter uses its inverted branch.
+ *
+ * Conversion mode is selected once from the configured air-band start. A band
+ * below the converter uses `converter - air`; a band above it uses
+ * `air - converter`. Validation keeps the full band on that selected side.
+ *
+ * @param band_start_hz Configured air-band start in hertz.
+ * @param converter_hz Non-negative converter frequency in hertz.
+ * @return Nonzero for inverted conversion.
+ */
+static int converter_is_inverted_for_band(double band_start_hz,
+                                          double converter_hz)
+{
+    return converter_hz > 0.0 && band_start_hz < converter_hz;
+}
+
+/**
+ * @brief Return whether the active configured converter branch is inverted.
+ *
+ * @return Nonzero when `receiver_hz = converter_hz - air_hz`.
+ */
+static int active_converter_is_inverted(void)
+{
+    return converter_is_inverted_for_band(g_freq_start, g_converter_freq);
+}
+
 static int build_device_scan_frequencies(const double *air_freqs, int count, double *device_freqs)
 {
+    int inverted = active_converter_is_inverted();
+
     for (int i = 0; i < count; i++) {
-        if (g_converter_freq >= 0.0)
-            device_freqs[i] = air_freqs[i] - g_converter_freq;
-        else
-            device_freqs[i] = fabs(-g_converter_freq - air_freqs[i]);
+        device_freqs[i] = inverted ?
+            g_converter_freq - air_freqs[i] :
+            air_freqs[i] - g_converter_freq;
         if (!receiver_frequency_valid(device_freqs[i]))
             return -1;
     }
@@ -3619,9 +3655,9 @@ static int build_device_scan_frequencies(const double *air_freqs, int count, dou
 
 static double receiver_frequency_from_radio(double air_freq)
 {
-    if (g_converter_freq >= 0.0)
-        return air_freq - g_converter_freq;
-    return fabs(-g_converter_freq - air_freq);
+    return active_converter_is_inverted() ?
+        g_converter_freq - air_freq :
+        air_freq - g_converter_freq;
 }
 
 static int receiver_frequency_valid(double rx_freq)
@@ -3698,21 +3734,18 @@ static double pluto_rfpll_modeled_error_hz(double requested_rx_hz)
 /**
  * @brief Convert a receive-LO error into the corresponding air-frequency sign.
  *
- * A positive converter preserves the air-to-receiver slope. A negative
- * converter may invert it on the lower side of its absolute-value mapping.
+ * A converter above the configured Start frequency reverses the
+ * air-to-receiver slope; direct and normal conversion preserve it.
  *
- * @param air_hz Air/source frequency at the planned receiver center in hertz.
  * @param receiver_error_hz Actual-minus-requested RX LO error in hertz.
  * @return Actual-minus-requested air-frequency source-center error in hertz.
  */
-static double air_error_from_receiver_error(double air_hz,
-                                            double receiver_error_hz)
+static double air_error_from_receiver_error(double receiver_error_hz)
 {
-    if (!isfinite(air_hz) || !isfinite(receiver_error_hz))
+    if (!isfinite(receiver_error_hz))
         return 0.0;
-    if (g_converter_freq >= 0.0)
-        return receiver_error_hz;
-    return air_hz >= -g_converter_freq ? receiver_error_hz : -receiver_error_hz;
+    return active_converter_is_inverted() ?
+        -receiver_error_hz : receiver_error_hz;
 }
 
 /**
@@ -3729,7 +3762,7 @@ static double modeled_frequency_correction_hz(double air_hz)
         return 0.0;
     receiver_hz = receiver_frequency_from_radio(air_hz);
     return air_error_from_receiver_error(
-        air_hz, pluto_rfpll_modeled_error_hz(receiver_hz));
+        pluto_rfpll_modeled_error_hz(receiver_hz));
 }
 
 /**
@@ -3765,45 +3798,40 @@ static int append_air_interval(freq_interval_t *intervals, int count,
 /**
  * @brief Build valid air-frequency intervals for a converter setting.
  *
- * Frequencies are hertz. For positive converters, receiver frequency is
- * `air - converter`. For negative converters, receiver frequency is
- * `abs(abs(converter) - air)`, which can create two valid air intervals.
+ * Frequencies are hertz and converter frequency is non-negative. A configured
+ * Start below the converter selects `converter - air`; otherwise conversion is
+ * `air - converter`. Exactly one valid air interval is produced.
  *
- * @param intervals Output array with room for two intervals.
+ * @param intervals Output array with room for one interval.
  * @param converter_freq Converter frequency in hertz.
+ * @param band_start_hz Configured air-band start in hertz.
  * @return Number of valid intervals written.
  */
 static int air_intervals_for_converter(freq_interval_t *intervals,
-                                       double converter_freq)
+                                       double converter_freq,
+                                       double band_start_hz)
 {
-    if (converter_freq >= 0.0) {
+    if (!isfinite(converter_freq) || converter_freq < 0.0)
+        return 0;
+    if (converter_is_inverted_for_band(band_start_hz, converter_freq))
         return append_air_interval(intervals, 0,
-                                   converter_freq + receiver_min_hz_double(),
-                                   converter_freq + receiver_max_hz_double());
-    }
-
-    {
-        double conv = -converter_freq;
-        int count = 0;
-        count = append_air_interval(intervals, count,
-                                    conv - receiver_max_hz_double(),
-                                    conv - receiver_min_hz_double());
-        count = append_air_interval(intervals, count,
-                                    conv + receiver_min_hz_double(),
-                                    conv + receiver_max_hz_double());
-        return count;
-    }
+                                   converter_freq - receiver_max_hz_double(),
+                                   converter_freq - receiver_min_hz_double());
+    return append_air_interval(intervals, 0,
+                               converter_freq + receiver_min_hz_double(),
+                               converter_freq + receiver_max_hz_double());
 }
 
 /**
  * @brief Build valid air-frequency intervals for the active converter setting.
  *
- * @param intervals Output array with room for two hertz intervals.
+ * @param intervals Output array with room for one hertz interval.
  * @return Number of valid intervals written.
  */
 static int air_intervals_for_receiver_limits(freq_interval_t *intervals)
 {
-    return air_intervals_for_converter(intervals, g_converter_freq);
+    return air_intervals_for_converter(intervals, g_converter_freq,
+                                       g_freq_start);
 }
 
 /**
@@ -3828,7 +3856,7 @@ static int air_band_within_receiver_limits(double start_hz, double end_hz,
         !isfinite(converter_freq) || end_hz <= start_hz)
         return 0;
 
-    count = air_intervals_for_converter(intervals, converter_freq);
+    count = air_intervals_for_converter(intervals, converter_freq, start_hz);
     for (int i = 0; i < count; i++) {
         if (start_hz >= intervals[i].start && end_hz <= intervals[i].end)
             return 1;
@@ -4131,7 +4159,7 @@ static double current_frequency_model_error_hz(void)
                                               plan.hardware_rf_bandwidth);
     receiver_hz = receiver_frequency_from_radio(center);
     return air_error_from_receiver_error(
-        center, pluto_rfpll_modeled_error_hz(receiver_hz));
+        pluto_rfpll_modeled_error_hz(receiver_hz));
 }
 
 static int required_points_for_band(double start, double end)
@@ -8539,8 +8567,10 @@ static int validate_scan_settings(double freq_start, double freq_end,
         snprintf(err, err_len, "bw_ratio must be greater than 0 and at most 1");
         return -1;
     }
-    if (!isfinite(converter_freq) || fabs(converter_freq) > 1.0e12) {
-        snprintf(err, err_len, "converter frequency is out of range");
+    if (!isfinite(converter_freq) ||
+        converter_freq < 0.0 || converter_freq > 1.0e12) {
+        snprintf(err, err_len,
+                 "converter frequency must be between 0 and 1 THz");
         return -1;
     }
     if (!isfinite(freq_start) || !isfinite(freq_end) ||

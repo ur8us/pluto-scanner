@@ -124,9 +124,12 @@ validation. If the attribute is unavailable, the fallback receiver range is
 raw receiver-frequency limits; values above `6 GHz` are valid when
 `converter_freq` maps them into the Pluto receiver range. FM broadcast-band
 testing still needs a converter mapping when the air frequency lies outside
-that direct tuning envelope. With this app's converter convention, the stable
-hardware test setup used `converter_freq = -530 MHz`, mapping `88-108 MHz` air
-frequency to `422-442 MHz` receiver tuning.
+that direct tuning envelope. Converter frequencies are always non-negative.
+When Start is below the converter frequency, the scanner automatically uses
+inverted conversion (`receiver = converter - air`) for the entire configured
+band. For example, `converter_freq = 530 MHz` with Start/End `88-108 MHz` maps
+to `442-422 MHz` receiver tuning. When Start is at or above the converter, the
+normal `receiver = air - converter` mapping is used.
 
 No Pluto reflashing is required for this program. It works with the original
 Analog Devices stock firmware and DATV firmware variants, as long as the normal
@@ -320,7 +323,14 @@ http://localhost:8080
 
 ## UI Controls
 
-- Start/end frequency and converter are air-frequency settings. Receiver limits are checked after converter conversion; the frontend normalizes typed fields into the active valid interval, and the backend remains authoritative. The adjacent disabled `Input` control shows the currently supported single receiver channel, input 1 (`A_BALANCED`); additional channels are deferred.
+- Start/end frequency and converter are air-frequency settings. Converter
+  frequency is non-negative; Start below Converter automatically selects
+  inverted conversion, while Start at or above Converter selects normal
+  conversion. Receiver limits are checked after conversion; the frontend
+  normalizes typed fields into the active valid interval, and the backend
+  remains authoritative. The adjacent disabled `Input` control shows the
+  currently supported single receiver channel, input 1 (`A_BALANCED`);
+  additional channels are deferred.
 - Sample rate, RF bandwidth, and passband usage are auto-profiled for Pluto performance and shown read-only in the UI.
 - RF bandwidth is kept strictly below sample rate in every auto profile.
 - Waterfall rows are published as exactly one processed output bin per visible CSS pixel; high-DPI canvas backing pixels are a local rendering detail. Raw FFT/CIC bin counts are kept as debug metadata.
@@ -434,7 +444,8 @@ Firefox binary with `FIREFOX_BIN=/path/to/firefox` when needed.
 
 - wide scan/hop mode
 - single-frequency mode
-- FM broadcast-band workflow with `converter_freq=-530 MHz`
+- FM broadcast-band workflow with automatic inversion at
+  `converter_freq=530 MHz`
 
 `tools/ui_browser_test.py` launches Firefox headless through Selenium and checks the visible Pluto controls, nonblank waterfall rendering, zoom, Go To, ruler interaction, and single-frequency transition.
 

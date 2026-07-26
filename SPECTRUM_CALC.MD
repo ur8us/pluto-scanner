@@ -44,22 +44,24 @@ All spans and centers in this document are air/signal frequencies. The Pluto
 receiver range is applied only after converter math:
 
 ```text
-rx_hz = air_hz - converter_hz          when converter_hz >= 0
-rx_hz = abs(-converter_hz - air_hz)    when converter_hz < 0
+inverted = converter_hz > 0 and freq_start_hz < converter_hz
+rx_hz = converter_hz - air_hz          when inverted
+rx_hz = air_hz - converter_hz          otherwise
 ```
 
-For a non-negative converter, the valid air interval is:
+Converter frequency must be non-negative. The configured Start selects one
+conversion direction for the full band. For inverted conversion, the valid air
+interval is:
+
+```text
+[max(0, converter_hz - receiver_max_hz),
+ converter_hz - receiver_min_hz]
+```
+
+For direct or normal conversion, the valid air interval is:
 
 ```text
 [converter_hz + receiver_min_hz, converter_hz + receiver_max_hz]
-```
-
-For a negative converter (`conv_hz = -converter_hz`), the valid air intervals
-are:
-
-```text
-[max(0, conv_hz - receiver_max_hz), conv_hz - receiver_min_hz]
-[conv_hz + receiver_min_hz, conv_hz + receiver_max_hz]
 ```
 
 `receiver_min_hz` and `receiver_max_hz` come from the connected Pluto RX LO
@@ -69,6 +71,8 @@ are:
 The configured air band must be wholly inside one valid interval before the
 planner runs. Invalid converted bands are rejected; the planner must not clamp
 or translate the user's configured air band to a nearby valid receiver range.
+The band cannot cross the converter frequency because that would cross zero IF
+and reverse conversion direction within the scan.
 The frontend must also avoid using raw `6000 MHz` as a maximum air-frequency
 input limit without converter math, because converter-mapped air frequencies
 can be above `6 GHz`.
@@ -113,8 +117,8 @@ modeled_actual_rx_hz =
   rfpll_parent_hz * (integer_word + fractional_word / 8388593) /
   divider
 receiver_error_hz = modeled_actual_rx_hz - requested_rx_hz
-air_error_hz = receiver_error_hz for a positive converter
-air_error_hz = +/- receiver_error_hz for a negative converter branch
+air_error_hz = -receiver_error_hz for inverted conversion
+air_error_hz = receiver_error_hz for direct or normal conversion
 model_error_hz = air_error_hz when fq_err_correction = 1, else 0
 effective_error_hz = model_error_hz
 ```

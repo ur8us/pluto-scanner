@@ -711,6 +711,7 @@
                         type="number"
                         id="converterFreq"
                         value="0"
+                        min="0"
                         step="0.1"
                     />
                 </div>
@@ -1714,13 +1715,17 @@
 
                 const startEl = document.getElementById("freqStart");
                 const endEl = document.getElementById("freqEnd");
-                const converterHz = inputMhzToHz("converterFreq");
+                const converterEl = document.getElementById("converterFreq");
+                let converterMhz = parseFloat(converterEl.value);
                 let startMhz = parseFloat(startEl.value);
                 let endMhz = parseFloat(endEl.value);
+                let converterHz;
                 let startHz;
                 let endHz;
                 let band;
 
+                if (!Number.isFinite(converterMhz) || converterMhz < 0)
+                    converterMhz = 0;
                 if (
                     !Number.isFinite(startMhz) ||
                     startMhz < MIN_AIR_FREQ_START_MHZ
@@ -1732,8 +1737,10 @@
                 )
                     endMhz = startMhz + MIN_SCAN_SPAN_MHZ;
 
+                converterHz = converterMhz * 1e6;
                 startHz = startMhz * 1e6;
                 endHz = endMhz * 1e6;
+                converterEl.value = mhzInputValue(converterHz);
                 band = clampAirBandToReceiverLimits(
                     startHz,
                     endHz,
@@ -1837,30 +1844,32 @@
              * Build valid air-frequency intervals for the active converter.
              *
              * @param {number} converterHz Converter frequency in hertz.
+             * @param {number} bandStartHz Configured air-band start in hertz.
              * @returns {Array<Object>} Valid air-frequency intervals in hertz.
              */
-            function receiverAirIntervalsForConverter(converterHz) {
+            function receiverAirIntervalsForConverter(
+                converterHz,
+                bandStartHz,
+            ) {
                 const intervals = [];
                 const converter = Number.isFinite(converterHz)
-                    ? converterHz
+                    ? Math.max(0, converterHz)
                     : 0;
-                if (converter >= 0) {
+                const inverted =
+                    converter > 0 &&
+                    Number.isFinite(bandStartHz) &&
+                    bandStartHz < converter;
+                if (inverted) {
+                    appendReceiverAirInterval(
+                        intervals,
+                        converter - activeReceiverMaxHz,
+                        converter - activeReceiverMinHz,
+                    );
+                } else {
                     appendReceiverAirInterval(
                         intervals,
                         converter + activeReceiverMinHz,
                         converter + activeReceiverMaxHz,
-                    );
-                } else {
-                    const conv = -converter;
-                    appendReceiverAirInterval(
-                        intervals,
-                        conv - activeReceiverMaxHz,
-                        conv - activeReceiverMinHz,
-                    );
-                    appendReceiverAirInterval(
-                        intervals,
-                        conv + activeReceiverMinHz,
-                        conv + activeReceiverMaxHz,
                     );
                 }
                 if (!intervals.length) {
@@ -1881,7 +1890,10 @@
              * @returns {{left:number,right:number}} Clamped air band in hertz.
              */
             function clampAirBandToReceiverLimits(startHz, endHz, converterHz) {
-                const intervals = receiverAirIntervalsForConverter(converterHz);
+                const intervals = receiverAirIntervalsForConverter(
+                    converterHz,
+                    startHz,
+                );
                 let reqStart = Number(startHz);
                 let reqEnd = Number(endHz);
                 let reqSpan;
@@ -4120,11 +4132,19 @@
                 return frequencyAtAxisFraction(axis, x / rect.width);
             }
 
+            /**
+             * Convert one air frequency through the active configured branch.
+             *
+             * @param {number} freq Air frequency in hertz.
+             * @returns {number} Pluto receiver frequency in hertz.
+             */
             function receiverFrequencyFromRadio(freq) {
-                if (currentConverterFreq >= 0) {
-                    return freq - currentConverterFreq;
-                }
-                return Math.abs(-currentConverterFreq - freq);
+                const inverted =
+                    currentConverterFreq > 0 &&
+                    configuredFreq0 < currentConverterFreq;
+                return inverted
+                    ? currentConverterFreq - freq
+                    : freq - currentConverterFreq;
             }
 
             function percentileFromSorted(values, percentile) {
@@ -7686,6 +7706,8 @@
                         document.getElementById("freqEnd").value;
                     const previousConverter =
                         document.getElementById("converterFreq").value;
+                    const previousConfiguredStart = configuredFreq0;
+                    const previousCurrentConverter = currentConverterFreq;
                     activeReceiverMinHz = 46875001;
                     activeReceiverMaxHz = 6000000000;
                     activeReceiverRangeSource = "test";
@@ -7697,7 +7719,7 @@
                         start: document.getElementById("freqStart").value,
                         end: document.getElementById("freqEnd").value,
                     };
-                    document.getElementById("converterFreq").value = "-530";
+                    document.getElementById("converterFreq").value = "530";
                     document.getElementById("freqStart").value = "88";
                     document.getElementById("freqEnd").value = "108";
                     sanitizeScanFrequencyInputs();
@@ -7705,15 +7727,42 @@
                         start: document.getElementById("freqStart").value,
                         end: document.getElementById("freqEnd").value,
                     };
+                    document.getElementById("converterFreq").value = "9360";
+                    document.getElementById("freqStart").value = "8360";
+                    document.getElementById("freqEnd").value = "9360";
+                    sanitizeScanFrequencyInputs();
+                    const automaticInversion = {
+                        start: document.getElementById("freqStart").value,
+                        end: document.getElementById("freqEnd").value,
+                    };
+                    configuredFreq0 = 8360e6;
+                    currentConverterFreq = 9360e6;
+                    const receiverMapping = {
+                        inverted_start: receiverFrequencyFromRadio(8360e6),
+                        inverted_end:
+                            receiverFrequencyFromRadio(9313.124999e6),
+                    };
+                    configuredFreq0 = 10400e6;
+                    receiverMapping.normal_start =
+                        receiverFrequencyFromRadio(10400e6);
+                    receiverMapping.normal_end =
+                        receiverFrequencyFromRadio(10420e6);
                     activeReceiverMinHz = previousMin;
                     activeReceiverMaxHz = previousMax;
                     activeReceiverRangeSource = previousSource;
+                    configuredFreq0 = previousConfiguredStart;
+                    currentConverterFreq = previousCurrentConverter;
                     document.getElementById("freqStart").value =
                         previousStart;
                     document.getElementById("freqEnd").value = previousEnd;
                     document.getElementById("converterFreq").value =
                         previousConverter;
-                    return { direct, converter };
+                    return {
+                        direct,
+                        converter,
+                        automatic_inversion: automaticInversion,
+                        receiver_mapping: receiverMapping,
+                    };
                 },
                 hashViewConflictCheck() {
                     const previousHash = window.location.hash;

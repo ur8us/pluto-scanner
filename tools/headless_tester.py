@@ -112,8 +112,27 @@ def main():
             "single",
         ),
         (
-            "fm_band_with_minus_530mhz_converter",
-            dict(common, freq_start=88, freq_end=108, converter_freq=-530),
+            "fm_band_with_automatic_inversion",
+            dict(common, freq_start=88, freq_end=108, converter_freq=530),
+            "scan",
+        ),
+        (
+            "ku_band_with_automatic_inversion",
+            dict(common, freq_start=8360, freq_end=9313,
+                 converter_freq=9360),
+            "scan",
+        ),
+        (
+            "ku_narrow_with_automatic_inversion",
+            dict(common, freq_start=8360, freq_end=9313,
+                 converter_freq=9360, visible_start_hz=8399.5e6,
+                 visible_end_hz=8400.5e6),
+            "single",
+        ),
+        (
+            "ku_band_with_normal_conversion",
+            dict(common, freq_start=10400, freq_end=10420,
+                 converter_freq=9360),
             "scan",
         ),
     ]

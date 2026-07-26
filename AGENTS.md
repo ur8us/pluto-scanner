@@ -46,6 +46,11 @@ After a Pluto connection opens, the backend reads the AD936x RX LO
 `frequency_available` range and uses it as the active receiver limit. The
 fallback is `46,875,001 Hz..6 GHz`. Keep frontend frequencies as air/signal
 frequencies and enforce receiver limits after converter conversion.
+Converter frequency is non-negative. Select inverted conversion for the whole
+configured band when Start is below Converter
+(`receiver_hz = converter_hz - air_hz`); otherwise use normal conversion
+(`receiver_hz = air_hz - converter_hz`). Reject a band that crosses the
+converter frequency or falls outside the converted receiver limits.
 
 The supported signal path currently uses one complex receiver channel on
 `A_BALANCED`. Keep the frontend `Input` selector visible but disabled with only

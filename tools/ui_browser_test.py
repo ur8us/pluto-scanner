@@ -130,6 +130,8 @@ def main():
         assert driver.find_element(By.ID, "infoReceiverRange").is_displayed()
         if driver.find_element(By.ID, "btnStart").text.strip().lower() != "run":
             raise RuntimeError("main scan action button is not labeled Run")
+        if driver.find_element(By.ID, "converterFreq").get_attribute("min") != "0":
+            raise RuntimeError("converter input still permits negative frequencies")
         Select(driver.find_element(By.ID, "timeMarks")).select_by_value("15")
         assert (
             driver.execute_script("return localStorage.getItem('timeMarksSeconds');")
@@ -196,6 +198,16 @@ def main():
         if receiver_clamp != {
             "direct": {"start": "46.875001", "end": "6000"},
             "converter": {"start": "88", "end": "108"},
+            "automatic_inversion": {
+                "start": "8360",
+                "end": "9313.124999",
+            },
+            "receiver_mapping": {
+                "inverted_start": 1000000000,
+                "inverted_end": 46875001,
+                "normal_start": 1040000000,
+                "normal_end": 1060000000,
+            },
         }:
             raise RuntimeError(f"unexpected receiver clamp: {receiver_clamp}")
         hash_conflicts = driver.execute_script(
