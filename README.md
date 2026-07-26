@@ -294,29 +294,29 @@ http://localhost:8080
 
 ## Screenshots
 
-### QO-100 both polarizations, 1 GHz bandwidth, minimum zoom
+### QO-100 both polarizations, 1 GHz span, minimum zoom
 
-![QO-100 both polarizations, 1 GHz bandwidth, minimum zoom](images/qo-100-both-polarizations-bw-1ghz-min-zoom.png)
+![QO-100 both polarizations, 1 GHz span, minimum zoom](images/qo-100-both-polarizations-span-1ghz-min-zoom.png)
 
-### QO-100 lower beacon, 1 kHz bandwidth, maximum zoom
+### QO-100 upper beacon, 1 kHz span, maximum zoom
 
-![QO-100 lower beacon, 1 kHz bandwidth, maximum zoom](images/qo-100-lower-beacon-bw-1khz-max-zoom.png)
+![QO-100 upper beacon, 1 kHz span, maximum zoom](images/qo-100-upper-beacon-span-1khz-max-zoom.png)
 
-### QO-100 lower beacon, OCXO gravity influence
+### QO-100 upper beacon, OCXO gravity influence
 
-![QO-100 lower beacon, OCXO gravity influence](images/qo-100-lower-beacon-gravity-influence-on-ocxo.png)
+![QO-100 upper beacon, OCXO gravity influence](images/qo-100-upper-beacon-gravity-influence-on-ocxo.png)
 
-### QO-100 narrow-band transponder, 700 kHz bandwidth
+### QO-100 narrow-band transponder, 750 kHz bandwidth
 
-![QO-100 narrow-band transponder, 700 kHz bandwidth](images/qo-100-narrow-band-transponder-bw-700khz.png)
+![QO-100 narrow-band transponder, 750 kHz bandwidth](images/qo-100-narrow-band-transponder-bw-750khz.png)
 
-### Whip antenna, 1 GHz bandwidth, minimum zoom
+### Whip antenna, 1 GHz span, minimum zoom
 
-![Whip antenna, 1 GHz bandwidth, minimum zoom](images/whip-antenna-bw-1ghz-min-zoom.png)
+![Whip antenna, 1 GHz span, minimum zoom](images/whip-antenna-span-1ghz-min-zoom.png)
 
-### Whip antenna FM broadcasting band, 27 MHz bandwidth
+### Whip antenna FM broadcasting band, 26 MHz span
 
-![Whip antenna FM broadcasting band, 27 MHz bandwidth](images/whip-antenna-fm-broadcasting-band-bw-27mhz.png)
+![Whip antenna FM broadcasting band, 26 MHz span](images/whip-antenna-fm-broadcasting-band-span-26mhz.png)
 
 ## UI Controls
 

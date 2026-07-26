@@ -468,18 +468,24 @@ steady_lps =
   cic_stream_sps / (decim_hop * decim)  when decim > 1
   raw_stream_sps / fft                  when decim == 1
 
-draw_lps =
+planned_draw_lps =
   steady_lps                      when steady_lps <= max_rate_lps
   max_rate_lps * 0.85             when steady_lps > max_rate_lps
 
 line_interval_s =
-  1 / draw_lps
+  1 / planned_draw_lps
+
+actual_single_publish_lps <= max_rate_lps * 0.85
 ```
 
 The throttle point depends on the mode: scan and non-CIC single mode may drop
 whole pre-FFT buffers or cycles, while CIC single mode must preserve every raw
 buffer until the CIC-decimated FFT line is complete and may only drop after
-that processed line exists.
+that processed line exists. Because the empirical stream estimate can be lower
+than the rate at which FFTs actually complete, the final single-stream
+monotonic publish-clock guard is always active. `line_interval_s` remains the
+planned cadence diagnostic and cached-preview pacing interval; live frontend
+rows are rendered on arrival rather than delayed to this estimate.
 
 Level normalization:
 

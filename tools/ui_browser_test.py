@@ -243,6 +243,10 @@ def main():
             raise RuntimeError(
                 f"early live row did not supersede queued previews smoothly: {cadence_probe}"
             )
+        if cadence_probe.get("live_burst") != {"rendered": 64, "queued": 0}:
+            raise RuntimeError(
+                f"live rows accumulated presentation latency: {cadence_probe}"
+            )
 
         visibility_probe = driver.execute_async_script(
             "const done=arguments[0];"
@@ -429,8 +433,16 @@ def main():
             raise RuntimeError("waterfall was blank before layout-only zoom")
         driver.execute_script(
             "document.documentElement.style.zoom='125%';"
-            "window.dispatchEvent(new Event('resize'));"
         )
+        layout_in_immediate = driver.execute_script(
+            "return window.__plutoTestHooks.resizeCanvasesNow();"
+        )
+        if int(layout_in_immediate.get("nonblack_pixels", 0)) <= 0:
+            raise RuntimeError("layout zoom-in blanked the waterfall immediately")
+        if int(layout_in_immediate.get("deepest_nonblack_row", -1)) < int(
+            before_layout_history.get("deepest_nonblack_row", -1)
+        ):
+            raise RuntimeError("layout zoom-in discarded visible waterfall depth")
         time.sleep(0.8)
         WebDriverWait(driver, 10).until(
             lambda d: int(
@@ -449,8 +461,16 @@ def main():
         )
         driver.execute_script(
             "document.documentElement.style.zoom='';"
-            "window.dispatchEvent(new Event('resize'));"
         )
+        layout_out_immediate = driver.execute_script(
+            "return window.__plutoTestHooks.resizeCanvasesNow();"
+        )
+        if int(layout_out_immediate.get("nonblack_pixels", 0)) <= 0:
+            raise RuntimeError("layout zoom-out blanked the waterfall immediately")
+        if int(layout_out_immediate.get("deepest_nonblack_row", -1)) < int(
+            layout_in_history.get("deepest_nonblack_row", -1)
+        ):
+            raise RuntimeError("layout zoom-out discarded visible waterfall depth")
         time.sleep(0.8)
         WebDriverWait(driver, 10).until(
             lambda d: int(

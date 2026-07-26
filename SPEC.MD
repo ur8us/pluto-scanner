@@ -353,7 +353,9 @@ resolution narrows.
 The raw buffers feeding CIC must remain contiguous. The scanner may drop
 queued buffers in non-CIC paths, but single-frequency CIC mode waits for queue
 space and only throttles after complete FFT lines or at the final publish-clock
-guard. This preserves the stateful CIC filter and matches the cross-hardware
+guard. The final single-stream guard always checks actual monotonic publication
+time; it does not assume that the empirical line-rate estimate is an upper
+bound. This preserves the stateful CIC filter and matches the cross-hardware
 lesson from the older Fobos scanner: raw gaps before CIC corrupt the waterfall.
 
 ### 3.8 HTTP API
@@ -517,10 +519,11 @@ data: {"view":<id>,"n":<line#>,"b":<total_steps>,"mode":"scan|single",
   indexed boundary of the still-running capture; following `preview=0` rows
   continue that epoch. In the restart fallback, preview rows remain independent
   from the newly started live stream. `line_interval_ms` is the planned
-  steady-state cadence; the frontend queues rows against one retained monotonic
-  deadline so neither path produces a burst followed by a pause. Animated Go To
-  accepts a matching current-resolution preview row and never stretches an
-  older row into the new viewport.
+  steady-state cadence diagnostic. The frontend applies timed pacing only to
+  cached previews; live rows render on arrival so an underestimated empirical
+  cadence cannot accumulate display latency. Animated Go To accepts a matching
+  current-resolution preview row and never stretches an older row into the new
+  viewport.
 
 ---
 
@@ -565,9 +568,14 @@ manual dual slider); auto levels use robust percentiles (8 % noise floor,
   must be a length-`display_bins` array of integers `0..255`.
 - `f0 < f1` and finite.
 - Cached previews are queued and rendered at `preview_interval_ms`; live rows
-  use `line_interval_ms`, and the next presentation deadline survives a
-  temporarily empty queue until the next row or view change. An early live row
-  replaces unrendered cached rows rather than accumulating display latency.
+  render immediately on arrival. `line_interval_ms` remains available for
+  diagnostics and stall detection but never delays a live row in the browser.
+  An early live row replaces unrendered cached rows rather than accumulating
+  display latency.
+- Browser maximize/restore, responsive layout changes, page zoom, and DPR
+  changes synchronously resample the existing rendered waterfall into the new
+  canvas backing width before any asynchronous retained-row refinement. They
+  must never expose a cleared canvas or request a new backend view.
 - When the document is hidden, paced presentation is suspended and only the
   newest pending SSE row is retained. After the document becomes visible, a
   short settle interval collapses delayed EventSource callbacks before that row

@@ -6268,7 +6268,13 @@ static int publish_clock_should_keep(scan_ctx_t *ctx)
         return 1;
     }
     limit_lps = normalize_rate_limit_lps(ctx->rate_limit_lps);
-    if (!ctx->single_mode || ctx->estimated_line_rate <= (double)limit_lps)
+    /*
+     * The empirical CIC throughput estimate plans overlap and diagnostics; it
+     * is not a reliable upper bound on how quickly completed rows can arrive.
+     * Always enforce the single-stream publish clock from monotonic time so an
+     * underestimated rate cannot overrun the browser presentation path.
+     */
+    if (!ctx->single_mode)
         return 1;
 
     target_lps = (double)limit_lps * PLUTO_RATE_LIMIT_GUARD;

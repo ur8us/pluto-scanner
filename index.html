@@ -1127,6 +1127,84 @@
             }
 
             /**
+             * Resample the rendered waterfall into a resized backing store.
+             *
+             * Browser maximize/restore and page zoom do not change frequency
+             * coordinates. Preserve every visible historical row immediately;
+             * the retained raw rows may refine this image asynchronously later.
+             * When shrinking, select the brightest contributing source pixel so
+             * narrow carriers are not lost by nearest-neighbor subsampling.
+             *
+             * @param {ImageData|null} source Previous rendered waterfall image.
+             * @param {number} width New backing-store width in pixels.
+             * @param {number} height New backing-store height in pixels.
+             * @returns {ImageData} Resized opaque waterfall image.
+             */
+            function resampleWaterfallImageData(source, width, height) {
+                const imageData = wfCtx.createImageData(width, height);
+                const dest = imageData.data;
+                clearWaterfallPixelBuffer(dest);
+                if (
+                    !source ||
+                    source.width <= 0 ||
+                    source.height <= 0 ||
+                    width <= 0 ||
+                    height <= 0
+                ) {
+                    return imageData;
+                }
+
+                const sourceData = source.data;
+                const sourceWidth = source.width;
+                const copyHeight = Math.min(height, source.height);
+                for (let y = 0; y < copyHeight; y++) {
+                    const sourceRow = y * sourceWidth * 4;
+                    const destRow = y * width * 4;
+                    for (let x = 0; x < width; x++) {
+                        let first = Math.floor(
+                            (x * sourceWidth) / width,
+                        );
+                        let last = Math.ceil(
+                            ((x + 1) * sourceWidth) / width,
+                        );
+                        first = Math.max(
+                            0,
+                            Math.min(sourceWidth - 1, first),
+                        );
+                        last = Math.max(
+                            first + 1,
+                            Math.min(sourceWidth, last),
+                        );
+
+                        let best = first;
+                        let bestBrightness = -1;
+                        for (let sourceX = first; sourceX < last; sourceX++) {
+                            const sourceOffset =
+                                sourceRow + sourceX * 4;
+                            const brightness =
+                                sourceData[sourceOffset] +
+                                sourceData[sourceOffset + 1] +
+                                sourceData[sourceOffset + 2];
+                            if (brightness > bestBrightness) {
+                                bestBrightness = brightness;
+                                best = sourceX;
+                            }
+                        }
+
+                        const sourceOffset = sourceRow + best * 4;
+                        const destOffset = destRow + x * 4;
+                        dest[destOffset] = sourceData[sourceOffset];
+                        dest[destOffset + 1] =
+                            sourceData[sourceOffset + 1];
+                        dest[destOffset + 2] =
+                            sourceData[sourceOffset + 2];
+                        dest[destOffset + 3] = 255;
+                    }
+                }
+                return imageData;
+            }
+
+            /**
              * Resize local canvas backing stores after a settled layout change.
              *
              * This function must not request a backend view update. A browser
@@ -1151,14 +1229,18 @@
                     scopeRulerCanvas.width !== w || scopeRulerCanvas.height !== 135;
 
                 if (waterfallSizeChanged || !wfImageData || wfImageData.width !== w) {
+                    const previousImageData = wfImageData;
                     wfCanvas.width = w;
                     wfCanvas.height = 600;
                     rulerCanvas.width = w;
                     rulerCanvas.height = 600;
                     clearRulerOverlay();
-                    wfImageData = wfCtx.createImageData(w, 600);
+                    wfImageData = resampleWaterfallImageData(
+                        previousImageData,
+                        w,
+                        600,
+                    );
                     wfScratchImageData = null;
-                    clearWaterfallPixelBuffer(wfImageData.data);
                     presentWaterfallImage();
                     if (lutReady && wfRows.length) scheduleCurrentViewRedraw();
                 }
@@ -4895,13 +4977,14 @@
             }
 
             /**
-             * Return the planned steady-state interval for one live row.
+             * Return the backend's diagnostic steady-state interval.
              *
-             * Legacy backends used `preview_interval_ms` for every row, so it
-             * remains a fallback when the dedicated field is absent.
+             * Live rows are rendered on arrival because this empirical interval
+             * can underestimate the completed FFT rate and must not create an
+             * ever-growing presentation queue.
              *
              * @param {Object} data Parsed SSE waterfall row.
-             * @returns {number} Planned live presentation interval in milliseconds.
+             * @returns {number} Planned live interval in milliseconds.
              */
             function linePresentationIntervalMs(data) {
                 let interval = Number(data && data.line_interval_ms);
@@ -4912,11 +4995,19 @@
                 return 0;
             }
 
-            /** Return the presentation interval appropriate for one row type. */
+            /**
+             * Return the presentation delay for one row.
+             *
+             * Cached previews retain planned pacing across a view handoff.
+             * Ordinary live rows have no additional frontend delay.
+             *
+             * @param {Object} data Parsed SSE waterfall row.
+             * @returns {number} Frontend delay in milliseconds.
+             */
             function rowPresentationIntervalMs(data) {
                 return Number(data && data.preview) !== 0
                     ? previewPresentationIntervalMs(data)
-                    : linePresentationIntervalMs(data);
+                    : 0;
             }
 
             /**
@@ -7704,7 +7795,24 @@
                     const normal = await run(900000001, false);
                     const early = await run(900000002, true);
                     clearWaterfallPresentationQueue();
-                    return { normal, early };
+                    const liveRendered = [];
+                    for (let id = 0; id < 64; id++) {
+                        enqueueWaterfallPresentation(
+                            {
+                                id,
+                                view: 900000003,
+                                preview: 0,
+                                line_interval_ms: 40,
+                            },
+                            (data) => liveRendered.push(Number(data.id)),
+                        );
+                    }
+                    const liveBurst = {
+                        rendered: liveRendered.length,
+                        queued: waterfallPresentationQueue.length,
+                    };
+                    clearWaterfallPresentationQueue();
+                    return { normal, early, live_burst: liveBurst };
                 },
                 async visibilityPresentationProbe() {
                     clearWaterfallPresentationQueue();
@@ -7739,6 +7847,15 @@
                     waterfallPresentationSuspended = document.hidden;
                     return result;
                 },
+                /**
+                 * Apply settled canvas geometry synchronously for resize tests.
+                 *
+                 * @returns {Object} Waterfall state immediately after resizing.
+                 */
+                resizeCanvasesNow() {
+                    resizeCanvases();
+                    return this.waterfallDiagnostics();
+                },
                 viewState() {
                     return {
                         start_hz: currentFreq0,
@@ -7755,15 +7872,31 @@
                 waterfallDiagnostics() {
                     const data = wfImageData ? wfImageData.data : null;
                     let nonblack = 0;
+                    let nonblackRows = 0;
+                    let deepestNonblackRow = -1;
                     if (data) {
-                        for (let i = 0; i < data.length; i += 4) {
-                            if (data[i] || data[i + 1] || data[i + 2])
-                                nonblack++;
+                        const width = wfImageData.width;
+                        const height = wfImageData.height;
+                        for (let y = 0; y < height; y++) {
+                            let rowNonblack = false;
+                            for (let x = 0; x < width; x++) {
+                                const i = (y * width + x) * 4;
+                                if (data[i] || data[i + 1] || data[i + 2]) {
+                                    nonblack++;
+                                    rowNonblack = true;
+                                }
+                            }
+                            if (rowNonblack) {
+                                nonblackRows++;
+                                deepestNonblackRow = y;
+                            }
                         }
                     }
                     return {
                         history_rows: wfRows.length,
                         nonblack_pixels: nonblack,
+                        nonblack_rows: nonblackRows,
+                        deepest_nonblack_row: deepestNonblackRow,
                         canvas_width: wfCanvas.width,
                         canvas_height: wfCanvas.height,
                         presentation_rows: waterfallPresentationHistory.length,
