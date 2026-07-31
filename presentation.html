@@ -3,8 +3,8 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <meta name="description" content="A visual summary of nine new principles explored in the Pluto SDR Scanner video series.">
-  <title>Pluto Scanner: Nine Principles for Modern SDR Tools</title>
+  <meta name="description" content="A visual summary of ten new principles explored in the Pluto SDR Scanner video series.">
+  <title>Pluto Scanner: Ten Principles for Modern SDR Tools</title>
   <style>
     :root {
       color-scheme: dark;
@@ -526,7 +526,8 @@
 
     #p7 .principle-visual img,
     #p8 .principle-visual img,
-    #p9 .principle-visual img {
+    #p9 .principle-visual img,
+    #p10 .principle-visual img {
       aspect-ratio: 16 / 9;
       object-fit: contain;
     }
@@ -1096,7 +1097,8 @@
       .page .principle-visual img,
       .page #p7 .principle-visual img,
       .page #p8 .principle-visual img,
-      .page #p9 .principle-visual img {
+      .page #p9 .principle-visual img,
+      .page #p10 .principle-visual img {
         width: auto;
         max-width: 100%;
         height: auto;
@@ -1195,7 +1197,7 @@
 <body>
   <a class="skip-link" href="#summary">Skip to summary</a>
   <div class="progress" id="progress" aria-hidden="true"></div>
-  <div class="page-status" id="pageStatus" aria-live="polite">01 / 12</div>
+  <div class="page-status" id="pageStatus" aria-live="polite">01 / 13</div>
   <div class="page-controls" aria-label="Page navigation">
     <button class="page-control" id="pageUp" type="button" aria-label="Previous page" title="Previous page">↑</button>
     <button class="page-control" id="pageDown" type="button" aria-label="Next page" title="Next page">↓</button>
@@ -1218,14 +1220,14 @@
       <img src="images/03.png" alt="">
     </div>
     <div class="hero-inner">
-      <p class="eyebrow">A nine-part video series</p>
+      <p class="eyebrow">A ten-part video series</p>
       <h1>New principles <span>for SDR tools</span></h1>
       <p class="hero-copy">
         Pluto Scanner asks a practical question: what should a spectrum tool feel like when the interface,
         processing pipeline, and recovery logic are designed as one continuous system?
       </p>
       <div class="hero-meta" aria-label="Series highlights">
-        <div class="metric"><strong>9</strong><span>principles</span></div>
+        <div class="metric"><strong>10</strong><span>principles</span></div>
         <div class="metric"><strong>10<sup>6</sup>×</strong><span>zoom range</span></div>
         <div class="metric"><strong>~0.01 Hz</strong><span>tuning accuracy</span></div>
         <div class="metric"><strong>25–30 KB/s</strong><span>moderate traffic</span></div>
@@ -1287,6 +1289,7 @@
       <button type="button" data-target="p7" data-label="Low-latency resolution" aria-label="Go to principle 7"></button>
       <button type="button" data-target="p8" data-label="Exact tuning" aria-label="Go to principle 8"></button>
       <button type="button" data-target="p9" data-label="Automatic recovery" aria-label="Go to principle 9"></button>
+      <button type="button" data-target="p10" data-label="Simulation-backed development" aria-label="Go to principle 10"></button>
     </nav>
 
     <div class="chapters">
@@ -1495,6 +1498,30 @@
           </div>
         </div>
       </section>
+
+      <section class="principle page" id="p10" style="--accent:var(--green)">
+        <div class="principle-grid">
+          <div class="principle-visual">
+            <a href="https://www.youtube.com/watch?v=KN4PUU8bcSc" target="_blank" rel="noopener" aria-label="Watch the simulation-backed development chapter">
+              <img src="images/10.png" alt="Simulation-backed development with synthetic signals and automated validation" loading="lazy">
+            </a>
+          </div>
+          <div class="principle-copy">
+            <div class="chapter-number">Principle 10</div>
+            <h3>Simulation-backed development</h3>
+            <p class="lead">Give every critical DSP path a known input and an automatically measurable result.</p>
+            <p class="detail">
+              Hidden development modes replace the receiver with synthetic tones, noise, and deliberately
+              damaged sample streams. Automated checks distinguish a clean narrow carrier from spectral
+              spreading caused by missing or repeated samples, then feed the evidence back into debugging.
+              The same tests can sweep tuning, zoom, FFT, decimation, and waterfall settings repeatedly,
+              without a laboratory signal generator or subjective inspection.
+            </p>
+            <div class="fact"><strong>Test, measure, validate</strong><span>Repeatable DSP evidence before live RF testing</span></div>
+            <a class="watch-link" href="https://www.youtube.com/watch?v=KN4PUU8bcSc" target="_blank" rel="noopener">Watch chapter</a>
+          </div>
+        </div>
+      </section>
     </div>
 
     <section class="closing page" id="conclusion">
@@ -1505,9 +1532,10 @@
         </div>
         <div>
           <p>
-            Pluto Scanner’s strongest principle is the combination of all nine: keep the operator’s mental
+            Pluto Scanner’s strongest principle is the combination of all ten: keep the operator’s mental
             model stable while software continuously changes acquisition mode, resolution, rate, coordinates,
-            cached data, and device state underneath.
+            cached data, and device state underneath, then validate those hidden transitions with repeatable
+            synthetic tests.
           </p>
           <a class="closing-link" href="https://github.com/ur8us/pluto-scanner" target="_blank" rel="noopener">
             <span>Explore Pluto Scanner</span><span>↗</span>
