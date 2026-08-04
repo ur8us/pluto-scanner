@@ -11,28 +11,10 @@ It does not require custom Pluto firmware: the original Analog Devices stock
 firmware and DATV firmware variants are supported when the standard libiio
 devices and AD936x attributes are present.
 
-Design goals (from `README.md`):
-
-1. AI-first development workflow.
-2. A web interface that minimizes traffic (waterfall rows are exactly one
-   byte per visible CSS pixel; only planning metadata rides alongside).
-3. One-million-times zoom: from gigahertz-wide full-screen spans down to
-   hertz-per-pixel detail.
-4. Seamless merging of scan/hop mode and single-frequency reception, hidden
-   from the user.
-5. Waterfall speed expressed as a line-rate range (min/max lines/s) rather
-   than being tied directly to FFT size.
-6. Persistent waterfall history — zoom/pan reuses recorded rows instead of
-   clearing the screen. The principle is known in SDR UIs, but this program
-   treats it as an area to improve so history remains useful across large zoom
-   and frequency changes.
-7. Low-latency, smooth resolution changes — compatible high-zoom view changes
-   keep capture running. The new integer-CIC/Hann/FFT generation starts from
-   indexed raw history and joins the same capture timeline at an exact sample
-   boundary. FFT size is the smallest power of two that covers the visible CSS
-   pixels; CIC supplies deeper resolution.
-8. Exact frequency tuning — deterministic compensation for PLL and DDS-style
-   rounding errors keeps received signals plotted at their true frequencies.
+The project's ten design goals, their user-facing rationale, implementation
+invariants, examples, and verification guidance are defined in
+[`PRINCIPLES.MD`](PRINCIPLES.MD). This specification defines the exact runtime,
+API, frontend, RF-planning, and DSP behavior used to realize those principles.
 
 ---
 
@@ -788,6 +770,8 @@ Frontend: validate row → update scope → scroll waterfall → relabel → aut
 
 ## 9. Reference documents
 
+- **`PRINCIPLES.MD`** — user-facing rationale, examples, implementation
+  invariants, and verification guidance for the ten design principles.
 - **`SPECTRUM_CALC.MD`** — complete mathematical specification: zoom table
   (`1×..1,000,000×`), RF profile selection, scan/single FFT/CIC planning
   formulas, line-rate estimates, and level normalization. This is the

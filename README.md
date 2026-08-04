@@ -68,7 +68,7 @@ I want this project to explore new principles for SDR tools (click to watch vide
 9. [Automatic device recovery: the physical receiver can be unplugged and reconnected at any time. The backend detects the disconnection, polls for the device to reappear, and resumes scanning automatically — no restart button, no page reload, no user intervention. A receive explicitly started with `Run` also resumes after the scanner program is restarted; `Stop` disables that resume intent.](https://www.youtube.com/watch?v=pBepJdQ0E8A)
 10. [Simulation-backed development. Every critical DSP block in the SDR is validated through repeatable tests using synthetic signals — not by eyeballing the spectrum.](https://www.youtube.com/watch?v=KN4PUU8bcSc)
 
-[Interactive presentation of the principles](https://htmlpreview.github.io/?https://github.com/ur8us/pluto-scanner/blob/master/presentation.html)
+[Interactive presentation of the principles](https://ur8us.github.io/pluto-scanner/presentation.html)
 
 ## Project Scope
 

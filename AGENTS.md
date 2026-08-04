@@ -9,6 +9,8 @@
 - `pluto-scanner.conf` is local runtime state and should stay untracked.
 - `images/` contains README screenshots captured from the live browser UI.
 - `PLUTO.MD` reference for ADALM-Pluto hardware (libiio API, clock control, SSH).
+- `PRINCIPLES.MD` design rationale for the ten user-facing principles, with
+  implementation invariants, examples, and verification guidance for agents.
 - `SPEC.MD` full API specification (endpoints, status fields, SSE row format, controls).
 - `SPECTRUM_CALC.MD` spectrum math reference (FFT, CIC, filter, level normalization formulas).
 
