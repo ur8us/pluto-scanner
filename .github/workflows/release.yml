@@ -2,10 +2,10 @@ name: Release
 
 on:
   push:
+    branches:
+      - master
     tags:
       - "v*"
-  schedule:
-    - cron: "37 2 * * *"
   workflow_dispatch:
 
 permissions:
@@ -202,7 +202,6 @@ jobs:
 
   release:
     name: Publish GitHub release
-    if: startsWith(github.ref, 'refs/tags/') || github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
     needs:
       - linux
       - windows
@@ -239,7 +238,19 @@ jobs:
             git push --force origin "refs/tags/$tag"
           fi
           if gh release view "$tag" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
-            gh release upload "$tag" release-assets/* --repo "$GITHUB_REPOSITORY" --clobber
+            # --clobber may have already replaced some assets before a transient
+            # API failure, so retry the complete, idempotent upload operation.
+            for attempt in 1 2 3 4; do
+              if gh release upload "$tag" release-assets/* --repo "$GITHUB_REPOSITORY" --clobber; then
+                break
+              fi
+              if [ "$attempt" -eq 4 ]; then
+                echo "Release asset upload failed after $attempt attempts" >&2
+                exit 1
+              fi
+              echo "Release asset upload failed; retrying in $((attempt * 10)) seconds" >&2
+              sleep "$((attempt * 10))"
+            done
             if [ "$tag" = "nightly" ]; then
               gh release edit "$tag" \
                 --repo "$GITHUB_REPOSITORY" \
